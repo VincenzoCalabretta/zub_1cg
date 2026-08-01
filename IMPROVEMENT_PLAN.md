@@ -94,7 +94,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-002: Enforce ELF memory and protection invariants
 
-- **Status:** ready
+- **Status:** in progress
 - **Why:** All current link products warn about RWE segments, and entry-point
   documentation has already drifted. A successful link is not enough for
   bare-metal correctness.
