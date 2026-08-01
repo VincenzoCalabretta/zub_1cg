@@ -5,7 +5,6 @@
 #   - Xilinx Vitis installed with xsct on PATH or at $XSCT (defaults to
 #     /mnt/data/xilinx/Vitis/2023.2/bin/xsct)
 #   - Board in JTAG mode, /dev/ttyUSB1 present
-#   - //apps/apu/hello_world:hello_world_a53.elf built with --config=apu
 set -euo pipefail
 
 TTY="${ZUB_TTY:-/dev/ttyUSB1}"
@@ -29,15 +28,7 @@ PSI="$RUN/board/zub_1cg/psu_init.tcl"
 
 ELF="$RUN/apps/apu/hello_world/hello_world_a53.elf"
 if [[ ! -f "$ELF" ]]; then
-    WSROOT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-    while [[ "$WSROOT" != "/" && ! -f "$WSROOT/MODULE.bazel" ]]; do
-        WSROOT="$(dirname "$WSROOT")"
-    done
-    ELF="$WSROOT/bazel-bin/apps/apu/hello_world/hello_world_a53.elf"
-fi
-if [[ ! -f "$ELF" ]]; then
-    echo "FAIL: hello_world_a53.elf not found — pre-build with:"
-    echo "  bazel build --config=apu //apps/apu/hello_world:hello_world_a53.elf"
+    echo "FAIL: hello_world_a53.elf is missing from test runfiles"
     exit 1
 fi
 

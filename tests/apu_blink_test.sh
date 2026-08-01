@@ -8,8 +8,7 @@
 #      zub_ctl watch-a53 programs the PL bitstream before loading the ELF.
 #
 # Workflow:
-#   bazel build --config=apu //apps/apu/blink:blink.elf   # cross-compile (pre-build)
-#   bazel test --config=host //tests:apu_blink_test        # run on hardware
+#   bazel test --config=host --config=onboard //tests:apu_blink_test
 set -euo pipefail
 
 TTY="${ZUB_TTY:-/dev/ttyUSB1}"
@@ -31,22 +30,10 @@ ZUB_CTL="$RUN/tools/zub_ctl/zub_ctl"
 BIT="$RUN/board/zub_1cg/design_1_wrapper.bit"
 PSI="$RUN/board/zub_1cg/psu_init.tcl"
 
-# The ELF is cross-compiled (--config=apu) and cannot be a Bazel data dep of
-# a host-platform test.  Look in runfiles first (works if a transition is ever
-# added), then fall back to the workspace bazel-bin output.
+# The test rule cross-compiles this ELF for A53 and supplies it in runfiles.
 ELF="$RUN/apps/apu/blink/blink.elf"
 if [[ ! -f "$ELF" ]]; then
-    # Walk up from the script to find the workspace root (contains bazel-bin/).
-    WSROOT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-    while [[ "$WSROOT" != "/" && ! -f "$WSROOT/MODULE.bazel" ]]; do
-        WSROOT="$(dirname "$WSROOT")"
-    done
-    ELF="$WSROOT/bazel-bin/apps/apu/blink/blink.elf"
-fi
-
-if [[ ! -f "$ELF" ]]; then
-    echo "FAIL: blink.elf not found — pre-build with:"
-    echo "  bazel build --config=apu //apps/apu/blink:blink.elf"
+    echo "FAIL: blink.elf is missing from test runfiles"
     exit 1
 fi
 

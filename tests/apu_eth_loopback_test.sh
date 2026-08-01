@@ -23,15 +23,7 @@ PSI="$RUN/board/zub_1cg/psu_init.tcl"
 
 ELF="$RUN/apps/apu/eth_loopback/eth_loopback_a53.elf"
 if [[ ! -f "$ELF" ]]; then
-    WSROOT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-    while [[ "$WSROOT" != "/" && ! -f "$WSROOT/MODULE.bazel" ]]; do
-        WSROOT="$(dirname "$WSROOT")"
-    done
-    ELF="$WSROOT/bazel-bin/apps/apu/eth_loopback/eth_loopback_a53.elf"
-fi
-if [[ ! -f "$ELF" ]]; then
-    echo "FAIL: eth_loopback_a53.elf not found — pre-build with:"
-    echo "  bazel build --config=apu //apps/apu/eth_loopback:eth_loopback_a53.elf"
+    echo "FAIL: eth_loopback_a53.elf is missing from test runfiles"
     exit 1
 fi
 

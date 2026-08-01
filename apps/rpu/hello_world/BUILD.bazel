@@ -17,6 +17,10 @@ cc_binary(
     additional_linker_inputs = ["//board/rpu:linker_script"],
     linkopts = [
         "-T$(location //board/rpu:linker_script)",
+        # This target supplies its own reset handler in //board/rpu:startup.S.
+        # Keep the requirement here so host-side test transitions build the
+        # same firmware as `bazel build --config=rpu`.
+        "-nostartfiles",
         # newlib-nano: tiny libc (memset, memcpy, printf, …) + nosys syscall stubs.
         # Requires the Arm GNU Toolchain (gcc-arm-embedded); not -nostdlib.
         "--specs=nano.specs",
@@ -26,4 +30,5 @@ cc_binary(
         "//board/rpu:bsp",
         "@threadx//:threadx_r5",
     ],
+    visibility = ["//visibility:public"],
 )

@@ -4,10 +4,8 @@
 # Preconditions:
 #   - Board plugged in (USB-JTAG at FT2232H, boot switches all OFF = JTAG mode)
 #   - /dev/ttyUSB1 present (UART0 console via MIO 10/11)
-#   - //apps/rpu/hello_world built with --config=rpu
 #
 # Workflow:
-#   bazel build --config=rpu //apps/rpu/hello_world
 #   bazel test --config=host --config=onboard //tests:rpu_hello_world_test
 set -euo pipefail
 
@@ -33,19 +31,10 @@ OPENOCD_CFG="$RUN/scripts/openocd/aes_zub.cfg"
 LOAD_R5="$RUN/scripts/openocd/load_r5.tcl"
 PSU_INIT_RUN="$RUN/scripts/openocd/psu_init_run.tcl"
 
-# ELF is cross-compiled (--config=rpu) so it cannot be a Bazel data dep of a
-# host-platform test.  Look in runfiles first, then fall back to bazel-bin.
+# The test rule cross-compiles this ELF for R5 and supplies it in runfiles.
 ELF="$RUN/apps/rpu/hello_world/hello_world"
 if [[ ! -f "$ELF" ]]; then
-    WSROOT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-    while [[ "$WSROOT" != "/" && ! -f "$WSROOT/MODULE.bazel" ]]; do
-        WSROOT="$(dirname "$WSROOT")"
-    done
-    ELF="$WSROOT/bazel-bin/apps/rpu/hello_world/hello_world"
-fi
-if [[ ! -f "$ELF" ]]; then
-    echo "FAIL: R5 ELF not found — pre-build with:"
-    echo "  bazel build --config=rpu //apps/rpu/hello_world"
+    echo "FAIL: R5 ELF is missing from test runfiles"
     exit 1
 fi
 

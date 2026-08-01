@@ -52,9 +52,9 @@ Audit snapshot from 2026-08-01:
   entry points are currently `0x0` (APU blink and Ethernet), `0x800` (APU
   ThreadX hello), and `0xffff0128` (R5 hello); README values do not consistently
   match these artifacts.
-- The four board tests are manual and serialized, but APU tests find a
-  separately prebuilt ELF outside their declared runfiles. Missing firmware now
-  fails, but the undeclared workspace dependency remains.
+- The four board tests are manual and serialized. Each now builds its A53 or
+  R5 firmware through a Bazel platform transition and receives that ELF in
+  declared runfiles; hardware execution remains blocked on UART routing.
 - Cold-boot PS UART routing remains the principal hardware blocker. The last
   recorded state is that the transmitter drains but no bytes reach FTDI channel
   1; an earlier successful sequence inherited PS configuration from Vitis.

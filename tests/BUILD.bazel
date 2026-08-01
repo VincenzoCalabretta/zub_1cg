@@ -9,11 +9,8 @@ All targets are tagged `manual`, `exclusive`, and `local`:
 The `--config=onboard` flag (defined in .bazelrc) sets --spawn_strategy=local,
 which disables the Linux sandbox and allows tests to open /dev/ttyUSB* devices.
 
-To run a test:
-  # Step 1: cross-compile the APU ELF (one-time, or after source changes)
-  bazel build --config=apu //apps/apu/blink:blink.elf
-
-  # Step 2: run the test with board connected in JTAG mode
+To run a test, connect the board in JTAG mode. Firmware is built automatically
+for the target core and included in the host test's runfiles:
   bazel test --config=host --config=onboard //tests:apu_blink_test
   bazel test --config=host --config=onboard //tests:apu_hello_world_test
   bazel test --config=host --config=onboard //tests:apu_eth_loopback_test
@@ -26,13 +23,17 @@ Environment variables (all optional):
   XSCT          — path to Xilinx xsct             (A53 and RPU tests)
 """
 
+load(":rules.bzl", "onboard_firmware_test")
+
 package(default_visibility = ["//visibility:public"])
 
 _HW_TAGS = ["manual", "exclusive", "requires-hardware", "local"]
 
-sh_test(
+onboard_firmware_test(
     name = "rpu_hello_world_test",
-    srcs = ["rpu_hello_world_test.sh"],
+    test_script = "rpu_hello_world_test.sh",
+    firmware = "//apps/rpu/hello_world:hello_world",
+    firmware_platform = "//platforms:rpu_r5_0",
     data = [
         "//board/zub_1cg:psu_init",
         "//scripts/openocd:aes_zub_cfg",
@@ -43,12 +44,12 @@ sh_test(
     tags = _HW_TAGS,
 )
 
-sh_test(
+onboard_firmware_test(
     name = "apu_hello_world_test",
-    srcs = ["apu_hello_world_test.sh"],
+    test_script = "apu_hello_world_test.sh",
+    firmware = "//apps/apu/hello_world:hello_world_a53.elf",
+    firmware_platform = "//platforms:apu_a53",
     data = [
-        # ELF not listed: cross-compiled (--config=apu), incompatible with host
-        # platform.  Pre-build: bazel build --config=apu //apps/apu/hello_world:hello_world_a53.elf
         "//board/zub_1cg:bitstream",
         "//board/zub_1cg:psu_init",
         "//tools/zub_ctl:zub_ctl",
@@ -56,12 +57,12 @@ sh_test(
     tags = _HW_TAGS,
 )
 
-sh_test(
+onboard_firmware_test(
     name = "apu_blink_test",
-    srcs = ["apu_blink_test.sh"],
+    test_script = "apu_blink_test.sh",
+    firmware = "//apps/apu/blink:blink.elf",
+    firmware_platform = "//platforms:apu_a53",
     data = [
-        # ELF not listed: cross-compiled (--config=apu), incompatible with host
-        # platform.  Pre-build: bazel build --config=apu //apps/apu/blink:blink.elf
         "//board/zub_1cg:bitstream",
         "//board/zub_1cg:psu_init",
         "//tools/zub_ctl:zub_ctl",
@@ -69,12 +70,12 @@ sh_test(
     tags = _HW_TAGS,
 )
 
-sh_test(
+onboard_firmware_test(
     name = "apu_eth_loopback_test",
-    srcs = ["apu_eth_loopback_test.sh"],
+    test_script = "apu_eth_loopback_test.sh",
+    firmware = "//apps/apu/eth_loopback:eth_loopback_a53.elf",
+    firmware_platform = "//platforms:apu_a53",
     data = [
-        # ELF not listed: cross-compiled (--config=apu), incompatible with host
-        # platform.  Pre-build: bazel build --config=apu //apps/apu/eth_loopback:eth_loopback_a53.elf
         "//board/zub_1cg:bitstream",
         "//board/zub_1cg:psu_init",
         "//tools/zub_ctl:zub_ctl",
