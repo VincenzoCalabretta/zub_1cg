@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  presubmit:
+    name: Presubmit (format + host tests + firmware link)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Cache Nix store
+        uses: actions/cache@v4
+        with:
+          path: /nix/store
+          key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-keys: |
+            nix-${{ runner.os }}-
+
+      - name: Cache Bazel outputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel.lock') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-
+
+      - name: Presubmit
+        run: nix develop --command scripts/presubmit.sh
+
+  manual-build:
+    name: Manual-target link check (hardware test binaries)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Cache Bazel outputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-manual-${{ runner.os }}-${{ hashFiles('MODULE.bazel.lock') }}
+          restore-keys: |
+            bazel-manual-${{ runner.os }}-
+
+      - name: Build APU hardware-test firmware
+        run: |
+          nix develop --command bazel build --config=apu \
+            //apps/apu/blink:blink.elf \
+            //apps/apu/hello_world:hello_world_a53.elf \
+            //apps/apu/eth_loopback:eth_loopback_a53.elf
+
+      - name: Build RPU hardware-test firmware
+        run: |
+          nix develop --command bazel build --config=rpu \
+            //apps/rpu/hello_world:hello_world
+
+      - name: Build zub_ctl host binary
+        run: nix develop --command bazel build --config=host //tools/zub_ctl:zub_ctl

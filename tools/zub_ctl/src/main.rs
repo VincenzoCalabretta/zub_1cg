@@ -163,8 +163,12 @@ fn run_doctor(args: DoctorArgs) -> Result<bool> {
 
     // 1. TTY presence.
     let tty_exists = args.tty.exists();
-    print_check(tty_exists, false, &format!("TTY device {}", args.tty.display()),
-        if tty_exists { "" } else { "device not found" });
+    print_check(
+        tty_exists,
+        false,
+        &format!("TTY device {}", args.tty.display()),
+        if tty_exists { "" } else { "device not found" },
+    );
     failed |= !tty_exists;
 
     // 2. TTY read/write permission.
@@ -174,9 +178,16 @@ fn run_doctor(args: DoctorArgs) -> Result<bool> {
             .write(true)
             .open(&args.tty)
             .is_ok();
-        print_check(perm_ok, false,
+        print_check(
+            perm_ok,
+            false,
             &format!("TTY permissions (r/w) on {}", args.tty.display()),
-            if perm_ok { "" } else { "cannot open for read+write; try: sudo usermod -aG dialout $USER" });
+            if perm_ok {
+                ""
+            } else {
+                "cannot open for read+write; try: sudo usermod -aG dialout $USER"
+            },
+        );
         failed |= !perm_ok;
     }
 
@@ -184,12 +195,22 @@ fn run_doctor(args: DoctorArgs) -> Result<bool> {
     let by_id = std::path::Path::new("/dev/serial/by-id");
     if by_id.exists() {
         let ft2232_found = fs::read_dir(by_id)
-            .map(|entries| entries.filter_map(|e| e.ok())
-                .any(|e| e.file_name().to_string_lossy().contains("FT2232")))
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().contains("FT2232"))
+            })
             .unwrap_or(false);
-        print_check(ft2232_found, true,
+        print_check(
+            ft2232_found,
+            true,
             "FT2232H in /dev/serial/by-id",
-            if ft2232_found { "" } else { "no FT2232H enumerated; check USB cable / driver" });
+            if ft2232_found {
+                ""
+            } else {
+                "no FT2232H enumerated; check USB cable / driver"
+            },
+        );
     }
 
     // 4. openocd version.
@@ -205,9 +226,12 @@ fn run_doctor(args: DoctorArgs) -> Result<bool> {
             print_check(true, false, &format!("openocd ({first})"), "");
         }
         Err(e) => {
-            print_check(false, false,
+            print_check(
+                false,
+                false,
                 &format!("openocd ({})", args.openocd),
-                &format!("{e}"));
+                &format!("{e}"),
+            );
             failed = true;
         }
     }
@@ -217,9 +241,12 @@ fn run_doctor(args: DoctorArgs) -> Result<bool> {
         None => print_check_skip("xsct binary (--xsct not provided)"),
         Some(path) => {
             let ok = path.exists();
-            print_check(ok, false,
+            print_check(
+                ok,
+                false,
                 &format!("xsct at {}", path.display()),
-                if ok { "" } else { "file not found" });
+                if ok { "" } else { "file not found" },
+            );
             failed |= !ok;
         }
     }
@@ -231,24 +258,35 @@ fn run_doctor(args: DoctorArgs) -> Result<bool> {
             let manifest_path = dir.join("artifacts.json");
             match fs::read_to_string(&manifest_path) {
                 Err(e) => {
-                    print_check(false, false, "artifacts.json readable",
-                        &format!("{}: {e}", manifest_path.display()));
+                    print_check(
+                        false,
+                        false,
+                        "artifacts.json readable",
+                        &format!("{}: {e}", manifest_path.display()),
+                    );
                     failed = true;
                 }
                 Ok(json) => {
                     let entries = parse_artifact_hashes(&json);
                     if entries.is_empty() {
-                        print_check(false, false, "artifacts.json has entries",
-                            "parse yielded zero (path, sha256) pairs");
+                        print_check(
+                            false,
+                            false,
+                            "artifacts.json has entries",
+                            "parse yielded zero (path, sha256) pairs",
+                        );
                         failed = true;
                     }
                     for (rel, expected) in &entries {
                         let full = dir.join(rel);
                         match fs::read(&full) {
                             Err(e) => {
-                                print_check(false, false,
+                                print_check(
+                                    false,
+                                    false,
                                     &format!("artifact {rel}"),
-                                    &format!("cannot read: {e}"));
+                                    &format!("cannot read: {e}"),
+                                );
                                 failed = true;
                             }
                             Ok(data) => {
@@ -259,9 +297,12 @@ fn run_doctor(args: DoctorArgs) -> Result<bool> {
                                 } else {
                                     format!("computed {actual}, manifest {expected}")
                                 };
-                                print_check(ok, false,
+                                print_check(
+                                    ok,
+                                    false,
                                     &format!("artifact {rel} SHA-256"),
-                                    &mismatch);
+                                    &mismatch,
+                                );
                                 failed |= !ok;
                             }
                         }
@@ -283,9 +324,23 @@ fn print_check(ok: bool, advisory: bool, label: &str, detail: &str) {
     if ok {
         eprintln!("[OK  ] {label}");
     } else if advisory {
-        eprintln!("[WARN] {label}{}", if detail.is_empty() { String::new() } else { format!(" — {detail}") });
+        eprintln!(
+            "[WARN] {label}{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" — {detail}")
+            }
+        );
     } else {
-        eprintln!("[FAIL] {label}{}", if detail.is_empty() { String::new() } else { format!(" — {detail}") });
+        eprintln!(
+            "[FAIL] {label}{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" — {detail}")
+            }
+        );
     }
 }
 
@@ -311,9 +366,13 @@ fn run_watch_r5(args: WatchR5Args) -> Result<bool> {
     //    FTDI channel-1 pin. xsct owns the JTAG cable during this step,
     //    so openocd cannot be running yet.
     if let Some(xsct) = args.pre_xsct.as_ref() {
-        let script = args.pre_xsct_script.as_ref()
+        let script = args
+            .pre_xsct_script
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--pre-xsct requires --pre-xsct-script"))?;
-        let psinit = args.psinit.as_ref()
+        let psinit = args
+            .psinit
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--pre-xsct requires --psinit"))?;
         let psinit_abs = fs::canonicalize(psinit)
             .with_context(|| format!("resolve psu_init: {}", psinit.display()))?;
@@ -337,8 +396,8 @@ fn run_watch_r5(args: WatchR5Args) -> Result<bool> {
     // Inject ELF path before the script so the script's `$ELF` variable is
     // already set to an absolute path regardless of the working directory.
     if let Some(elf) = &args.elf {
-        let elf_abs = fs::canonicalize(elf)
-            .with_context(|| format!("resolve ELF {}", elf.display()))?;
+        let elf_abs =
+            fs::canonicalize(elf).with_context(|| format!("resolve ELF {}", elf.display()))?;
         cmd.arg("--command")
             .arg(format!("set ELF {{{}}}", elf_abs.display()));
     }
@@ -471,9 +530,7 @@ fn compile_regexes(patterns: &[String]) -> Result<Vec<Regex>> {
         .collect()
 }
 
-fn spawn_serial_watch(
-    args: &SerialArgs,
-) -> Result<(Arc<AtomicBool>, JoinHandle<Result<bool>>)> {
+fn spawn_serial_watch(args: &SerialArgs) -> Result<(Arc<AtomicBool>, JoinHandle<Result<bool>>)> {
     let expect = compile_regexes(&args.expect)?;
     let fail_on = compile_regexes(&args.fail_on)?;
 
@@ -546,7 +603,10 @@ fn spawn_serial_watch(
                         }
                         for pat in &fail_on {
                             if pat.is_match(&line) {
-                                eprintln!("[zub_ctl] serial-watch: fail-on regex hit: {}", pat.as_str());
+                                eprintln!(
+                                    "[zub_ctl] serial-watch: fail-on regex hit: {}",
+                                    pat.as_str()
+                                );
                                 return Ok(false);
                             }
                         }

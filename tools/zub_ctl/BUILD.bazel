@@ -15,7 +15,10 @@ Usage from an integration test (see //tests):
 load("@rules_rust//rust:defs.bzl", "rust_binary")
 
 exports_files(
-    ["Cargo.toml", "Cargo.lock"],
+    [
+        "Cargo.toml",
+        "Cargo.lock",
+    ],
     visibility = ["//visibility:public"],
 )
 
@@ -23,6 +26,9 @@ rust_binary(
     name = "zub_ctl",
     srcs = ["src/main.rs"],
     edition = "2021",
+    # serialport links libudev on Linux; the -sys crate finds it via pkg-config
+    # against the Nix-provided systemdMinimal in the devShell.
+    tags = ["requires-network"],
     visibility = ["//visibility:public"],
     deps = [
         "//tools/elf_check:elf_check_lib",
@@ -31,7 +37,4 @@ rust_binary(
         "@zub_ctl_crates//:regex",
         "@zub_ctl_crates//:serialport",
     ],
-    # serialport links libudev on Linux; the -sys crate finds it via pkg-config
-    # against the Nix-provided systemdMinimal in the devShell.
-    tags = ["requires-network"],
 )

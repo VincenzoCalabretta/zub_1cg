@@ -9,14 +9,14 @@ filegroup(name = "empty")
 
 cc_toolchain(
     name = "aarch64_none_elf_cc_toolchain",
+    all_files = ":empty",
+    ar_files = ":empty",
+    compiler_files = ":empty",
+    dwp_files = ":empty",
+    linker_files = ":empty",
+    objcopy_files = ":empty",
+    strip_files = ":empty",
     toolchain_config = ":aarch64_none_elf_config",
-    all_files        = ":empty",
-    ar_files         = ":empty",
-    compiler_files   = ":empty",
-    dwp_files        = ":empty",
-    linker_files     = ":empty",
-    objcopy_files    = ":empty",
-    strip_files      = ":empty",
 )
 
 toolchain(
@@ -29,6 +29,6 @@ toolchain(
         "@platforms//os:none",
         "@platforms//cpu:aarch64",
     ],
-    toolchain      = ":aarch64_none_elf_cc_toolchain",
+    toolchain = ":aarch64_none_elf_cc_toolchain",
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 )

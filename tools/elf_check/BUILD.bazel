@@ -3,7 +3,10 @@
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 exports_files(
-    ["Cargo.toml", "Cargo.lock"],
+    [
+        "Cargo.toml",
+        "Cargo.lock",
+    ],
     visibility = ["//visibility:public"],
 )
 

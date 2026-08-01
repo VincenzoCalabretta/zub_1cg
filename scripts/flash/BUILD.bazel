@@ -21,8 +21,8 @@ sh_binary(
     # with --config=host without conflicting platform constraints.
     data = [
         "boot_a53.bif",
-        "//board/a53_loader:sources",
         "//board/a53_loader:linker_script",
+        "//board/a53_loader:sources",
     ],
 )
 

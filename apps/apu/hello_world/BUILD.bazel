@@ -3,8 +3,8 @@ cc_binary(
     srcs = [
         "src/helloworld.c",
         "src/platform.c",
-        "src/xuartps_hw.c",
         "src/platform.h",
+        "src/xuartps_hw.c",
     ],
     additional_linker_inputs = ["//board/apu:lscript_a53.ld"],
     linkopts = ["-T$(location //board/apu:lscript_a53.ld)"],
@@ -12,10 +12,10 @@ cc_binary(
         "@platforms//os:none",
         "@platforms//cpu:aarch64",
     ],
+    visibility = ["//visibility:public"],
     deps = [
         "//board/apu:bsp",
         "//third_party/xilinx_bsp:headers",
         "@threadx//:threadx_a53",
     ],
-    visibility = ["//visibility:public"],
 )

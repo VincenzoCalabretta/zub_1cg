@@ -21,8 +21,8 @@ cc_library(
         ["*.hpp"],
         exclude = ["ThreadXGEM2Driver.*"],
     ),
-    strip_include_prefix = "/third_party/os_abstraction_layer",
     include_prefix = "encore/OS",
+    strip_include_prefix = "/third_party/os_abstraction_layer",
     target_compatible_with = [
         "@platforms//os:none",
         "@platforms//cpu:aarch64",
@@ -31,8 +31,8 @@ cc_library(
     deps = [
         "//third_party/os_abstraction_layer/Common:common",
         "//third_party/xilinx_bsp:headers",
-        "@filex//:filex",
-        "@netxduo//:netxduo",
+        "@filex",
+        "@netxduo",
         "@threadx//:threadx_a53",
     ],
 )
@@ -41,8 +41,8 @@ cc_library(
     name = "threadx_gem2_drv",
     srcs = ["ThreadXGEM2Driver.c"],
     hdrs = ["ThreadXGEM2Driver.h"],
-    strip_include_prefix = "/third_party/os_abstraction_layer",
     include_prefix = "encore/OS",
+    strip_include_prefix = "/third_party/os_abstraction_layer",
     target_compatible_with = [
         "@platforms//os:none",
         "@platforms//cpu:aarch64",
@@ -51,7 +51,7 @@ cc_library(
     deps = [
         "//board/apu:bsp",
         "//third_party/xilinx_bsp:headers",
-        "@netxduo//:netxduo",
+        "@netxduo",
         "@threadx//:threadx_a53",
     ],
 )

@@ -49,7 +49,8 @@ def _arm_gcc_config_impl(repo_ctx):
     gcc_bin = repo_ctx.os.environ.get("ARM_GCC_BIN", "").strip()
     if not gcc_bin:
         r = repo_ctx.execute([
-            "sh", "-c",
+            "sh",
+            "-c",
             "dirname $(which arm-none-eabi-gcc 2>/dev/null) 2>/dev/null",
         ])
         gcc_bin = r.stdout.strip() if r.return_code == 0 else "/usr/bin"

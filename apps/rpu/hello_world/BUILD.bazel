@@ -3,6 +3,9 @@
 cc_binary(
     name = "hello_world",
     srcs = ["main.c"],
+    # Pass the linker script; $(location ...) expands to the file's path at
+    # build time. additional_linker_inputs ensures Bazel tracks the dependency.
+    additional_linker_inputs = ["//board/rpu:linker_script"],
     copts = [
         "-mcpu=cortex-r5",
         "-mfpu=vfpv3-d16",
@@ -12,9 +15,6 @@ cc_binary(
         "-ffreestanding",
         "-fno-builtin",
     ],
-    # Pass the linker script; $(location ...) expands to the file's path at
-    # build time. additional_linker_inputs ensures Bazel tracks the dependency.
-    additional_linker_inputs = ["//board/rpu:linker_script"],
     linkopts = [
         "-T$(location //board/rpu:linker_script)",
         # This target supplies its own reset handler in //board/rpu:startup.S.
@@ -26,9 +26,9 @@ cc_binary(
         "--specs=nano.specs",
         "--specs=nosys.specs",
     ],
+    visibility = ["//visibility:public"],
     deps = [
         "//board/rpu:bsp",
         "@threadx//:threadx_r5",
     ],
-    visibility = ["//visibility:public"],
 )

@@ -3,6 +3,8 @@
 The compiler prefix is captured at Bazel fetch time by env_ext.bzl.
 """
 
+load("@arm_gcc_config//:defs.bzl", "ARM_GCC_BIN", "ARM_GCC_INCLUDE_DIRS")
+load("@bazel_tools//tools/build_defs/cc:action_names.bzl", "ACTION_NAMES")
 load(
     "@bazel_tools//tools/cpp:cc_toolchain_config_lib.bzl",
     "feature",
@@ -10,8 +12,6 @@ load(
     "flag_set",
     "tool_path",
 )
-load("@bazel_tools//tools/build_defs/cc:action_names.bzl", "ACTION_NAMES")
-load("@arm_gcc_config//:defs.bzl", "ARM_GCC_BIN", "ARM_GCC_INCLUDE_DIRS")
 
 _ALL_COMPILE_ACTIONS = [
     ACTION_NAMES.c_compile,
@@ -42,16 +42,16 @@ _CPU_FLAGS = [
 
 def _impl(ctx):
     tool_paths = [
-        tool_path(name = "gcc",     path = _GCC_PREFIX + "gcc"),
-        tool_path(name = "g++",     path = _GCC_PREFIX + "g++"),
-        tool_path(name = "ld",      path = _GCC_PREFIX + "ld"),
-        tool_path(name = "ar",      path = _GCC_PREFIX + "ar"),
-        tool_path(name = "cpp",     path = _GCC_PREFIX + "cpp"),
-        tool_path(name = "gcov",    path = _GCC_PREFIX + "gcov"),
-        tool_path(name = "nm",      path = _GCC_PREFIX + "nm"),
+        tool_path(name = "gcc", path = _GCC_PREFIX + "gcc"),
+        tool_path(name = "g++", path = _GCC_PREFIX + "g++"),
+        tool_path(name = "ld", path = _GCC_PREFIX + "ld"),
+        tool_path(name = "ar", path = _GCC_PREFIX + "ar"),
+        tool_path(name = "cpp", path = _GCC_PREFIX + "cpp"),
+        tool_path(name = "gcov", path = _GCC_PREFIX + "gcov"),
+        tool_path(name = "nm", path = _GCC_PREFIX + "nm"),
         tool_path(name = "objdump", path = _GCC_PREFIX + "objdump"),
-        tool_path(name = "strip",   path = _GCC_PREFIX + "strip"),
-        tool_path(name = "dwp",     path = "/usr/bin/false"),
+        tool_path(name = "strip", path = _GCC_PREFIX + "strip"),
+        tool_path(name = "dwp", path = "/usr/bin/false"),
     ]
 
     default_compile = feature(
@@ -80,7 +80,7 @@ def _impl(ctx):
         )],
     )
 
-    no_pic     = feature(name = "supports_pic",            enabled = False)
+    no_pic = feature(name = "supports_pic", enabled = False)
     no_dynamic = feature(name = "supports_dynamic_linker", enabled = False)
 
     return cc_common.create_cc_toolchain_config_info(
@@ -88,14 +88,14 @@ def _impl(ctx):
         features = [default_compile, default_link, no_pic, no_dynamic],
         cxx_builtin_include_directories = ARM_GCC_INCLUDE_DIRS,
         toolchain_identifier = "arm-none-eabi-cortex-r5",
-        host_system_name     = "x86_64-linux-gnu",
-        target_system_name   = "arm-none-eabi",
-        target_cpu           = "cortex-r5",
-        target_libc          = "none",
-        compiler             = "gcc",
-        abi_version          = "none",
-        abi_libc_version     = "none",
-        tool_paths           = tool_paths,
+        host_system_name = "x86_64-linux-gnu",
+        target_system_name = "arm-none-eabi",
+        target_cpu = "cortex-r5",
+        target_libc = "none",
+        compiler = "gcc",
+        abi_version = "none",
+        abi_libc_version = "none",
+        tool_paths = tool_paths,
     )
 
 arm_none_eabi_toolchain_config = rule(

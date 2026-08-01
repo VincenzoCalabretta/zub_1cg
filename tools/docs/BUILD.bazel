@@ -3,7 +3,10 @@
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 exports_files(
-    ["Cargo.toml", "Cargo.lock"],
+    [
+        "Cargo.toml",
+        "Cargo.lock",
+    ],
     visibility = ["//visibility:public"],
 )
 
@@ -23,8 +26,8 @@ rust_binary(
     name = "pdf_to_markdown",
     srcs = ["src/main.rs"],
     edition = "2021",
-    deps = [":pdf_to_markdown_lib"],
     visibility = ["//visibility:public"],
+    deps = [":pdf_to_markdown_lib"],
 )
 
 rust_test(

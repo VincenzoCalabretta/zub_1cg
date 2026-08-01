@@ -21,14 +21,14 @@ cc_library(
     name = "bsp",
     srcs = [
         "startup.S",
-        "uart.c",
         "timer.c",
+        "uart.c",
     ],
     hdrs = [
-        "uart.h",
         "timer.h",
+        "uart.h",
     ],
-    includes = ["."],
     copts = _R5F_COPTS,
+    includes = ["."],
     visibility = ["//visibility:public"],
 )

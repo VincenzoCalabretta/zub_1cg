@@ -80,11 +80,11 @@ cc_library(
         "common/inc/*.h",
         "ports/cortex_r5/gnu/inc/*.h",
     ]),
+    copts = _R5F_COPTS,
     includes = [
         "common/inc",
         "ports/cortex_r5/gnu/inc",
     ],
-    copts = _R5F_COPTS,
     target_compatible_with = [
         "@platforms//os:none",
         "@platforms//cpu:armv7",

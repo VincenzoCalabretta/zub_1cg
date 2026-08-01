@@ -7,10 +7,10 @@ cc_binary(
         "@platforms//os:none",
         "@platforms//cpu:aarch64",
     ],
+    visibility = ["//visibility:public"],
     deps = [
         "//third_party/xilinx_bsp:headers",
         "//third_party/xilinx_bsp:libxil",
         "//third_party/xilinx_bsp:libxilstandalone",
     ],
-    visibility = ["//visibility:public"],
 )

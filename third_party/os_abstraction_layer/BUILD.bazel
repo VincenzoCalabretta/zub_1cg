@@ -3,8 +3,8 @@
 cc_library(
     name = "os_abstraction_layer",
     hdrs = ["OS.hpp"],
-    strip_include_prefix = "/third_party/os_abstraction_layer",
     include_prefix = "encore/OS",
+    strip_include_prefix = "/third_party/os_abstraction_layer",
     visibility = ["//visibility:public"],
     deps = ["//third_party/os_abstraction_layer/Common:common"],
 )

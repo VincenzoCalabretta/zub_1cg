@@ -12,7 +12,10 @@ find them on-disk.
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(glob(["*.cfg", "*.tcl"]))
+exports_files(glob([
+    "*.cfg",
+    "*.tcl",
+]))
 
 filegroup(
     name = "aes_zub_cfg",
@@ -26,5 +29,8 @@ filegroup(
 
 filegroup(
     name = "all_scripts",
-    srcs = glob(["*.cfg", "*.tcl"]),
+    srcs = glob([
+        "*.cfg",
+        "*.tcl",
+    ]),
 )

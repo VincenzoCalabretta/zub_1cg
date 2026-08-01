@@ -16,7 +16,10 @@ fn board_artifacts_match_manifest() {
         .unwrap_or_else(|e| panic!("cannot read {}: {}", manifest_path.display(), e));
 
     let entries = parse_artifact_hashes(&manifest);
-    assert!(!entries.is_empty(), "artifacts.json yielded no (path, sha256) entries");
+    assert!(
+        !entries.is_empty(),
+        "artifacts.json yielded no (path, sha256) entries"
+    );
 
     for (rel_path, expected) in entries {
         let full_path = dir.join(&rel_path);

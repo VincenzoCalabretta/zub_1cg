@@ -115,7 +115,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-003: Make board tests truthful and single-command
 
-- **Status:** in progress; depends on ZUB-001 for passing UART assertions
+- **Status:** in progress (doctor preflight done; board-test Starlark macro and per-test doctor integration remain; blocked on ZUB-001 for passing UART assertions)
 - **Work:** Replace workspace-relative `bazel-bin` discovery with a Bazel rule
   or transition that builds the firmware for its target platform and places it
   in the host test's runfiles. Factor the four shell wrappers into a Starlark
@@ -147,7 +147,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-011: Establish a hardware-independent CI gate
 
-- **Status:** proposed; depends on ZUB-002
+- **Status:** done (.github/workflows/ci.yml gates every push/PR on scripts/presubmit.sh; manual-build job keeps hardware-test firmware link-checked without requiring hardware)
 - **Work:** Add CI that enters the locked Nix environment and runs host tests,
   both cross-build configurations, ELF invariant tests, `nix flake check`, and
   repository formatting/lint checks. Run explicit builds for targets tagged
@@ -160,7 +160,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-012: Add deterministic developer quality commands
 
-- **Status:** proposed
+- **Status:** done (scripts/presubmit.sh runs buildifier + rustfmt --check + all host tests + APU/RPU builds; CI delegates to it so local and remote checks are identical)
 - **Work:** Provide Bazel targets or documented Bazel invocations for
   `buildifier`, C/C++ formatting and warnings, ShellCheck, Rust formatting and
   Clippy, and Tcl syntax/smoke checks where feasible. Promote new warnings to

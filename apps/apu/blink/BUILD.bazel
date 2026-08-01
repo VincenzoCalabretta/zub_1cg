@@ -3,10 +3,10 @@ cc_binary(
     srcs = ["src/main.c"],
     additional_linker_inputs = ["//board/apu:lscript_a53.ld"],
     linkopts = ["-T$(location //board/apu:lscript_a53.ld)"],
-    deps = ["//third_party/xilinx_bsp:headers"],
     target_compatible_with = [
         "@platforms//os:none",
         "@platforms//cpu:aarch64",
     ],
     visibility = ["//visibility:public"],
+    deps = ["//third_party/xilinx_bsp:headers"],
 )

@@ -196,7 +196,7 @@
     },
     "//toolchains/aarch64_none_elf:env_ext.bzl%aarch64_gcc_config_ext": {
       "general": {
-        "bzlTransitiveDigest": "luUL/XcN4h3BZtDaOgb+BGetNCz8ybPEmu2B/GS2miE=",
+        "bzlTransitiveDigest": "yTKvzPDkvrhkO9H/nHkNYEBSkPx1clJ72O4a++eWNAc=",
         "usagesDigest": "l+NC8kwtQt7xmXMPQ7Mpo+GilakNNhC/m0id+z6qrdA=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
@@ -214,7 +214,7 @@
     },
     "//toolchains/arm_none_eabi:env_ext.bzl%arm_gcc_config_ext": {
       "general": {
-        "bzlTransitiveDigest": "k4g5Xt48cgllf76FDDyMpwGnTl8nczs311y75JfY2MU=",
+        "bzlTransitiveDigest": "/l6Px/HTEcTLM8YgnQJYhBp5Gu9g0jznze+UCo6+ECE=",
         "usagesDigest": "YLK8BmOJApCHBwnTTsJxAOu3cxA0MtYZX/DgoWaqbe0=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},

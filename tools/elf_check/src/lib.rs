@@ -442,15 +442,28 @@ fn object_end(s: &str) -> usize {
     let mut in_string = false;
     let mut escaped = false;
     for (i, c) in s.char_indices() {
-        if escaped { escaped = false; continue; }
-        if c == '\\' && in_string { escaped = true; continue; }
-        if c == '"' { in_string = !in_string; continue; }
-        if in_string { continue; }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
         match c {
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
-                if depth == 0 { return i; }
+                if depth == 0 {
+                    return i;
+                }
             }
             _ => {}
         }
@@ -469,9 +482,18 @@ fn extract_json_string(obj: &str, key: &str) -> Option<String> {
     let mut result = String::new();
     let mut escaped = false;
     for c in inner.chars() {
-        if escaped { escaped = false; result.push(c); continue; }
-        if c == '\\' { escaped = true; continue; }
-        if c == '"' { return Some(result); }
+        if escaped {
+            escaped = false;
+            result.push(c);
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == '"' {
+            return Some(result);
+        }
         result.push(c);
     }
     None

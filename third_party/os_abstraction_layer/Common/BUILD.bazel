@@ -14,7 +14,7 @@ own deps or copts.
 cc_library(
     name = "common",
     hdrs = glob(["*.hpp"]),
-    strip_include_prefix = "/third_party/os_abstraction_layer",
     include_prefix = "encore/OS",
+    strip_include_prefix = "/third_party/os_abstraction_layer",
     visibility = ["//visibility:public"],
 )

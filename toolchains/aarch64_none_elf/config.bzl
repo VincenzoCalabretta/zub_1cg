@@ -11,19 +11,19 @@ the normal cc_library dep on //third_party/xilinx_bsp:headers.
 """
 
 load(
-    "@bazel_tools//tools/cpp:cc_toolchain_config_lib.bzl",
-    "feature",
-    "flag_group",
-    "flag_set",
-    "tool_path",
-)
-load("@bazel_tools//tools/build_defs/cc:action_names.bzl", "ACTION_NAMES")
-load(
     "@aarch64_gcc_config//:defs.bzl",
     "AARCH64_GCC_BIN",
     "AARCH64_GCC_INCLUDE_DIRS",
     "BSP_LIB_DIR",
     "BSP_SPEC",
+)
+load("@bazel_tools//tools/build_defs/cc:action_names.bzl", "ACTION_NAMES")
+load(
+    "@bazel_tools//tools/cpp:cc_toolchain_config_lib.bzl",
+    "feature",
+    "flag_group",
+    "flag_set",
+    "tool_path",
 )
 
 _ALL_COMPILE_ACTIONS = [
@@ -42,17 +42,17 @@ _ALL_COMPILE_ACTIONS = [
 def _impl(ctx):
     tp = AARCH64_GCC_BIN + "/aarch64-none-elf-"
     tool_paths = [
-        tool_path(name = "gcc",      path = tp + "gcc"),
-        tool_path(name = "g++",      path = tp + "g++"),
-        tool_path(name = "ar",       path = tp + "ar"),
-        tool_path(name = "ld",       path = tp + "ld"),
-        tool_path(name = "nm",       path = tp + "nm"),
-        tool_path(name = "objcopy",  path = tp + "objcopy"),
-        tool_path(name = "objdump",  path = tp + "objdump"),
-        tool_path(name = "strip",    path = tp + "strip"),
-        tool_path(name = "gcov",     path = tp + "gcov"),
-        tool_path(name = "cpp",      path = tp + "cpp"),
-        tool_path(name = "dwp",      path = "/usr/bin/false"),
+        tool_path(name = "gcc", path = tp + "gcc"),
+        tool_path(name = "g++", path = tp + "g++"),
+        tool_path(name = "ar", path = tp + "ar"),
+        tool_path(name = "ld", path = tp + "ld"),
+        tool_path(name = "nm", path = tp + "nm"),
+        tool_path(name = "objcopy", path = tp + "objcopy"),
+        tool_path(name = "objdump", path = tp + "objdump"),
+        tool_path(name = "strip", path = tp + "strip"),
+        tool_path(name = "gcov", path = tp + "gcov"),
+        tool_path(name = "cpp", path = tp + "cpp"),
+        tool_path(name = "dwp", path = "/usr/bin/false"),
         tool_path(name = "llvm-cov", path = "/usr/bin/false"),
     ]
 
@@ -93,20 +93,20 @@ def _impl(ctx):
         )],
     )
 
-    no_pic     = feature(name = "supports_pic",            enabled = False)
+    no_pic = feature(name = "supports_pic", enabled = False)
     no_dynamic = feature(name = "supports_dynamic_linker", enabled = False)
 
     return cc_common.create_cc_toolchain_config_info(
         ctx = ctx,
-        toolchain_identifier       = "aarch64-none-elf",
-        host_system_name           = "x86_64-linux-gnu",
-        target_system_name         = "aarch64-none-elf",
-        target_cpu                 = "aarch64",
-        target_libc                = "none",
-        compiler                   = "gcc",
-        abi_version                = "none",
-        abi_libc_version           = "none",
-        tool_paths                 = tool_paths,
+        toolchain_identifier = "aarch64-none-elf",
+        host_system_name = "x86_64-linux-gnu",
+        target_system_name = "aarch64-none-elf",
+        target_cpu = "aarch64",
+        target_libc = "none",
+        compiler = "gcc",
+        abi_version = "none",
+        abi_libc_version = "none",
+        tool_paths = tool_paths,
         cxx_builtin_include_directories = AARCH64_GCC_INCLUDE_DIRS,
         features = [
             default_compile_flags,

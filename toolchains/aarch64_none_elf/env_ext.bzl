@@ -47,7 +47,8 @@ def _aarch64_gcc_config_impl(repo_ctx):
         # Fallback: search PATH so the repo rule succeeds outside the devShell
         # (build actions will fail later if gcc really is missing).
         r = repo_ctx.execute([
-            "sh", "-c",
+            "sh",
+            "-c",
             "dirname $(which aarch64-none-elf-gcc 2>/dev/null) 2>/dev/null",
         ])
         gcc_bin = r.stdout.strip() if r.return_code == 0 else ""
@@ -72,10 +73,10 @@ AARCH64_GCC_INCLUDE_DIRS = {include_dirs}
 BSP_SPEC    = {bsp_spec}
 BSP_LIB_DIR = {bsp_lib}
 """.format(
-        gcc_bin      = repr(gcc_bin),
+        gcc_bin = repr(gcc_bin),
         include_dirs = repr(include_dirs),
-        bsp_spec     = repr(bsp_root + "/Xilinx.spec"),
-        bsp_lib      = repr(bsp_root + "/lib"),
+        bsp_spec = repr(bsp_root + "/Xilinx.spec"),
+        bsp_lib = repr(bsp_root + "/lib"),
     ))
 
 _aarch64_gcc_config_rule = repository_rule(
