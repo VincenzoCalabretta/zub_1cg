@@ -1,8 +1,8 @@
 cc_binary(
     name = "eth_loopback_a53.elf",
     srcs = ["src/eth_loopback.c"],
-    additional_linker_inputs = ["src/lscript_a53.ld"],
-    linkopts = ["-T$(location src/lscript_a53.ld)"],
+    additional_linker_inputs = ["//board/apu:lscript_a53.ld"],
+    linkopts = ["-T$(location //board/apu:lscript_a53.ld)"],
     target_compatible_with = [
         "@platforms//os:none",
         "@platforms//cpu:aarch64",

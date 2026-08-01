@@ -1,5 +1,10 @@
 """Board support for ZynqMP A53 bare-metal ThreadX."""
 
+exports_files(
+    ["lscript_a53.ld"],
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "bsp",
     srcs = [
