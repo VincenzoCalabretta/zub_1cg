@@ -128,7 +128,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-010: Pin every build input and record artifact provenance
 
-- **Status:** proposed
+- **Status:** in progress
 - **Work:** Add archive hashes to all repository downloads; pin the Bazel major
   version with `.bazelversion`; reduce `PATH` and environment leakage into Bazel
   actions; verify that a clean Nix shell can fetch once and rebuild offline.
