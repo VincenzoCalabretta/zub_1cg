@@ -3,8 +3,11 @@ name = "elf_check"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "ELF load-segment invariant checker for zub_1cg firmware."
+description = "ELF load-segment and board artifact invariant checker for zub_1cg."
 
 [[bin]]
 name = "elf_check"
 path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"

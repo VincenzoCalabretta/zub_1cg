@@ -377,6 +377,106 @@ pub fn validate_required_symbol(elf: &Elf, required: &str) -> Result<(), String>
     }
 }
 
+// ── SHA-256 and artifact manifest parsing ────────────────────────────────────
+
+use sha2::{Digest, Sha256};
+
+pub fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// Extracts (path, sha256) pairs from the board `artifacts.json` manifest.
+///
+/// Recursively scans all JSON objects and collects those that directly own both
+/// a `"path"` and a `"sha256"` field (i.e., the leaf artifact records, not the
+/// enclosing document or board objects).
+pub fn parse_artifact_hashes(json: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    collect_artifact_objects(json, &mut results);
+    results
+}
+
+fn collect_artifact_objects(s: &str, results: &mut Vec<(String, String)>) {
+    let mut remaining = s;
+    while let Some(obj_start) = remaining.find('{') {
+        remaining = &remaining[obj_start + 1..];
+        let depth_end = object_end(remaining);
+        let obj = &remaining[..depth_end];
+        remaining = &remaining[depth_end + 1..];
+        // Recurse into nested objects first (depth-first).
+        collect_artifact_objects(obj, results);
+        // Check if this object directly owns "path" and "sha256" by looking at
+        // a flattened copy where all nested {} are replaced with {}.
+        let flat = flatten_nested_objects(obj);
+        if let (Some(path), Some(hash)) = (
+            extract_json_string(&flat, "\"path\""),
+            extract_json_string(&flat, "\"sha256\""),
+        ) {
+            results.push((path, hash));
+        }
+    }
+}
+
+fn flatten_nested_objects(s: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = s;
+    while let Some(start) = remaining.find('{') {
+        result.push_str(&remaining[..start]);
+        result.push_str("{}");
+        remaining = &remaining[start + 1..];
+        let end = object_end(remaining);
+        remaining = &remaining[end + 1..];
+    }
+    result.push_str(remaining);
+    result
+}
+
+fn object_end(s: &str) -> usize {
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped { escaped = false; continue; }
+        if c == '\\' && in_string { escaped = true; continue; }
+        if c == '"' { in_string = !in_string; continue; }
+        if in_string { continue; }
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 { return i; }
+            }
+            _ => {}
+        }
+    }
+    s.len()
+}
+
+fn extract_json_string(obj: &str, key: &str) -> Option<String> {
+    let key_pos = obj.find(key)?;
+    let after_key = &obj[key_pos + key.len()..];
+    let after_colon = after_key[after_key.find(':')? + 1..].trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let inner = &after_colon[1..];
+    let mut result = String::new();
+    let mut escaped = false;
+    for c in inner.chars() {
+        if escaped { escaped = false; result.push(c); continue; }
+        if c == '\\' { escaped = true; continue; }
+        if c == '"' { return Some(result); }
+        result.push(c);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +586,44 @@ mod tests {
             validate_required_symbol(&elf, "reset_handler").unwrap_err(),
             "ELF is missing required symbol reset_handler"
         );
+    }
+
+    #[test]
+    fn sha256_matches_known_vectors() {
+        // Standard SHA-256 test vectors (all 64 lowercase hex characters = 32 bytes)
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn parse_artifact_hashes_extracts_fields() {
+        let json = r#"{"artifacts":[
+            {"path":"foo.bit","role":"bitstream","sha256":"aabbcc"},
+            {"path":"bar.tcl","role":"init","sha256":"112233"}
+        ]}"#;
+        let hashes = parse_artifact_hashes(json);
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0], ("foo.bit".into(), "aabbcc".into()));
+        assert_eq!(hashes[1], ("bar.tcl".into(), "112233".into()));
+    }
+
+    #[test]
+    fn parse_artifact_hashes_skips_objects_without_both_fields() {
+        let json = r#"{"board":{"model":"X"},"artifacts":[{"path":"a","sha256":"1234"}]}"#;
+        let hashes = parse_artifact_hashes(json);
+        // board object has no sha256, outer document object is filtered out;
+        // only the leaf artifact object is collected
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].0, "a");
     }
 }

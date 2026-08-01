@@ -1,4 +1,4 @@
-"""Board artifacts for the Avnet AES-ZUB-1CG (Zynq UltraScale+ ZU1CG).
+"""Board artifacts for the Avnet AES-ZUB-1CG (Zynq UltraScale+ ZU1CG) and integrity checks.
 
   design_1_wrapper.bit  — PL bitstream built from //vivado_workspace originals:
                           the eth-loopback-capable design (AXI GPIO at 0xA0000000,
@@ -9,6 +9,8 @@
 Both artifacts are opaque blobs to Bazel — regenerated in Vitis/Vivado, not
 here. See README.md § "Regenerating board artifacts" for the procedure.
 """
+
+load("@rules_rust//rust:defs.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -25,4 +27,15 @@ filegroup(
 filegroup(
     name = "artifacts_manifest",
     srcs = ["artifacts.json"],
+)
+
+rust_test(
+    name = "artifact_integrity_test",
+    srcs = ["artifact_integrity_test.rs"],
+    data = [
+        ":artifacts_manifest",
+        ":bitstream",
+        ":psu_init",
+    ],
+    deps = ["//tools/elf_check:elf_check_lib"],
 )
