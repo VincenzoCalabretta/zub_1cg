@@ -48,9 +48,9 @@ Audit snapshot from 2026-08-01:
   `zub_ctl` has no automated tests.
 - The initial audit found an RWE `LOAD` segment for every firmware ELF. ZUB-002
   now produces distinct executable and writable segments for all current APU
-  and RPU images, with host-side tests that reject W+X segments or missing RX/RW
-  separation. Architecture, entry-point, and memory-range checks remain pending.
-  The produced entry points are currently `0x0` (APU blink and Ethernet), `0x800` (APU
+  and RPU images, with host-side tests that reject W+X segments, missing RX/RW
+  separation, or a wrong architecture/entry point. Memory-range checks remain
+  pending. The produced entry points are currently `0x0` (APU blink and Ethernet), `0x800` (APU
   ThreadX hello), and `0xffff0128` (R5 hello); README values do not consistently
   match these artifacts.
 - The four board tests are manual and serialized. Each now builds its A53 or

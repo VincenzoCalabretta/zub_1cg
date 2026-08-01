@@ -61,9 +61,12 @@ def _firmware_elf_test_impl(ctx):
         content = """#!/usr/bin/env bash
 set -euo pipefail
 exec \"$TEST_SRCDIR/${{TEST_WORKSPACE:-_main}}/{checker}\" \\
+     --machine {machine} --entry {entry} \\
      \"$TEST_SRCDIR/${{TEST_WORKSPACE:-_main}}/{firmware}\"
 """.format(
             checker = ctx.executable.checker.short_path,
+            machine = ctx.attr.expected_machine,
+            entry = ctx.attr.expected_entry,
             firmware = ctx.executable.firmware.short_path,
         ),
         is_executable = True,
@@ -87,15 +90,19 @@ _firmware_elf_test = rule(
             mandatory = True,
         ),
         "firmware_platform": attr.string(mandatory = True),
+        "expected_machine": attr.string(mandatory = True),
+        "expected_entry": attr.string(mandatory = True),
     },
     test = True,
 )
 
-def firmware_elf_test(name, firmware, firmware_platform):
+def firmware_elf_test(name, firmware, firmware_platform, expected_machine, expected_entry):
     """Validates one target-core firmware ELF on the host during presubmit."""
     _firmware_elf_test(
         name = name,
         checker = "//tools/elf_check:elf_check",
         firmware = firmware,
         firmware_platform = firmware_platform,
+        expected_machine = expected_machine,
+        expected_entry = expected_entry,
     )

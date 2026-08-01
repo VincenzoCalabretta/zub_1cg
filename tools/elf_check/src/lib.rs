@@ -14,6 +14,9 @@ const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
+pub const EM_ARM: u16 = 40;
+pub const EM_AARCH64: u16 = 183;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
     Elf32,
@@ -174,6 +177,23 @@ pub fn validate(elf: &Elf) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates the target architecture and entry point expected by a firmware target.
+pub fn validate_identity(elf: &Elf, machine: u16, entry: u64) -> Result<(), String> {
+    if elf.machine != machine {
+        return Err(format!(
+            "ELF machine is {}, expected {machine}",
+            elf.machine
+        ));
+    }
+    if elf.entry != entry {
+        return Err(format!(
+            "ELF entry point is 0x{:x}, expected 0x{entry:x}",
+            elf.entry
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +240,19 @@ mod tests {
         assert_eq!(
             validate(&elf).unwrap_err(),
             "ELF has no read-write PT_LOAD segment"
+        );
+    }
+
+    #[test]
+    fn rejects_unexpected_machine_and_entry_point() {
+        let elf = parse(&elf64_with_segments(&[PF_R | PF_X, PF_R | PF_W])).unwrap();
+        assert_eq!(
+            validate_identity(&elf, EM_ARM, 0x800).unwrap_err(),
+            "ELF machine is 183, expected 40"
+        );
+        assert_eq!(
+            validate_identity(&elf, EM_AARCH64, 0).unwrap_err(),
+            "ELF entry point is 0x800, expected 0x0"
         );
     }
 }
