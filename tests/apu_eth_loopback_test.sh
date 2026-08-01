@@ -30,9 +30,9 @@ if [[ ! -f "$ELF" ]]; then
     ELF="$WSROOT/bazel-bin/apps/apu/eth_loopback/eth_loopback_a53.elf"
 fi
 if [[ ! -f "$ELF" ]]; then
-    echo "SKIP: eth_loopback_a53.elf not found — pre-build with:"
+    echo "FAIL: eth_loopback_a53.elf not found — pre-build with:"
     echo "  bazel build --config=apu //apps/apu/eth_loopback:eth_loopback_a53.elf"
-    exit 0
+    exit 1
 fi
 
 exec "$ZUB_CTL" watch-a53 \

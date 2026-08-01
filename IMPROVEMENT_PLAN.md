@@ -53,9 +53,8 @@ Audit snapshot from 2026-08-01:
   ThreadX hello), and `0xffff0128` (R5 hello); README values do not consistently
   match these artifacts.
 - The four board tests are manual and serialized, but APU tests find a
-  separately prebuilt ELF outside their declared runfiles. Several return
-  success when it is missing. This can produce a green test without testing
-  firmware.
+  separately prebuilt ELF outside their declared runfiles. Missing firmware now
+  fails, but the undeclared workspace dependency remains.
 - Cold-boot PS UART routing remains the principal hardware blocker. The last
   recorded state is that the transmitter drains but no bytes reach FTDI channel
   1; an earlier successful sequence inherited PS configuration from Vitis.
@@ -113,7 +112,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-003: Make board tests truthful and single-command
 
-- **Status:** ready; depends on ZUB-001 for passing UART assertions
+- **Status:** in progress; depends on ZUB-001 for passing UART assertions
 - **Work:** Replace workspace-relative `bazel-bin` discovery with a Bazel rule
   or transition that builds the firmware for its target platform and places it
   in the host test's runfiles. Factor the four shell wrappers into a Starlark

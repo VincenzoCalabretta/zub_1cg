@@ -45,9 +45,9 @@ if [[ ! -f "$ELF" ]]; then
 fi
 
 if [[ ! -f "$ELF" ]]; then
-    echo "SKIP: blink.elf not found — pre-build with:"
+    echo "FAIL: blink.elf not found — pre-build with:"
     echo "  bazel build --config=apu //apps/apu/blink:blink.elf"
-    exit 0
+    exit 1
 fi
 
 exec "$ZUB_CTL" watch-a53 \

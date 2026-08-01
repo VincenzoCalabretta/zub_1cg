@@ -36,9 +36,9 @@ if [[ ! -f "$ELF" ]]; then
     ELF="$WSROOT/bazel-bin/apps/apu/hello_world/hello_world_a53.elf"
 fi
 if [[ ! -f "$ELF" ]]; then
-    echo "SKIP: hello_world_a53.elf not found — pre-build with:"
+    echo "FAIL: hello_world_a53.elf not found — pre-build with:"
     echo "  bazel build --config=apu //apps/apu/hello_world:hello_world_a53.elf"
-    exit 0
+    exit 1
 fi
 
 exec "$ZUB_CTL" watch-a53 \
