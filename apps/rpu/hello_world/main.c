@@ -14,6 +14,8 @@ static ULONG hello_stack[1024];
 static void hello_entry(ULONG arg)
 {
     (void)arg;
+    uart_print("Hello, World!\r\n");
+    timer_start();
     for (;;) {
         uart_print("Hello, World!\r\n");
         tx_thread_sleep(100);   /* 100 ticks × 10 ms/tick = 1 second */
@@ -48,9 +50,9 @@ int main(void)
 
     uart_print("\r\n--- ThreadX Hello World (AES-ZUB R5F) ---\r\n");
 
-    /* Bring up the scheduler before enabling the board-specific tick source.
-     * This also permits the initial auto-start thread to run on boards where
-     * the TTC/GIC wiring has not yet been configured. */
+    /* Configure the GIC + TTC before handing off to ThreadX. IRQs remain
+     * masked until ThreadX restores the initial thread context. */
+    timer_init();
 
     /* Hand off to ThreadX — never returns. */
     tx_kernel_enter();

@@ -2,15 +2,18 @@
 #include <stdint.h>
 
 /*
- * ─── GIC400 register map ────────────────────────────────────────────────────
+ * ─── RPU PL390 register map ─────────────────────────────────────────────────
  * Reference: UG1085 Zynq UltraScale+ TRM, GIC chapter.
  *            ARM IHI0048B GIC Architecture Specification.
  *
- * Distributor base : 0xF901_0000
- * CPU Interface    : 0xF902_0000
+ * RPU PL390 distributor : 0xF900_0000
+ * RPU CPU interface     : 0xF900_1000
+ *
+ * 0xF901_0000/0xF902_0000 are the A53-only GIC-400 windows. Accessing
+ * those from the R5 causes an abort before ThreadX can start.
  */
-#define GIC_DIST_BASE   0xF9010000UL
-#define GIC_CPU_BASE    0xF9020000UL
+#define GIC_DIST_BASE   0xF9000000UL
+#define GIC_CPU_BASE    0xF9001000UL
 
 #define REG32(a)  (*((volatile uint32_t *)(a)))
 
@@ -108,16 +111,6 @@ static void gic_init(void)
     /* Set priority (byte field in IPRIORITYR) */
     volatile uint32_t *prio_reg = &GICD_IPRIORITYR(TTC0_CH0_INTID / 4);
     *prio_reg = (*prio_reg & ~(0xFFU << byte_shift)) | (TTC0_GIC_PRIORITY << byte_shift);
-
-    /* Enable the interrupt in the distributor */
-    GICD_ISENABLER(GIC_ENABLE_WORD(TTC0_CH0_INTID)) = GIC_ENABLE_BIT(TTC0_CH0_INTID);
-
-    /* Re-enable distributor */
-    GICD_CTLR = 1;
-
-    /* CPU interface: allow all priorities, enable signalling to CPU */
-    GICC_PMR  = 0xFF;
-    GICC_CTLR = 1;
 }
 
 /* ── TTC0 initialisation ────────────────────────────────────────────── */
@@ -130,13 +123,13 @@ static void ttc0_init(void)
     /* Prescaler: divide by 2^(PSDIV+1) */
     TTC_CLK_CNTRL = CLK_PSDIV_EN | (TTC_PSDIV << CLK_PSDIV_SHIFT);
 
-    /* Interval mode, count up, reset on interval */
+    /* Program interval mode with the counter held stopped. */
     TTC_INTERVAL_VAL = (uint32_t)TTC_INTERVAL;
-    TTC_CNT_CNTRL = CNT_INTERVAL | CNT_RESET;  /* CNT_DIS=0 → start */
+    TTC_CNT_CNTRL = CNT_DIS | CNT_INTERVAL;
 
-    /* Clear any pending interrupt, then enable interval interrupt */
-    (void)TTC_ISR;           /* read-to-clear */
-    TTC_IER = TTC_INT_INTERVAL;
+    /* TTC ISR is read-to-clear. Keep its source disabled until the
+     * initial ThreadX thread has a valid context. */
+    (void)TTC_ISR;
 }
 
 /*
@@ -154,7 +147,7 @@ void IRQHandler(void)
     uint32_t intid = GICC_IAR & 0x3FFU;   /* bottom 10 bits = INTID */
 
     if (intid == TTC0_CH0_INTID) {
-        (void)TTC_ISR;              /* clear TTC interrupt flag */
+        (void)TTC_ISR;               /* clear TTC interrupt flag (read-to-clear) */
         _tx_timer_interrupt();      /* advance ThreadX time */
     }
 
@@ -167,7 +160,17 @@ void timer_init(void)
 {
     gic_init();
     ttc0_init();
-    /* Enable CPU IRQs via CPSR — ThreadX will manage the I-bit from here. */
+}
+
+void timer_start(void)
+{
+    (void)TTC_ISR;
+    GICD_ISENABLER(GIC_ENABLE_WORD(TTC0_CH0_INTID)) = GIC_ENABLE_BIT(TTC0_CH0_INTID);
+    GICD_CTLR = 1;
+    GICC_PMR  = 0xFF;
+    GICC_CTLR = 1;
+    TTC_IER = TTC_INT_INTERVAL;
+    TTC_CNT_CNTRL = CNT_INTERVAL;
     __asm__ volatile("cpsie i");
 }
 
