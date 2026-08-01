@@ -115,6 +115,8 @@ built in Xilinx tools:
 2. Generate bitstream → export hardware handoff (`.xsa`).
 3. In Vitis, create a platform from the `.xsa`; extract `psu_init.tcl`
    and copy both files into `board/zub_1cg/`.
+4. Update [`board/zub_1cg/artifacts.json`](board/zub_1cg/artifacts.json) with
+   the source handoff and SHA-256 values in the same commit.
 
 See `CLAUDE.md` for hardware register offsets and the R5 boot sequence.
 

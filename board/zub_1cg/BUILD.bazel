@@ -21,3 +21,8 @@ filegroup(
     name = "psu_init",
     srcs = ["psu_init.tcl"],
 )
+
+filegroup(
+    name = "artifacts_manifest",
+    srcs = ["artifacts.json"],
+)
