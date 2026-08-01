@@ -35,6 +35,8 @@ firmware_elf_test(
     firmware_platform = "//platforms:apu_a53",
     expected_machine = "aarch64",
     expected_entry = "0x0",
+    expected_memory_range = "0x0:0x80000000",
+    required_symbols = ["_vector_table"],
 )
 
 firmware_elf_test(
@@ -43,6 +45,8 @@ firmware_elf_test(
     firmware_platform = "//platforms:apu_a53",
     expected_machine = "aarch64",
     expected_entry = "0x800",
+    expected_memory_range = "0x0:0x80000000",
+    required_symbols = ["_vector_table"],
 )
 
 firmware_elf_test(
@@ -51,6 +55,8 @@ firmware_elf_test(
     firmware_platform = "//platforms:apu_a53",
     expected_machine = "aarch64",
     expected_entry = "0x0",
+    expected_memory_range = "0x0:0x80000000",
+    required_symbols = ["_vector_table"],
 )
 
 firmware_elf_test(
@@ -59,6 +65,8 @@ firmware_elf_test(
     firmware_platform = "//platforms:rpu_r5_0",
     expected_machine = "arm",
     expected_entry = "0xffff0128",
+    expected_memory_range = "0xffff0000:0x100000000",
+    required_symbols = ["reset_handler"],
 )
 
 onboard_firmware_test(

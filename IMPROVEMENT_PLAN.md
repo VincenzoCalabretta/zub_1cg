@@ -49,8 +49,10 @@ Audit snapshot from 2026-08-01:
 - The initial audit found an RWE `LOAD` segment for every firmware ELF. ZUB-002
   now produces distinct executable and writable segments for all current APU
   and RPU images, with host-side tests that reject W+X segments, missing RX/RW
-  separation, or a wrong architecture/entry point. Memory-range checks remain
-  pending. The produced entry points are currently `0x0` (APU blink and Ethernet), `0x800` (APU
+  separation, wrong architecture/entry point, out-of-range load segments,
+  malformed segment alignment, or a missing startup symbol. Linker assertions
+  also enforce A53/R5 vector alignment and stack separation. The produced entry
+  points are currently `0x0` (APU blink and Ethernet), `0x800` (APU
   ThreadX hello), and `0xffff0128` (R5 hello); README values do not consistently
   match these artifacts.
 - The four board tests are manual and serialized. Each now builds its A53 or

@@ -53,4 +53,8 @@ SECTIONS {
 
     ASSERT(_tx_first_unused_memory <= _stack_bottom,
            "R5 image overlaps the exception-mode stacks")
+    ASSERT((ADDR(.vectors) & 0x1f) == 0,
+           "R5 vector table must be 32-byte aligned")
+    ASSERT(_stack_top < ORIGIN(OCM) + LENGTH(OCM),
+           "R5 exception-mode stack exceeds OCM")
 }

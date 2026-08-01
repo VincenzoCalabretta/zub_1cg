@@ -61,12 +61,14 @@ def _firmware_elf_test_impl(ctx):
         content = """#!/usr/bin/env bash
 set -euo pipefail
 exec \"$TEST_SRCDIR/${{TEST_WORKSPACE:-_main}}/{checker}\" \\
-     --machine {machine} --entry {entry} \\
+     --machine {machine} --entry {entry} --range {memory_range} {required_symbols} \\
      \"$TEST_SRCDIR/${{TEST_WORKSPACE:-_main}}/{firmware}\"
 """.format(
             checker = ctx.executable.checker.short_path,
             machine = ctx.attr.expected_machine,
             entry = ctx.attr.expected_entry,
+            memory_range = ctx.attr.expected_memory_range,
+            required_symbols = " ".join(["--require-symbol " + symbol for symbol in ctx.attr.required_symbols]),
             firmware = ctx.executable.firmware.short_path,
         ),
         is_executable = True,
@@ -92,11 +94,13 @@ _firmware_elf_test = rule(
         "firmware_platform": attr.string(mandatory = True),
         "expected_machine": attr.string(mandatory = True),
         "expected_entry": attr.string(mandatory = True),
+        "expected_memory_range": attr.string(mandatory = True),
+        "required_symbols": attr.string_list(),
     },
     test = True,
 )
 
-def firmware_elf_test(name, firmware, firmware_platform, expected_machine, expected_entry):
+def firmware_elf_test(name, firmware, firmware_platform, expected_machine, expected_entry, expected_memory_range, required_symbols):
     """Validates one target-core firmware ELF on the host during presubmit."""
     _firmware_elf_test(
         name = name,
@@ -105,4 +109,6 @@ def firmware_elf_test(name, firmware, firmware_platform, expected_machine, expec
         firmware_platform = firmware_platform,
         expected_machine = expected_machine,
         expected_entry = expected_entry,
+        expected_memory_range = expected_memory_range,
+        required_symbols = required_symbols,
     )

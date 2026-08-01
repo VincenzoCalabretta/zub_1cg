@@ -10,6 +10,8 @@ const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const PT_LOAD: u32 = 1;
+const SHT_SYMTAB: u32 = 2;
+const SHT_DYNSYM: u32 = 11;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -35,6 +37,9 @@ impl fmt::Display for Class {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadSegment {
     pub flags: u32,
+    pub virtual_address: u64,
+    pub memory_size: u64,
+    pub alignment: u64,
 }
 
 impl LoadSegment {
@@ -57,6 +62,13 @@ pub struct Elf {
     pub machine: u16,
     pub entry: u64,
     pub load_segments: Vec<LoadSegment>,
+    pub symbols: Vec<Symbol>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    pub value: u64,
 }
 
 fn byte_range(bytes: &[u8], offset: usize, length: usize) -> Result<&[u8], String> {
@@ -134,15 +146,151 @@ pub fn parse(bytes: &[u8]) -> Result<Elf, String> {
         if u32_at(bytes, offset)? == PT_LOAD {
             load_segments.push(LoadSegment {
                 flags: u32_at(bytes, offset + flags_offset)?,
+                virtual_address: match class {
+                    Class::Elf32 => u32_at(bytes, offset + 8)? as u64,
+                    Class::Elf64 => u64_at(bytes, offset + 16)?,
+                },
+                memory_size: match class {
+                    Class::Elf32 => u32_at(bytes, offset + 20)? as u64,
+                    Class::Elf64 => u64_at(bytes, offset + 40)?,
+                },
+                alignment: match class {
+                    Class::Elf32 => u32_at(bytes, offset + 28)? as u64,
+                    Class::Elf64 => u64_at(bytes, offset + 48)?,
+                },
             });
         }
     }
+    let symbols = parse_symbols(bytes, class)?;
     Ok(Elf {
         class,
         machine,
         entry,
         load_segments,
+        symbols,
     })
+}
+
+fn parse_symbols(bytes: &[u8], class: Class) -> Result<Vec<Symbol>, String> {
+    let (section_header_offset, section_header_size, section_header_count) = match class {
+        Class::Elf32 => (
+            u32_at(bytes, 32)? as u64,
+            u16_at(bytes, 46)? as usize,
+            u16_at(bytes, 48)? as usize,
+        ),
+        Class::Elf64 => (
+            u64_at(bytes, 40)?,
+            u16_at(bytes, 58)? as usize,
+            u16_at(bytes, 60)? as usize,
+        ),
+    };
+    let minimum_section_header_size = match class {
+        Class::Elf32 => 40,
+        Class::Elf64 => 64,
+    };
+    if section_header_count == 0 {
+        return Ok(Vec::new());
+    }
+    if section_header_size < minimum_section_header_size {
+        return Err(format!(
+            "section header entry is too small: {section_header_size} bytes"
+        ));
+    }
+    let section_header_offset =
+        usize::try_from(section_header_offset).map_err(|_| "section header offset is too large")?;
+    let mut symbols = Vec::new();
+    for index in 0..section_header_count {
+        let offset = section_header_offset
+            .checked_add(
+                index
+                    .checked_mul(section_header_size)
+                    .ok_or_else(|| "section header offset overflow")?,
+            )
+            .ok_or_else(|| "section header offset overflow")?;
+        byte_range(bytes, offset, section_header_size)?;
+        let section_type = u32_at(bytes, offset + 4)?;
+        if section_type != SHT_SYMTAB && section_type != SHT_DYNSYM {
+            continue;
+        }
+        let (section_offset, section_size, string_table_index, entry_size) = match class {
+            Class::Elf32 => (
+                u32_at(bytes, offset + 16)? as u64,
+                u32_at(bytes, offset + 20)? as u64,
+                u32_at(bytes, offset + 24)? as usize,
+                u32_at(bytes, offset + 36)? as u64,
+            ),
+            Class::Elf64 => (
+                u64_at(bytes, offset + 24)?,
+                u64_at(bytes, offset + 32)?,
+                u32_at(bytes, offset + 40)? as usize,
+                u64_at(bytes, offset + 56)?,
+            ),
+        };
+        let minimum_symbol_size = match class {
+            Class::Elf32 => 16,
+            Class::Elf64 => 24,
+        };
+        let entry_size =
+            usize::try_from(entry_size).map_err(|_| "symbol entry size is too large")?;
+        if entry_size < minimum_symbol_size {
+            return Err(format!("symbol entry is too small: {entry_size} bytes"));
+        }
+        let string_table_offset = section_header_offset
+            .checked_add(
+                string_table_index
+                    .checked_mul(section_header_size)
+                    .ok_or_else(|| "string table header offset overflow")?,
+            )
+            .ok_or_else(|| "string table header offset overflow")?;
+        byte_range(bytes, string_table_offset, section_header_size)?;
+        let (strings_offset, strings_size) = match class {
+            Class::Elf32 => (
+                u32_at(bytes, string_table_offset + 16)? as u64,
+                u32_at(bytes, string_table_offset + 20)? as u64,
+            ),
+            Class::Elf64 => (
+                u64_at(bytes, string_table_offset + 24)?,
+                u64_at(bytes, string_table_offset + 32)?,
+            ),
+        };
+        let section_offset =
+            usize::try_from(section_offset).map_err(|_| "symbol table offset is too large")?;
+        let section_size =
+            usize::try_from(section_size).map_err(|_| "symbol table size is too large")?;
+        let strings = byte_range(
+            bytes,
+            usize::try_from(strings_offset).map_err(|_| "string table offset is too large")?,
+            usize::try_from(strings_size).map_err(|_| "string table size is too large")?,
+        )?;
+        if section_size % entry_size != 0 {
+            return Err("symbol table size is not a multiple of its entry size".to_owned());
+        }
+        for symbol_offset in
+            (section_offset..section_offset.saturating_add(section_size)).step_by(entry_size)
+        {
+            let symbol = byte_range(bytes, symbol_offset, entry_size)?;
+            let name_offset = u32_at(symbol, 0)? as usize;
+            let (value, section_index) = match class {
+                Class::Elf32 => (u32_at(symbol, 4)? as u64, u16_at(symbol, 14)?),
+                Class::Elf64 => (u64_at(symbol, 8)?, u16_at(symbol, 6)?),
+            };
+            if section_index == 0 || name_offset >= strings.len() {
+                continue;
+            }
+            let end = strings[name_offset..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|length| name_offset + length)
+                .unwrap_or(strings.len());
+            if let Ok(name) = std::str::from_utf8(&strings[name_offset..end]) {
+                symbols.push(Symbol {
+                    name: name.to_owned(),
+                    value,
+                });
+            }
+        }
+    }
+    Ok(symbols)
 }
 
 /// Validates the hardened firmware segment layout.
@@ -194,6 +342,41 @@ pub fn validate_identity(elf: &Elf, machine: u16, entry: u64) -> Result<(), Stri
     Ok(())
 }
 
+/// Validates load-segment addresses and alignments against a target memory region.
+pub fn validate_memory(elf: &Elf, start: u64, end: u64) -> Result<(), String> {
+    if start >= end {
+        return Err("memory range must have a non-zero size".to_owned());
+    }
+    for segment in &elf.load_segments {
+        let segment_end = segment
+            .virtual_address
+            .checked_add(segment.memory_size)
+            .ok_or_else(|| "PT_LOAD segment address overflows".to_owned())?;
+        if segment.virtual_address < start || segment_end > end {
+            return Err(format!(
+                "PT_LOAD segment 0x{:x}..0x{:x} is outside 0x{start:x}..0x{end:x}",
+                segment.virtual_address, segment_end
+            ));
+        }
+        if segment.alignment != 0 && !segment.alignment.is_power_of_two() {
+            return Err(format!(
+                "PT_LOAD segment at 0x{:x} has non-power-of-two alignment 0x{:x}",
+                segment.virtual_address, segment.alignment
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates that a named, defined startup symbol is present in the ELF.
+pub fn validate_required_symbol(elf: &Elf, required: &str) -> Result<(), String> {
+    if elf.symbols.iter().any(|symbol| symbol.name == required) {
+        Ok(())
+    } else {
+        Err(format!("ELF is missing required symbol {required}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,7 +418,10 @@ mod tests {
 
     #[test]
     fn rejects_non_elf_and_missing_segment_classes() {
-        assert_eq!(parse(b"not an elf").unwrap_err(), "truncated ELF at offset 0x0");
+        assert_eq!(
+            parse(b"not an elf").unwrap_err(),
+            "truncated ELF at offset 0x0"
+        );
         let elf = parse(&elf64_with_segments(&[PF_R | PF_X])).unwrap();
         assert_eq!(
             validate(&elf).unwrap_err(),
@@ -253,6 +439,52 @@ mod tests {
         assert_eq!(
             validate_identity(&elf, EM_AARCH64, 0).unwrap_err(),
             "ELF entry point is 0x800, expected 0x0"
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_misaligned_load_segments() {
+        let elf = Elf {
+            class: Class::Elf64,
+            machine: EM_AARCH64,
+            entry: 0,
+            symbols: Vec::new(),
+            load_segments: vec![LoadSegment {
+                flags: PF_R | PF_X,
+                virtual_address: 0x8000,
+                memory_size: 0x1000,
+                alignment: 0x1000,
+            }],
+        };
+        assert_eq!(
+            validate_memory(&elf, 0, 0x8000).unwrap_err(),
+            "PT_LOAD segment 0x8000..0x9000 is outside 0x0..0x8000"
+        );
+        let mut misaligned = elf.clone();
+        misaligned.load_segments[0].virtual_address = 0;
+        misaligned.load_segments[0].alignment = 3;
+        assert_eq!(
+            validate_memory(&misaligned, 0, 0x8000).unwrap_err(),
+            "PT_LOAD segment at 0x0 has non-power-of-two alignment 0x3"
+        );
+    }
+
+    #[test]
+    fn requires_startup_symbols() {
+        let elf = Elf {
+            class: Class::Elf64,
+            machine: EM_AARCH64,
+            entry: 0,
+            load_segments: Vec::new(),
+            symbols: vec![Symbol {
+                name: "_vector_table".to_owned(),
+                value: 0,
+            }],
+        };
+        validate_required_symbol(&elf, "_vector_table").unwrap();
+        assert_eq!(
+            validate_required_symbol(&elf, "reset_handler").unwrap_err(),
+            "ELF is missing required symbol reset_handler"
         );
     }
 }

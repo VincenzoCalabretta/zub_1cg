@@ -295,4 +295,11 @@ _SDA2_BASE_ = __sdata2_start + ((__sbss2_end - __sdata2_start) / 2 );
 } > psu_ddr_0 :data
 
 _end = .;
+
+ASSERT((_vector_table & 0x7ff) == 0,
+       "A53 vector table must be 2 KiB aligned")
+ASSERT(_heap_end <= _el3_stack_end,
+       "A53 heap overlaps the exception stacks")
+ASSERT(_end <= ORIGIN(psu_ddr_0) + LENGTH(psu_ddr_0),
+       "A53 image exceeds the DDR linker region")
 }
