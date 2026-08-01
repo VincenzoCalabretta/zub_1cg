@@ -1,0 +1,34 @@
+"""Board support package for AES-ZUB Cortex-R5F core 0."""
+
+_R5F_COPTS = [
+    "-mcpu=cortex-r5",
+    "-mfpu=vfpv3-d16",
+    "-mfloat-abi=hard",
+    "-marm",
+    "-ffreestanding",
+    "-fno-builtin",
+]
+
+# Expose the linker script so apps can reference it with $(location ...).
+filegroup(
+    name = "linker_script",
+    srcs = ["memory.lds"],
+    visibility = ["//visibility:public"],
+)
+
+# BSP library: startup, UART, GIC + timer.
+cc_library(
+    name = "bsp",
+    srcs = [
+        "startup.S",
+        "uart.c",
+        "timer.c",
+    ],
+    hdrs = [
+        "uart.h",
+        "timer.h",
+    ],
+    includes = ["."],
+    copts = _R5F_COPTS,
+    visibility = ["//visibility:public"],
+)

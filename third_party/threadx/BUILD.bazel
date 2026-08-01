@@ -1,0 +1,93 @@
+"""Eclipse ThreadX — common core + Cortex-A53 (AArch64) and Cortex-R5F (arm)
+GNU ports.
+
+Injected into the downloaded ThreadX source tree by //:extensions.bzl.
+Paths are relative to the ThreadX repo root.
+
+Two libraries are exposed from one archive:
+
+    :threadx_a53  — for //apps/apu (aarch64-none-elf, ports/cortex_a53/gnu)
+                    Board provides _tx_initialize_low_level and the vector
+                    table, so we exclude the port's own low-level init and
+                    stack-build assembly.
+
+    :threadx_r5   — for //apps/rpu (arm-none-eabi Cortex-R5F,
+                    ports/cortex_r5/gnu). Only tx_initialize_low_level.S is
+                    excluded (board/rpu/timer.c provides the C version).
+"""
+
+# ── ThreadX A53 port ────────────────────────────────────────────────────────
+
+cc_library(
+    name = "threadx_a53",
+    srcs = glob(
+        [
+            "common/src/tx_*.c",
+            "common/src/txe_*.c",
+            "ports/cortex_a53/gnu/src/*.S",
+            "ports/cortex_a53/gnu/src/*.c",
+        ],
+        exclude = [
+            "common/src/tx_misra.c",
+            "common/src/tx_trace_*.c",
+            "ports/cortex_a53/gnu/src/tx_initialize_low_level.S",
+            "ports/cortex_a53/gnu/src/tx_thread_stack_build.S",
+        ],
+    ),
+    hdrs = glob([
+        "common/inc/*.h",
+        "ports/cortex_a53/gnu/inc/*.h",
+    ]),
+    includes = [
+        "common/inc",
+        "ports/cortex_a53/gnu/inc",
+    ],
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# ── ThreadX Cortex-R5F port ─────────────────────────────────────────────────
+
+# CPU flags must match the toolchain and BSP so registers align.
+_R5F_COPTS = [
+    "-mcpu=cortex-r5",
+    "-mfpu=vfpv3-d16",
+    "-mfloat-abi=hard",
+    "-marm",
+    "-ffreestanding",
+    "-fno-builtin",
+]
+
+cc_library(
+    name = "threadx_r5",
+    srcs = glob(
+        [
+            "common/src/tx_*.c",
+            "common/src/txe_*.c",
+            "ports/cortex_r5/gnu/src/*.S",
+        ],
+        exclude = [
+            "common/src/tx_misra.c",
+            "common/src/tx_trace_*.c",
+            # board/rpu/timer.c provides _tx_initialize_low_level in C.
+            "ports/cortex_r5/gnu/src/tx_initialize_low_level.S",
+        ],
+    ),
+    hdrs = glob([
+        "common/inc/*.h",
+        "ports/cortex_r5/gnu/inc/*.h",
+    ]),
+    includes = [
+        "common/inc",
+        "ports/cortex_r5/gnu/inc",
+    ],
+    copts = _R5F_COPTS,
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:armv7",
+    ],
+    visibility = ["//visibility:public"],
+)

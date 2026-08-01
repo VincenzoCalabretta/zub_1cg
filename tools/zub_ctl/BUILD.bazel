@@ -1,0 +1,36 @@
+"""zub_ctl — test driver for the zub_1cg board.
+
+Rust binary built via rules_rust + crate_universe. See MODULE.bazel for the
+crate_universe extension registration.
+
+Usage from an integration test (see //tests):
+    zub_ctl serial-watch --tty /dev/ttyUSB1 \\
+                         --expect "Hello, World!" --timeout 30
+    zub_ctl watch-r5    --openocd-cfg X --openocd-script Y \\
+                         --tty /dev/ttyUSB1 --expect "..." --timeout 30
+    zub_ctl watch-a53   --xsct X --elf Y --bitstream Z --psinit W \\
+                         --tty /dev/ttyUSB1 --expect "..." --timeout 30
+"""
+
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+exports_files(
+    ["Cargo.toml", "Cargo.lock"],
+    visibility = ["//visibility:public"],
+)
+
+rust_binary(
+    name = "zub_ctl",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@zub_ctl_crates//:anyhow",
+        "@zub_ctl_crates//:clap",
+        "@zub_ctl_crates//:regex",
+        "@zub_ctl_crates//:serialport",
+    ],
+    # serialport links libudev on Linux; the -sys crate finds it via pkg-config
+    # against the Nix-provided systemdMinimal in the devShell.
+    tags = ["requires-network"],
+)

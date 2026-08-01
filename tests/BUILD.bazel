@@ -1,0 +1,83 @@
+"""On-target integration tests driven by //tools/zub_ctl.
+
+All targets are tagged `manual`, `exclusive`, and `local`:
+  manual    → excluded from wildcard `bazel test //...` runs
+  exclusive → serialized; only one runs at a time so they don't race on
+              /dev/ttyUSB1 or the JTAG interface
+  local     → prevents remote caching/execution of hardware tests
+
+The `--config=onboard` flag (defined in .bazelrc) sets --spawn_strategy=local,
+which disables the Linux sandbox and allows tests to open /dev/ttyUSB* devices.
+
+To run a test:
+  # Step 1: cross-compile the APU ELF (one-time, or after source changes)
+  bazel build --config=apu //apps/apu/blink:blink.elf
+
+  # Step 2: run the test with board connected in JTAG mode
+  bazel test --config=host --config=onboard //tests:apu_blink_test
+  bazel test --config=host --config=onboard //tests:apu_hello_world_test
+  bazel test --config=host --config=onboard //tests:apu_eth_loopback_test
+  bazel test --config=host --config=onboard //tests:rpu_hello_world_test
+
+Environment variables (all optional):
+  ZUB_TTY       — serial device                   (default /dev/ttyUSB1)
+  ZUB_BAUD      — baud rate                       (default 115200)
+  ZUB_TIMEOUT   — seconds to wait for output      (default 30 / 60 for blink)
+  XSCT          — path to Xilinx xsct             (A53 and RPU tests)
+"""
+
+package(default_visibility = ["//visibility:public"])
+
+_HW_TAGS = ["manual", "exclusive", "requires-hardware", "local"]
+
+sh_test(
+    name = "rpu_hello_world_test",
+    srcs = ["rpu_hello_world_test.sh"],
+    data = [
+        "//board/zub_1cg:psu_init",
+        "//scripts/openocd:aes_zub_cfg",
+        "//scripts/openocd:load_r5",
+        "//scripts/openocd:all_scripts",
+        "//tools/zub_ctl:zub_ctl",
+    ],
+    tags = _HW_TAGS,
+)
+
+sh_test(
+    name = "apu_hello_world_test",
+    srcs = ["apu_hello_world_test.sh"],
+    data = [
+        # ELF not listed: cross-compiled (--config=apu), incompatible with host
+        # platform.  Pre-build: bazel build --config=apu //apps/apu/hello_world:hello_world_a53.elf
+        "//board/zub_1cg:bitstream",
+        "//board/zub_1cg:psu_init",
+        "//tools/zub_ctl:zub_ctl",
+    ],
+    tags = _HW_TAGS,
+)
+
+sh_test(
+    name = "apu_blink_test",
+    srcs = ["apu_blink_test.sh"],
+    data = [
+        # ELF not listed: cross-compiled (--config=apu), incompatible with host
+        # platform.  Pre-build: bazel build --config=apu //apps/apu/blink:blink.elf
+        "//board/zub_1cg:bitstream",
+        "//board/zub_1cg:psu_init",
+        "//tools/zub_ctl:zub_ctl",
+    ],
+    tags = _HW_TAGS,
+)
+
+sh_test(
+    name = "apu_eth_loopback_test",
+    srcs = ["apu_eth_loopback_test.sh"],
+    data = [
+        # ELF not listed: cross-compiled (--config=apu), incompatible with host
+        # platform.  Pre-build: bazel build --config=apu //apps/apu/eth_loopback:eth_loopback_a53.elf
+        "//board/zub_1cg:bitstream",
+        "//board/zub_1cg:psu_init",
+        "//tools/zub_ctl:zub_ctl",
+    ],
+    tags = _HW_TAGS,
+)

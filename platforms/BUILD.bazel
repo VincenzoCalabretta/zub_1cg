@@ -1,0 +1,30 @@
+"""Platform definitions for the AES-ZUB-1CG (Zynq UltraScale+ ZU1CG)."""
+
+package(default_visibility = ["//visibility:public"])
+
+# Host — runs Bazel, tests, and drives JTAG.
+platform(
+    name = "host",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+# Application Processing Unit — Cortex-A53 (APU0), bare-metal.
+platform(
+    name = "apu_a53",
+    constraint_values = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+# Real-time Processing Unit — Cortex-R5F core 0 (RPU0), bare-metal.
+platform(
+    name = "rpu_r5_0",
+    constraint_values = [
+        "@platforms//os:none",
+        "@platforms//cpu:armv7",
+    ],
+)

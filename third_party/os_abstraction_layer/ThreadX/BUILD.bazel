@@ -1,0 +1,57 @@
+"""encore OS abstraction layer — ThreadX implementation.
+
+strip_include_prefix + include_prefix replicates the CMake install layout so that
+  third_party/os_abstraction_layer/ThreadX/ThreadXSerialDevice.hpp
+resolves as
+  #include "encore/OS/ThreadX/ThreadXSerialDevice.hpp"
+
+NOTE: encore framework headers (encore/Encore.hpp, encore/ErrorHandling/, encore/Utils/)
+are NOT in this repository. The downstream binary target must supply the encore include
+path via its own deps or copts.
+
+Targets
+───────
+threadx_os        — header-only (IThreadCustomization, serial, file, sockets)
+threadx_gem2_drv  — NetX Duo GEM2 Ethernet driver (.c); link when using NetX networking
+"""
+
+cc_library(
+    name = "threadx_os",
+    hdrs = glob(
+        ["*.hpp"],
+        exclude = ["ThreadXGEM2Driver.*"],
+    ),
+    strip_include_prefix = "/third_party/os_abstraction_layer",
+    include_prefix = "encore/OS",
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//third_party/os_abstraction_layer/Common:common",
+        "//third_party/xilinx_bsp:headers",
+        "@filex//:filex",
+        "@netxduo//:netxduo",
+        "@threadx//:threadx_a53",
+    ],
+)
+
+cc_library(
+    name = "threadx_gem2_drv",
+    srcs = ["ThreadXGEM2Driver.c"],
+    hdrs = ["ThreadXGEM2Driver.h"],
+    strip_include_prefix = "/third_party/os_abstraction_layer",
+    include_prefix = "encore/OS",
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//board/apu:bsp",
+        "//third_party/xilinx_bsp:headers",
+        "@netxduo//:netxduo",
+        "@threadx//:threadx_a53",
+    ],
+)

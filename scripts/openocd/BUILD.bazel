@@ -1,0 +1,30 @@
+"""OpenOCD interface + load scripts for the AES-ZUB (Zynq UltraScale+).
+
+Two entry points are consumed by integration tests:
+  aes_zub.cfg  — FT2232H interface + TAP chain + DAP init sequence.
+  load_r5.tcl  — full R5 boot sequence (OCM remap, RPU config, UART init,
+                 ELF load, R5 release, CoreSight halt-and-run).
+
+The diag/*.tcl and check_*.tcl scripts are debugging aids; they are exposed
+so ad-hoc `openocd -f aes_zub.cfg -f scripts/openocd/<x>.tcl` invocations
+find them on-disk.
+"""
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(glob(["*.cfg", "*.tcl"]))
+
+filegroup(
+    name = "aes_zub_cfg",
+    srcs = ["aes_zub.cfg"],
+)
+
+filegroup(
+    name = "load_r5",
+    srcs = ["load_r5.tcl"],
+)
+
+filegroup(
+    name = "all_scripts",
+    srcs = glob(["*.cfg", "*.tcl"]),
+)

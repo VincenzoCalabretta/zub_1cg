@@ -1,0 +1,28 @@
+"""Eclipse FileX — FAT filesystem for ThreadX bare-metal targets.
+
+Downloaded and injected by filex_extension in extensions.bzl.
+Paths are relative to the FileX repo root.
+
+FileX is pure C; it calls ThreadX primitives (tx_mutex_*, tx_semaphore_*) directly.
+The generic port (ports/generic/inc/fx_port.h) is the only AArch64-compatible port;
+FileX ships no cortex_a53 port.
+"""
+
+cc_library(
+    name = "filex",
+    srcs = glob(["common/src/*.c"]),
+    hdrs = glob([
+        "common/inc/*.h",
+        "ports/generic/inc/*.h",
+    ]),
+    includes = [
+        "common/inc",
+        "ports/generic/inc",
+    ],
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+    deps = ["@threadx//:threadx_a53"],
+)

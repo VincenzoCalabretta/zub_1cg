@@ -1,0 +1,67 @@
+"""zub_1cg — mainline bare-metal + RTOS project for the Avnet AES-ZUB-1CG board.
+
+Targets (added progressively as phases land):
+  //apps/apu/...  — Cortex-A53 (APU0) applications on Xilinx ZynqMP BSP + ThreadX.
+  //apps/rpu/...  — Cortex-R5F (RPU0) applications on ThreadX.
+  //tests/...     — host-side integration tests driven by //tools/zub_ctl.
+
+Toolchains registered from //toolchains/... in phases 2 and 3.
+"""
+
+module(
+    name = "zub_1cg",
+    version = "0.0.1",
+)
+
+bazel_dep(name = "rules_cc", version = "0.1.1")
+bazel_dep(name = "platforms", version = "0.0.11")
+bazel_dep(name = "rules_rust", version = "0.62.0")
+
+# ── Rust toolchain (host-side tools) ──────────────────────────────────────────
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.86.0"],
+)
+use_repo(rust, "rust_toolchains")
+register_toolchains("@rust_toolchains//:all")
+
+# Rust crates for //tools/zub_ctl.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "zub_ctl_crates",
+    cargo_lockfile = "//tools/zub_ctl:Cargo.lock",
+    manifests = ["//tools/zub_ctl:Cargo.toml"],
+)
+use_repo(crate, "zub_ctl_crates")
+
+# ── Env-based cross-toolchain capture ─────────────────────────────────────────
+# The Nix shellHook exports ARM_GCC_BIN and AARCH64_GCC_BIN; these repository
+# rules read them at fetch time and generate defs.bzl with pinned Nix-store
+# paths. Consumed by //toolchains/*/config.bzl.
+arm_gcc_ext = use_extension(
+    "//toolchains/arm_none_eabi:env_ext.bzl",
+    "arm_gcc_config_ext",
+)
+use_repo(arm_gcc_ext, "arm_gcc_config")
+
+aarch64_gcc_ext = use_extension(
+    "//toolchains/aarch64_none_elf:env_ext.bzl",
+    "aarch64_gcc_config_ext",
+)
+use_repo(aarch64_gcc_ext, "aarch64_gcc_config")
+
+register_toolchains(
+    "//toolchains/arm_none_eabi:arm_none_eabi_toolchain",
+    "//toolchains/aarch64_none_elf:aarch64_none_elf_toolchain",
+)
+
+# ── Third-party sources (fetched by extensions.bzl) ───────────────────────────
+threadx_ext = use_extension("//:extensions.bzl", "threadx_extension")
+use_repo(threadx_ext, "threadx")
+
+filex_ext = use_extension("//:extensions.bzl", "filex_extension")
+use_repo(filex_ext, "filex")
+
+netxduo_ext = use_extension("//:extensions.bzl", "netxduo_extension")
+use_repo(netxduo_ext, "netxduo")

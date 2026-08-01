@@ -1,0 +1,21 @@
+cc_binary(
+    name = "hello_world_a53.elf",
+    srcs = [
+        "src/helloworld.c",
+        "src/platform.c",
+        "src/xuartps_hw.c",
+        "src/platform.h",
+    ],
+    additional_linker_inputs = ["src/lscript_a53.ld"],
+    linkopts = ["-T$(location src/lscript_a53.ld)"],
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    deps = [
+        "//board/apu:bsp",
+        "//third_party/xilinx_bsp:headers",
+        "@threadx//:threadx_a53",
+    ],
+    visibility = ["//visibility:public"],
+)

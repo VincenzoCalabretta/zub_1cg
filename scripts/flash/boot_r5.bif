@@ -1,0 +1,20 @@
+/*
+ * boot_r5.bif — Alternate SD/QSPI boot path using a Xilinx-generated FSBL.
+ *
+ * This is provided for parity with the Vitis-based workflow. The A53-loader
+ * path (boot_a53.bif + build_boot_a53.sh) is the preferred one because it
+ * does not require Vitis for FSBL generation.
+ *
+ * Prerequisites:
+ *   - Build the R5 app:  bazel build --config=rpu //apps/rpu/hello_world
+ *   - Build FSBL in Vitis (zub1cg BSP, R5 domain) and place it at
+ *     scripts/flash/build/fsbl_r5.elf
+ *
+ * Then, from the repo root:
+ *   bootgen -image scripts/flash/boot_r5.bif -arch zynqmp -o BOOT.BIN -w on
+ */
+the_ROM_image:
+{
+    [bootloader, destination_cpu = r5-0] scripts/flash/build/fsbl_r5.elf
+    [destination_cpu = r5-0]            bazel-bin/apps/rpu/hello_world/hello_world
+}

@@ -1,0 +1,12 @@
+cc_binary(
+    name = "blink.elf",
+    srcs = ["src/main.c"],
+    additional_linker_inputs = ["src/lscript.ld"],
+    linkopts = ["-T$(location src/lscript.ld)"],
+    deps = ["//third_party/xilinx_bsp:headers"],
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+)

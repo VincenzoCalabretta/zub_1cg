@@ -1,0 +1,22 @@
+"""Board support for ZynqMP A53 bare-metal ThreadX."""
+
+cc_library(
+    name = "bsp",
+    srcs = [
+        "tx_initialize_low_level.S",
+        "tx_thread_stack_build.S",
+        "timer.c",
+    ],
+    hdrs = ["timer.h"],
+    includes = ["."],
+    # alwayslink: the BSP defines _tx_initialize_low_level, IRQHandler, and the
+    # exception vector table — symbols only referenced by ThreadX libraries, not
+    # directly by the binary's own objects.  Without this flag the linker drops
+    # the archive before resolving those cross-library references.
+    alwayslink = True,
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+)

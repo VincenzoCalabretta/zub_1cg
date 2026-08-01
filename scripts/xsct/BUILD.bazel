@@ -1,0 +1,9 @@
+"""xsct-based flashing and loading scripts (requires Vitis 2023.2)."""
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "jtag_flash.sh",
+    "load_a53.tcl",
+    "psu_init_only.tcl",
+])

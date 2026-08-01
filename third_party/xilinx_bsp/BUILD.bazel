@@ -1,0 +1,43 @@
+"""Xilinx / AMD ZynqMP BSP for Cortex-A53 (ZUBoard 1CG).
+
+Headers and pre-compiled libraries from the Vitis 2023.2 generated BSP
+(zub_a53_0 domain, ethernet-enabled design).
+All files are MIT-licensed (AMD/Xilinx SPDX-License-Identifier: MIT).
+
+Directory layout:
+  include/    — BSP headers (xparameters.h, xil_cache.h, xemacps.h, …)
+  lib/        — libxil.a (all PS peripheral drivers incl. emacps),
+                libxilstandalone.a (platform runtime), libxiltimer.a
+  Xilinx.spec — GCC linker spec (optional start-files)
+"""
+
+cc_library(
+    name = "headers",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+cc_import(
+    name = "libxil",
+    static_library = "lib/libxil.a",
+    visibility = ["//visibility:public"],
+)
+
+cc_import(
+    name = "libxilstandalone",
+    static_library = "lib/libxilstandalone.a",
+    visibility = ["//visibility:public"],
+)
+
+cc_import(
+    name = "libxiltimer",
+    static_library = "lib/libxiltimer.a",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "xilinx_spec",
+    srcs = ["Xilinx.spec"],
+    visibility = ["//visibility:public"],
+)

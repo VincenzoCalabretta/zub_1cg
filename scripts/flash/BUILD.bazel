@@ -1,0 +1,36 @@
+"""Firmware packaging + on-target flashing.
+
+  //scripts/flash:build_boot_a53   — Build BOOT.BIN via A53-loader shim
+                                     (no Vitis FSBL required).
+  //scripts/flash:xsct_jtag_flash  — Flash an A53 ELF via xsct over JTAG.
+                                     Requires Xilinx Vitis (xsct binary).
+"""
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "boot_a53.bif",
+    "boot_r5.bif",
+])
+
+sh_binary(
+    name = "build_boot_a53",
+    srcs = ["build_boot_a53.sh"],
+    # NOTE: the script self-invokes `bazel build --config=rpu //apps/rpu/hello_world`
+    # rather than declaring it as a data dep, so this sh_binary can be built
+    # with --config=host without conflicting platform constraints.
+    data = [
+        "boot_a53.bif",
+        "//board/a53_loader:sources",
+        "//board/a53_loader:linker_script",
+    ],
+)
+
+sh_binary(
+    name = "xsct_jtag_flash",
+    srcs = ["//scripts/xsct:jtag_flash.sh"],
+    data = [
+        "//board/zub_1cg:bitstream",
+        "//board/zub_1cg:psu_init",
+    ],
+)

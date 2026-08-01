@@ -1,0 +1,20 @@
+"""encore OS abstraction layer — platform-neutral Common interfaces (header-only).
+
+strip_import_prefix + import_prefix replicates the CMake install layout so that
+  third_party/os_abstraction_layer/Common/IThreadCustomization.hpp
+resolves as
+  #include "encore/OS/Common/IThreadCustomization.hpp"
+
+NOTE: The encore framework headers (encore/Encore.hpp, encore/ErrorHandling/,
+encore/Utils/, encore/Logging/) are NOT in this repository. Downstream binary
+targets that consume this library must supply the encore include path via their
+own deps or copts.
+"""
+
+cc_library(
+    name = "common",
+    hdrs = glob(["*.hpp"]),
+    strip_include_prefix = "/third_party/os_abstraction_layer",
+    include_prefix = "encore/OS",
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,29 @@
+"""Hello World application for AES-ZUB Cortex-R5F."""
+
+cc_binary(
+    name = "hello_world",
+    srcs = ["main.c"],
+    copts = [
+        "-mcpu=cortex-r5",
+        "-mfpu=vfpv3-d16",
+        "-mfloat-abi=hard",
+        "-marm",
+        "-DR5_STARTUP_TRACE=1",
+        "-ffreestanding",
+        "-fno-builtin",
+    ],
+    # Pass the linker script; $(location ...) expands to the file's path at
+    # build time. additional_linker_inputs ensures Bazel tracks the dependency.
+    additional_linker_inputs = ["//board/rpu:linker_script"],
+    linkopts = [
+        "-T$(location //board/rpu:linker_script)",
+        # newlib-nano: tiny libc (memset, memcpy, printf, …) + nosys syscall stubs.
+        # Requires the Arm GNU Toolchain (gcc-arm-embedded); not -nostdlib.
+        "--specs=nano.specs",
+        "--specs=nosys.specs",
+    ],
+    deps = [
+        "//board/rpu:bsp",
+        "@threadx//:threadx_r5",
+    ],
+)

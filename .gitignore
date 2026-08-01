@@ -1,0 +1,11 @@
+bazel-*
+.bazelrc.user
+result
+result-*
+BOOT.BIN
+*.o
+*.map
+tools/zub_ctl/target/
+tools/zub_ctl/.cargo-home/
+__pycache__/
+*.py[cod]

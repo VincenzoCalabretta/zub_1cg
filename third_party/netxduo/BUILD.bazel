@@ -1,0 +1,34 @@
+"""Eclipse NetX Duo — dual-stack TCP/IP for ThreadX bare-metal targets.
+
+Downloaded and injected by netxduo_extension in extensions.bzl.
+Paths are relative to the NetX Duo repo root.
+
+Only the core IP stack (nx_*/nxd_* in common/src) and the cortex_a7/gnu port
+are compiled here.  NetX Duo ships no cortex_a53 port; cortex_a7/gnu is the
+closest AArch32/AArch64-compatible GNU port and nx_port.h is pure C defines.
+Protocol add-ons (HTTP, FTP, MQTT, TLS, etc.) in addons/ are excluded.
+"""
+
+cc_library(
+    name = "netxduo",
+    srcs = glob(
+        [
+            "common/src/nx_*.c",
+            "common/src/nxd_*.c",
+        ],
+    ),
+    hdrs = glob([
+        "common/inc/*.h",
+        "ports/cortex_a7/gnu/inc/*.h",
+    ]),
+    includes = [
+        "common/inc",
+        "ports/cortex_a7/gnu/inc",
+    ],
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+    deps = ["@threadx//:threadx_a53"],
+)

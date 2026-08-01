@@ -1,0 +1,15 @@
+/*
+ * boot_a53.bif — Xilinx boot-image descriptor: SD/QSPI boot without FSBL.
+ *
+ * The A53 loader is a self-contained AArch64 ELF that copies an embedded R5
+ * image into TCM and releases R5-0 out of module reset.  It replaces the
+ * classical FSBL for this project so no Vitis toolchain is required for
+ * standalone boot.
+ *
+ * The path below is relative to the repo root.  build_boot_a53.sh produces
+ * the loader ELF at that location, then invokes bootgen from the repo root.
+ */
+the_ROM_image:
+{
+    [bootloader, destination_cpu = a53-0] scripts/flash/build/a53_loader.elf
+}

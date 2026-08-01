@@ -1,0 +1,21 @@
+[package]
+name    = "zub_ctl"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Test driver for the zub_1cg board: UART reader + JTAG orchestration."
+
+[[bin]]
+name = "zub_ctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow     = "1"
+clap       = { version = "4", features = ["derive"] }
+regex      = "1"
+serialport = "4"
+
+[profile.release]
+opt-level = "z"
+lto       = true
+strip     = "symbols"
