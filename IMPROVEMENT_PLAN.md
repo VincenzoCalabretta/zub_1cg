@@ -46,7 +46,9 @@ Audit snapshot from 2026-08-01:
 - `nix develop --command bazel test --config=host //tools/...` passes, but it
   executes only the three tests in `//tools/docs:pdf_to_markdown_test`.
   `zub_ctl` has no automated tests.
-- The linker reports an RWE `LOAD` segment for every firmware ELF. The produced
+- The initial audit found an RWE `LOAD` segment for every firmware ELF. ZUB-002
+  now produces distinct executable and writable segments for all current APU
+  and RPU images; automated ELF invariant tests are still pending. The produced
   entry points are currently `0x0` (APU blink and Ethernet), `0x800` (APU
   ThreadX hello), and `0xffff0128` (R5 hello); README values do not consistently
   match these artifacts.

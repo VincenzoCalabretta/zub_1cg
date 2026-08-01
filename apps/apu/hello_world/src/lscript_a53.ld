@@ -18,6 +18,12 @@ MEMORY
 
 ENTRY(_vector_table)
 
+PHDRS
+{
+    text PT_LOAD FLAGS(5); /* PF_R | PF_X */
+    data PT_LOAD FLAGS(6); /* PF_R | PF_W */
+}
+
 SECTIONS
 {
 .text : {
@@ -33,7 +39,7 @@ SECTIONS
    *(.glue_7t)
    *(.ARM.extab)
    *(.gnu.linkonce.armextab.*)
-} > psu_ddr_0
+} > psu_ddr_0 :text
 
 .init (ALIGN(64)) : {
    KEEP (*(.init))
@@ -91,7 +97,7 @@ SECTIONS
    *(.got)
    *(.got.plt)
    __data_end = .;
-} > psu_ddr_0
+} > psu_ddr_0 :data
 
 .data1 : {
    . = ALIGN(64);
@@ -225,7 +231,7 @@ SECTIONS
    *(.gnu.linkonce.sb.*)
    . = ALIGN(64);
    __sbss_end = .;
-} > psu_ddr_0
+} > psu_ddr_0 :data
 
 .tdata : {
    . = ALIGN(64);
@@ -234,7 +240,7 @@ SECTIONS
    *(.tdata.*)
    *(.gnu.linkonce.td.*)
    __tdata_end = .;
-} > psu_ddr_0
+} > psu_ddr_0 :data
 
 .tbss : {
    . = ALIGN(64);
@@ -243,7 +249,7 @@ SECTIONS
    *(.tbss.*)
    *(.gnu.linkonce.tb.*)
    __tbss_end = .;
-} > psu_ddr_0
+} > psu_ddr_0 :data
 
 .bss (NOLOAD) : {
    . = ALIGN(64);
@@ -254,7 +260,7 @@ SECTIONS
    *(COMMON)
    . = ALIGN(64);
    __bss_end__ = .;
-} > psu_ddr_0
+} > psu_ddr_0 :data
 
 _SDA_BASE_  = __sdata_start + ((__sbss_end  - __sdata_start)  / 2 );
 _SDA2_BASE_ = __sdata2_start + ((__sbss2_end - __sdata2_start) / 2 );
@@ -267,7 +273,7 @@ _SDA2_BASE_ = __sdata2_start + ((__sbss2_end - __sdata2_start) / 2 );
    . += _HEAP_SIZE;
    _heap_end = .;
    HeapLimit = .;
-} > psu_ddr_0
+} > psu_ddr_0 :data
 
 .stack (NOLOAD) : {
    . = ALIGN(64);
@@ -286,7 +292,7 @@ _SDA2_BASE_ = __sdata2_start + ((__sbss2_end - __sdata2_start) / 2 );
    . += _EL0_STACK_SIZE;
    . = ALIGN(64);
    __el0_stack = .;
-} > psu_ddr_0
+} > psu_ddr_0 :data
 
 _end = .;
 }
