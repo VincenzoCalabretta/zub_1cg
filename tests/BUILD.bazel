@@ -23,11 +23,35 @@ Environment variables (all optional):
   XSCT          — path to Xilinx xsct             (A53 and RPU tests)
 """
 
-load(":rules.bzl", "onboard_firmware_test")
+load(":rules.bzl", "firmware_elf_test", "onboard_firmware_test")
 
 package(default_visibility = ["//visibility:public"])
 
 _HW_TAGS = ["manual", "exclusive", "requires-hardware", "local"]
+
+firmware_elf_test(
+    name = "apu_blink_elf_test",
+    firmware = "//apps/apu/blink:blink.elf",
+    firmware_platform = "//platforms:apu_a53",
+)
+
+firmware_elf_test(
+    name = "apu_hello_world_elf_test",
+    firmware = "//apps/apu/hello_world:hello_world_a53.elf",
+    firmware_platform = "//platforms:apu_a53",
+)
+
+firmware_elf_test(
+    name = "apu_eth_loopback_elf_test",
+    firmware = "//apps/apu/eth_loopback:eth_loopback_a53.elf",
+    firmware_platform = "//platforms:apu_a53",
+)
+
+firmware_elf_test(
+    name = "rpu_hello_world_elf_test",
+    firmware = "//apps/rpu/hello_world:hello_world",
+    firmware_platform = "//platforms:rpu_r5_0",
+)
 
 onboard_firmware_test(
     name = "rpu_hello_world_test",

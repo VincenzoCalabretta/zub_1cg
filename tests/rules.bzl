@@ -15,7 +15,7 @@ def _onboard_firmware_test_impl(ctx):
         output = launcher,
         content = """#!/usr/bin/env bash
 set -euo pipefail
-exec \"$TEST_SRCDIR/{script}\" \"$@\"
+exec \"$TEST_SRCDIR/${{TEST_WORKSPACE:-_main}}/{script}\" \"$@\"
 """.format(script = ctx.file.test_script.short_path),
         is_executable = True,
     )
@@ -52,4 +52,50 @@ def onboard_firmware_test(name, test_script, firmware, firmware_platform, data, 
         firmware_platform = firmware_platform,
         data = data,
         tags = tags,
+    )
+
+def _firmware_elf_test_impl(ctx):
+    launcher = ctx.actions.declare_file(ctx.label.name)
+    ctx.actions.write(
+        output = launcher,
+        content = """#!/usr/bin/env bash
+set -euo pipefail
+exec \"$TEST_SRCDIR/${{TEST_WORKSPACE:-_main}}/{checker}\" \\
+     \"$TEST_SRCDIR/${{TEST_WORKSPACE:-_main}}/{firmware}\"
+""".format(
+            checker = ctx.executable.checker.short_path,
+            firmware = ctx.executable.firmware.short_path,
+        ),
+        is_executable = True,
+    )
+    return [DefaultInfo(
+        executable = launcher,
+        runfiles = ctx.runfiles(files = [ctx.executable.checker, ctx.executable.firmware]),
+    )]
+
+_firmware_elf_test = rule(
+    implementation = _firmware_elf_test_impl,
+    attrs = {
+        "checker": attr.label(
+            executable = True,
+            cfg = "exec",
+            mandatory = True,
+        ),
+        "firmware": attr.label(
+            cfg = _firmware_platform_transition,
+            executable = True,
+            mandatory = True,
+        ),
+        "firmware_platform": attr.string(mandatory = True),
+    },
+    test = True,
+)
+
+def firmware_elf_test(name, firmware, firmware_platform):
+    """Validates one target-core firmware ELF on the host during presubmit."""
+    _firmware_elf_test(
+        name = name,
+        checker = "//tools/elf_check:elf_check",
+        firmware = firmware,
+        firmware_platform = firmware_platform,
     )

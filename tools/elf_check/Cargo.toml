@@ -1,0 +1,10 @@
+[package]
+name = "elf_check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "ELF load-segment invariant checker for zub_1cg firmware."
+
+[[bin]]
+name = "elf_check"
+path = "src/main.rs"

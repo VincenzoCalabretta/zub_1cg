@@ -1,0 +1,27 @@
+"""Bazel-built ELF load-segment checker and its unit tests."""
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+exports_files(
+    ["Cargo.toml", "Cargo.lock"],
+    visibility = ["//visibility:public"],
+)
+
+rust_library(
+    name = "elf_check_lib",
+    srcs = ["src/lib.rs"],
+    edition = "2021",
+)
+
+rust_binary(
+    name = "elf_check",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [":elf_check_lib"],
+)
+
+rust_test(
+    name = "elf_check_test",
+    crate = ":elf_check_lib",
+)
