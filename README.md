@@ -59,9 +59,10 @@ zub_1cg/
 
 | App | Core | Toolchain | Entry point | Test |
 |---|---|---|---|---|
+| `//apps/apu/blink` | A53 | aarch64-none-elf | 0x0 | `//tests:apu_blink_test` |
 | `//apps/apu/hello_world` | A53 | aarch64-none-elf | 0x800 | `//tests:apu_hello_world_test` |
-| `//apps/apu/eth_loopback` | A53 | aarch64-none-elf | 0x800 | `//tests:apu_eth_loopback_test` |
-| `//apps/rpu/hello_world` | R5F | arm-none-eabi | 0xFFFF0118 (OCM) | `//tests:rpu_hello_world_test` |
+| `//apps/apu/eth_loopback` | A53 | aarch64-none-elf | 0x0 | `//tests:apu_eth_loopback_test` |
+| `//apps/rpu/hello_world` | R5F | arm-none-eabi | 0xFFFF0128 (OCM) | `//tests:rpu_hello_world_test` |
 
 ## Testing on the board
 
