@@ -18,6 +18,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use elf_check_lib::{parse_artifact_hashes, sha256_hex};
 use regex::Regex;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -45,6 +46,8 @@ enum Cmd {
     WatchR5(WatchR5Args),
     /// Boot A53 via xsct, then watch UART for expected patterns.
     WatchA53(WatchA53Args),
+    /// Preflight check: TTY, OpenOCD/xsct availability, and artifact hashes.
+    Doctor(DoctorArgs),
 }
 
 #[derive(Args, Clone)]
@@ -117,6 +120,23 @@ struct WatchA53Args {
     serial: SerialArgs,
 }
 
+#[derive(Args)]
+struct DoctorArgs {
+    /// Serial device to probe for presence and permissions.
+    #[arg(long, default_value = "/dev/ttyUSB1")]
+    tty: PathBuf,
+    /// openocd binary (checked for presence and version).
+    #[arg(long, default_value = "openocd")]
+    openocd: String,
+    /// xsct binary (optional; skipped when absent).
+    #[arg(long)]
+    xsct: Option<PathBuf>,
+    /// Directory containing artifacts.json and committed board blobs.
+    /// When given, SHA-256 of every listed artifact is compared to the manifest.
+    #[arg(long)]
+    artifacts_dir: Option<PathBuf>,
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -125,6 +145,7 @@ fn main() {
         Cmd::SerialWatch(a) => run_serial_watch(a),
         Cmd::WatchR5(a) => run_watch_r5(a),
         Cmd::WatchA53(a) => run_watch_a53(a),
+        Cmd::Doctor(a) => run_doctor(a),
     };
     match rc {
         Ok(ok) => std::process::exit(if ok { 0 } else { 1 }),
@@ -133,6 +154,143 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+// ── doctor ───────────────────────────────────────────────────────────────────
+
+fn run_doctor(args: DoctorArgs) -> Result<bool> {
+    let mut failed = false;
+
+    // 1. TTY presence.
+    let tty_exists = args.tty.exists();
+    print_check(tty_exists, false, &format!("TTY device {}", args.tty.display()),
+        if tty_exists { "" } else { "device not found" });
+    failed |= !tty_exists;
+
+    // 2. TTY read/write permission.
+    if tty_exists {
+        let perm_ok = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&args.tty)
+            .is_ok();
+        print_check(perm_ok, false,
+            &format!("TTY permissions (r/w) on {}", args.tty.display()),
+            if perm_ok { "" } else { "cannot open for read+write; try: sudo usermod -aG dialout $USER" });
+        failed |= !perm_ok;
+    }
+
+    // 3. USB serial enumeration hint (advisory only).
+    let by_id = std::path::Path::new("/dev/serial/by-id");
+    if by_id.exists() {
+        let ft2232_found = fs::read_dir(by_id)
+            .map(|entries| entries.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains("FT2232")))
+            .unwrap_or(false);
+        print_check(ft2232_found, true,
+            "FT2232H in /dev/serial/by-id",
+            if ft2232_found { "" } else { "no FT2232H enumerated; check USB cable / driver" });
+    }
+
+    // 4. openocd version.
+    let ocd_result = Command::new(&args.openocd)
+        .arg("--version")
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .output();
+    match ocd_result {
+        Ok(out) => {
+            let ver = String::from_utf8_lossy(&out.stderr);
+            let first = ver.lines().next().unwrap_or("").trim().to_string();
+            print_check(true, false, &format!("openocd ({first})"), "");
+        }
+        Err(e) => {
+            print_check(false, false,
+                &format!("openocd ({})", args.openocd),
+                &format!("{e}"));
+            failed = true;
+        }
+    }
+
+    // 5. xsct (optional).
+    match &args.xsct {
+        None => print_check_skip("xsct binary (--xsct not provided)"),
+        Some(path) => {
+            let ok = path.exists();
+            print_check(ok, false,
+                &format!("xsct at {}", path.display()),
+                if ok { "" } else { "file not found" });
+            failed |= !ok;
+        }
+    }
+
+    // 6. Artifact hash verification (optional).
+    match &args.artifacts_dir {
+        None => print_check_skip("artifact hash check (--artifacts-dir not provided)"),
+        Some(dir) => {
+            let manifest_path = dir.join("artifacts.json");
+            match fs::read_to_string(&manifest_path) {
+                Err(e) => {
+                    print_check(false, false, "artifacts.json readable",
+                        &format!("{}: {e}", manifest_path.display()));
+                    failed = true;
+                }
+                Ok(json) => {
+                    let entries = parse_artifact_hashes(&json);
+                    if entries.is_empty() {
+                        print_check(false, false, "artifacts.json has entries",
+                            "parse yielded zero (path, sha256) pairs");
+                        failed = true;
+                    }
+                    for (rel, expected) in &entries {
+                        let full = dir.join(rel);
+                        match fs::read(&full) {
+                            Err(e) => {
+                                print_check(false, false,
+                                    &format!("artifact {rel}"),
+                                    &format!("cannot read: {e}"));
+                                failed = true;
+                            }
+                            Ok(data) => {
+                                let actual = sha256_hex(&data);
+                                let ok = &actual == expected;
+                                let mismatch = if ok {
+                                    String::new()
+                                } else {
+                                    format!("computed {actual}, manifest {expected}")
+                                };
+                                print_check(ok, false,
+                                    &format!("artifact {rel} SHA-256"),
+                                    &mismatch);
+                                failed |= !ok;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if failed {
+        eprintln!("[doctor] one or more required checks FAILED — fix the issues above before running board tests.");
+    } else {
+        eprintln!("[doctor] all checks passed.");
+    }
+    Ok(!failed)
+}
+
+fn print_check(ok: bool, advisory: bool, label: &str, detail: &str) {
+    if ok {
+        eprintln!("[OK  ] {label}");
+    } else if advisory {
+        eprintln!("[WARN] {label}{}", if detail.is_empty() { String::new() } else { format!(" — {detail}") });
+    } else {
+        eprintln!("[FAIL] {label}{}", if detail.is_empty() { String::new() } else { format!(" — {detail}") });
+    }
+}
+
+fn print_check_skip(label: &str) {
+    eprintln!("[SKIP] {label}");
 }
 
 // ── serial-watch (single command) ────────────────────────────────────────────

@@ -25,6 +25,7 @@ rust_binary(
     edition = "2021",
     visibility = ["//visibility:public"],
     deps = [
+        "//tools/elf_check:elf_check_lib",
         "@zub_ctl_crates//:anyhow",
         "@zub_ctl_crates//:clap",
         "@zub_ctl_crates//:regex",

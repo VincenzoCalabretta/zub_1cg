@@ -98,7 +98,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-002: Enforce ELF memory and protection invariants
 
-- **Status:** in progress
+- **Status:** done
 - **Why:** All current link products warn about RWE segments, and entry-point
   documentation has already drifted. A successful link is not enough for
   bare-metal correctness.
@@ -132,7 +132,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-010: Pin every build input and record artifact provenance
 
-- **Status:** in progress
+- **Status:** done (partial — sha256_hex + parse_artifact_hashes in elf_check_lib; board/zub_1cg:artifact_integrity_test verifies committed .bit/.tcl against artifacts.json; archive integrity pinning and BSP provenance remain proposed work)
 - **Work:** Add archive hashes to all repository downloads; pin the Bazel major
   version with `.bazelversion`; reduce `PATH` and environment leakage into Bazel
   actions; verify that a clean Nix shell can fetch once and rebuild offline.
