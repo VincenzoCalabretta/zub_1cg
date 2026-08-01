@@ -3,7 +3,7 @@
 Convert every PDF under `docs/` into agent-readable Markdown:
 
 ```bash
-python3 tools/docs/pdf_to_markdown.py --clean
+bazel run //tools/docs:pdf_to_markdown -- --clean
 ```
 
 The generated output lives in `documentation/pdf/` and is intentionally not
@@ -17,8 +17,7 @@ hand edited. Each PDF gets:
 - `manifest.json` (at the output root): source hash, page, context, category,
   and file for every table, intended for programmatic agent lookup.
 
-The script uses Poppler's `pdftotext -layout`; it requires no third-party
-Python libraries. It preserves text-layer PDFs. If the manifest reports a
+The Bazel-built Rust binary uses Poppler's `pdftotext -layout`. It preserves text-layer PDFs. If the manifest reports a
 missing text layer, OCR that source PDF first and rerun the converter. Table
 categories are heuristic, so use the recorded source page to verify important
 hardware values against the original PDF.
@@ -26,5 +25,5 @@ hardware values against the original PDF.
 To convert a different directory without changing the default output:
 
 ```bash
-python3 tools/docs/pdf_to_markdown.py --source path/to/pdfs --output documentation/other-pdfs --clean
+bazel run //tools/docs:pdf_to_markdown -- --source path/to/pdfs --output documentation/other-pdfs --clean
 ```

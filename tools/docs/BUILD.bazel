@@ -1,0 +1,33 @@
+"""Bazel-built PDF documentation converter and unit tests."""
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+exports_files(
+    ["Cargo.toml", "Cargo.lock"],
+    visibility = ["//visibility:public"],
+)
+
+rust_library(
+    name = "pdf_to_markdown_lib",
+    srcs = ["src/lib.rs"],
+    edition = "2021",
+    deps = [
+        "@docs_crates//:regex",
+        "@docs_crates//:serde",
+        "@docs_crates//:serde_json",
+        "@docs_crates//:sha2",
+    ],
+)
+
+rust_binary(
+    name = "pdf_to_markdown",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    deps = [":pdf_to_markdown_lib"],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "pdf_to_markdown_test",
+    crate = ":pdf_to_markdown_lib",
+)

@@ -64,6 +64,7 @@
             pkgs.clippy
             pkgs.pkg-config
             pkgs.systemdMinimal     # provides libudev for the serialport crate
+            pkgs.poppler-utils      # provides pdftotext for //tools/docs
 
             # ── Firmware packaging + on-target tooling ─────────────────────
             bootgen
@@ -78,7 +79,6 @@
 
             # ── General ────────────────────────────────────────────────────
             pkgs.git
-            pkgs.python3            # for occasional scripts (not tests)
             pkgs.file
             pkgs.which
             pkgs.jq

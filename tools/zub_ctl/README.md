@@ -59,11 +59,7 @@ zub_ctl watch-a53 \
 ## Building
 
 ```bash
-# Standalone (cargo, from Nix devShell):
-cd tools/zub_ctl && cargo build --release
-# → target/release/zub_ctl
-
-# Via Bazel:
+# Bazel-built binary:
 bazel build --config=host //tools/zub_ctl:zub_ctl
 # → bazel-bin/tools/zub_ctl/zub_ctl
 ```
