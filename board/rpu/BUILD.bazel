@@ -17,7 +17,7 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
-# BSP library: startup, UART, GIC + timer.
+# BSP library: startup, UART, GIC + timer (requires ThreadX for IRQ dispatch).
 cc_library(
     name = "bsp",
     srcs = [
@@ -29,6 +29,20 @@ cc_library(
         "timer.h",
         "uart.h",
     ],
+    copts = _R5F_COPTS,
+    includes = ["."],
+    visibility = ["//visibility:public"],
+)
+
+# Bare-metal BSP subset: startup + UART only.  No ThreadX dependency.
+# Use for tests that do not need the timer or IRQ dispatch.
+cc_library(
+    name = "bsp_bare",
+    srcs = [
+        "startup_bare.S",
+        "uart.c",
+    ],
+    hdrs = ["uart.h"],
     copts = _R5F_COPTS,
     includes = ["."],
     visibility = ["//visibility:public"],

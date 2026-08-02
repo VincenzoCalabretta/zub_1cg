@@ -196,7 +196,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-021: Create a shared on-target test protocol and runtime
 
-- **Status:** proposed
+- **Status:** done (board/test_proto.h provides TEST_BEGIN/PASS/FAIL/DIAG/ASSERT macros; hello_world ThreadX test emits [TEST PASS] hello_world; apps/rpu/bsp_test bare-metal test emits [TEST PASS] bsp_uart without ThreadX via new board/rpu:bsp_bare + startup_bare.S; both test scripts use --fail-on '\[TEST FAIL\]' so any protocol failure is surfaced; zub_ctl unit tests cover the FailOnHit path; A53 deferred pending xsct availability)
 - **Work:** Adapt the reference project's shared test-runtime idea into a small
   C library usable by both cores: stable `BEGIN`, assertion, diagnostic, and
   `PASS`/`FAIL` records; panic/assert hooks; bounded output; and an explicit

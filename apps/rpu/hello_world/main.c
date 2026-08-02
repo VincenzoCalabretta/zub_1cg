@@ -1,6 +1,8 @@
 #include "tx_api.h"
 #include "uart.h"
 #include "timer.h"
+#define TEST_PROTO_PRINT(s) uart_print(s)
+#include "test_proto.h"
 
 /* ── ThreadX objects ─────────────────────────────────────────────────── */
 
@@ -14,7 +16,9 @@ static ULONG hello_stack[1024];
 static void hello_entry(ULONG arg)
 {
     (void)arg;
+    TEST_BEGIN("hello_world");
     uart_print("Hello, World!\r\n");
+    TEST_PASS("hello_world");
     timer_start();
     for (;;) {
         uart_print("Hello, World!\r\n");

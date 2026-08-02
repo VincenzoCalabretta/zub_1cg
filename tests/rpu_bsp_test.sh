@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# On-target integration test: boot R5 hello_world via openocd, capture UART.
+# On-target bare-metal BSP test: boot R5 bsp_test via openocd, no ThreadX.
 #
 # Failure categories emitted on stderr:
 #   [PRECONDITION FAIL]  device/tool missing, permission denied, artifact corrupt
@@ -13,7 +13,7 @@
 #   - /dev/ttyUSB1 present (UART0 console via MIO 10/11)
 #
 # Workflow:
-#   bazel test --config=host --config=onboard //tests:rpu_hello_world_test
+#   bazel test --config=host --config=onboard //tests:rpu_bsp_test
 set -euo pipefail
 
 TTY="${ZUB_TTY:-/dev/ttyUSB1}"
@@ -35,9 +35,9 @@ OPENOCD_CFG="$RUN/scripts/openocd/aes_zub.cfg"
 LOAD_R5="$RUN/scripts/openocd/load_r5.tcl"
 PSU_INIT_RUN="$RUN/scripts/openocd/psu_init_run.tcl"
 
-ELF="$RUN/apps/rpu/hello_world/hello_world"
+ELF="$RUN/apps/rpu/bsp_test/bsp_test"
 if [[ ! -f "$ELF" ]]; then
-    echo "[INFRA FAIL] R5 ELF is missing from test runfiles" >&2
+    echo "[INFRA FAIL] R5 bare-metal ELF is missing from test runfiles" >&2
     exit 1
 fi
 if [[ ! -f "$OPENOCD_CFG" ]]; then
@@ -51,7 +51,7 @@ if ! "$ZUB_CTL" doctor --tty "$TTY" --openocd openocd 2>&1; then
     echo "[PRECONDITION FAIL] zub_ctl doctor failed — fix the issues above" >&2
     exit 1
 fi
-echo "=== Booting R5 firmware ===" >&2
+echo "=== Booting R5 bare-metal firmware ===" >&2
 
 # ── Boot + assertion ─────────────────────────────────────────────────────────
 "$ZUB_CTL" watch-r5 \
@@ -62,5 +62,5 @@ echo "=== Booting R5 firmware ===" >&2
     --tty            "$TTY" \
     --baud           "$BAUD" \
     --timeout        "$TIMEOUT_S" \
-    --expect         '\[TEST PASS\] hello_world' \
+    --expect         '\[TEST PASS\] bsp_uart' \
     --fail-on        '\[TEST FAIL\]'

@@ -1,0 +1,11 @@
+"""Board-level support shared across cores."""
+
+# Header-only test protocol: emit structured [TEST BEGIN/PASS/FAIL/DIAG] lines.
+# Include with a prior #define TEST_PROTO_PRINT(s) pointing at the BSP's
+# console write function.  See test_proto.h for usage.
+cc_library(
+    name = "test_proto",
+    hdrs = ["test_proto.h"],
+    includes = ["."],
+    visibility = ["//visibility:public"],
+)

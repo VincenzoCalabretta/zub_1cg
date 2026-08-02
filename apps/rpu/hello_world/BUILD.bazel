@@ -27,6 +27,7 @@ cc_binary(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//board:test_proto",
         "//board/rpu:bsp",
         "@threadx//:threadx_r5",
     ],
