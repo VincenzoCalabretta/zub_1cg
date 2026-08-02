@@ -19,7 +19,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use elf_check_lib::{parse_artifact_hashes, sha256_hex};
-use regex::Regex;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -28,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use zub_ctl_lib::{build_xsct_tcl, compile_regexes, match_line, push_bytes_to_lines, LineResult};
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -386,15 +386,15 @@ fn run_watch_r5(args: WatchR5Args) -> Result<bool> {
         }
     }
 
-    // 2. Start serial reader BEFORE running openocd so no boot output is lost.
-    let (stop, handle) = spawn_serial_watch(&args.serial)?;
+    // 2. Start serial reader BEFORE launching openocd so no boot output is lost.
+    let (stop, serial_handle) = spawn_serial_watch(&args.serial)?;
 
-    // 3. Run openocd, streaming its output with an [OCD] prefix.
+    // 3. Spawn openocd as a background child so the serial watch is not blocked
+    //    waiting for the JTAG tool to exit.  Inject ELF path before the script
+    //    so the script's $ELF variable is set to an absolute path.
     eprintln!("[zub_ctl] launching openocd…");
     let mut cmd = Command::new(&args.openocd);
     cmd.arg("-f").arg(&args.openocd_cfg);
-    // Inject ELF path before the script so the script's `$ELF` variable is
-    // already set to an absolute path regardless of the working directory.
     if let Some(elf) = &args.elf {
         let elf_abs =
             fs::canonicalize(elf).with_context(|| format!("resolve ELF {}", elf.display()))?;
@@ -404,15 +404,38 @@ fn run_watch_r5(args: WatchR5Args) -> Result<bool> {
     for script in &args.openocd_script {
         cmd.arg("-f").arg(script);
     }
-    let ocd_status = run_subprocess(&mut cmd, "OCD")?;
-    if !ocd_status.success() {
-        eprintln!("[zub_ctl] openocd exited with status {ocd_status:?}");
-    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut ocd_child: Child = cmd.spawn().context("spawn openocd")?;
 
-    // 4. Give the app time to reach its expected serial output.
-    let ok = handle.join().expect("serial thread panicked")?;
+    let ocd_stdout = ocd_child.stdout.take().unwrap();
+    let ocd_stderr = ocd_child.stderr.take().unwrap();
+    let t_out = thread::spawn(move || pipe_lines(ocd_stdout, "OCD", false));
+    let t_err = thread::spawn(move || pipe_lines(ocd_stderr, "OCD", true));
+
+    // 4. Wait for serial watch (pattern matched or timeout).
+    let ok = serial_handle.join().expect("serial thread panicked")?;
     drop(stop);
-    Ok(ok && ocd_status.success())
+
+    // 5. Reap openocd: kill it if still running (normal when the serial pattern
+    //    matched before openocd's own `shutdown` call), otherwise collect its
+    //    exit status.  A kill is not counted as a failure.
+    let ocd_success = match ocd_child.try_wait().context("poll openocd")? {
+        Some(status) => {
+            if !status.success() {
+                eprintln!("[zub_ctl] openocd exited with status {status:?}");
+            }
+            status.success()
+        }
+        None => {
+            let _ = ocd_child.kill();
+            let _ = ocd_child.wait();
+            true
+        }
+    };
+    let _ = t_out.join();
+    let _ = t_err.join();
+
+    Ok(ok && ocd_success)
 }
 
 // ── watch-a53 ────────────────────────────────────────────────────────────────
@@ -430,38 +453,7 @@ fn run_watch_a53(args: WatchA53Args) -> Result<bool> {
     let (stop, handle) = spawn_serial_watch(&args.serial)?;
 
     // 2. Build the xsct TCL script.
-    let tcl = format!(
-        r#"connect
-puts "Connected. Available targets:"
-targets
-
-puts "\nResetting system..."
-targets -set -nocase -filter {{name =~ "PSU"}}
-rst -system
-after 3000
-mwr 0xffca0038 0x1ff
-
-puts "Programming PL bitstream: {bit}"
-fpga -file {bit}
-
-puts "Running psu_init (clocks, MIO, DDR)..."
-targets -set -nocase -filter {{name =~ "APU*"}}
-source {psinit}
-psu_init
-psu_ps_pl_isolation_removal
-psu_ps_pl_reset_config
-after 1000
-
-puts "Loading ELF on A53 #0: {elf}"
-targets -set -nocase -filter {{name =~ "*A53*#0"}}
-rst -processor
-dow {elf}
-con
-"#,
-        bit = bit.display(),
-        psinit = psinit.display(),
-        elf = elf.display(),
-    );
+    let tcl = build_xsct_tcl(&elf, &bit, &psinit);
 
     // 3. Write TCL to a tempfile, run xsct.
     let tmp = std::env::temp_dir().join(format!("zub_ctl_xsct_{}.tcl", std::process::id()));
@@ -522,16 +514,8 @@ fn pipe_lines<R: Read>(r: R, prefix: &str, stderr_channel: bool) {
 
 // ── shared: serial-watch thread ──────────────────────────────────────────────
 
-/// Compile regexes at boundary so we surface bad patterns early.
-fn compile_regexes(patterns: &[String]) -> Result<Vec<Regex>> {
-    patterns
-        .iter()
-        .map(|p| Regex::new(p).with_context(|| format!("bad regex: {p}")))
-        .collect()
-}
-
 fn spawn_serial_watch(args: &SerialArgs) -> Result<(Arc<AtomicBool>, JoinHandle<Result<bool>>)> {
-    let expect = compile_regexes(&args.expect)?;
+    let remaining = compile_regexes(&args.expect)?;
     let fail_on = compile_regexes(&args.fail_on)?;
 
     let tty = args.tty.clone();
@@ -560,7 +544,7 @@ fn spawn_serial_watch(args: &SerialArgs) -> Result<(Arc<AtomicBool>, JoinHandle<
     let handle = thread::spawn(move || -> Result<bool> {
         let mut port = port;
         let start = Instant::now();
-        let mut remaining: Vec<Regex> = expect;
+        let mut remaining = remaining;
         let mut line_buf = String::new();
         let mut byte_buf = [0u8; 256];
 
@@ -587,39 +571,27 @@ fn spawn_serial_watch(args: &SerialArgs) -> Result<(Arc<AtomicBool>, JoinHandle<
             match port.read(&mut byte_buf) {
                 Ok(0) => continue,
                 Ok(n) => {
-                    // Serial data is treated as UTF-8 with lossy replacement:
-                    // we care about matching text, not binary integrity.
-                    let text = String::from_utf8_lossy(&byte_buf[..n]);
-                    line_buf.push_str(&text);
-                    while let Some(nl) = line_buf.find('\n') {
-                        let line: String = line_buf.drain(..=nl).collect();
-                        let line = line.trim_end_matches(&['\r', '\n'][..]).to_string();
-                        if line.is_empty() {
-                            continue;
-                        }
+                    for line in push_bytes_to_lines(&mut line_buf, &byte_buf[..n]) {
                         println!("[SERIAL] {line}");
                         if print_only {
                             continue;
                         }
-                        for pat in &fail_on {
-                            if pat.is_match(&line) {
-                                eprintln!(
-                                    "[zub_ctl] serial-watch: fail-on regex hit: {}",
-                                    pat.as_str()
-                                );
+                        let prev_len = remaining.len();
+                        let next_pat = remaining.first().map(|p| p.as_str().to_owned());
+                        match match_line(&line, &mut remaining, &fail_on) {
+                            LineResult::FailOnHit(pat) => {
+                                eprintln!("[zub_ctl] serial-watch: fail-on regex hit: {pat}");
                                 return Ok(false);
                             }
-                        }
-                        // Match against the first still-pending expected pattern.
-                        // Order matters for expected patterns; use one --expect
-                        // per line-of-interest to enforce order.
-                        if let Some(pat) = remaining.first() {
-                            if pat.is_match(&line) {
-                                eprintln!("[zub_ctl]   ✓ matched: {}", pat.as_str());
-                                remaining.remove(0);
-                                if remaining.is_empty() {
-                                    eprintln!("[zub_ctl] serial-watch: all patterns matched.");
-                                    return Ok(true);
+                            LineResult::AllMatched => {
+                                eprintln!("[zub_ctl] serial-watch: all patterns matched.");
+                                return Ok(true);
+                            }
+                            LineResult::Continue => {
+                                if remaining.len() < prev_len {
+                                    if let Some(pat) = next_pat {
+                                        eprintln!("[zub_ctl]   ✓ matched: {pat}");
+                                    }
                                 }
                             }
                         }

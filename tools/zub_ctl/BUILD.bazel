@@ -12,7 +12,7 @@ Usage from an integration test (see //tests):
                          --tty /dev/ttyUSB1 --expect "..." --timeout 30
 """
 
-load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 exports_files(
     [
@@ -20,6 +20,22 @@ exports_files(
         "Cargo.lock",
     ],
     visibility = ["//visibility:public"],
+)
+
+rust_library(
+    name = "zub_ctl_lib",
+    srcs = ["src/lib.rs"],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@zub_ctl_crates//:anyhow",
+        "@zub_ctl_crates//:regex",
+    ],
+)
+
+rust_test(
+    name = "zub_ctl_lib_test",
+    crate = ":zub_ctl_lib",
 )
 
 rust_binary(
@@ -31,6 +47,7 @@ rust_binary(
     tags = ["requires-network"],
     visibility = ["//visibility:public"],
     deps = [
+        ":zub_ctl_lib",
         "//tools/elf_check:elf_check_lib",
         "@zub_ctl_crates//:anyhow",
         "@zub_ctl_crates//:clap",

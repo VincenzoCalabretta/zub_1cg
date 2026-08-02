@@ -5,6 +5,10 @@ edition = "2021"
 publish = false
 description = "Test driver for the zub_1cg board: UART reader + JTAG orchestration."
 
+[lib]
+name = "zub_ctl_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "zub_ctl"
 path = "src/main.rs"

@@ -184,7 +184,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-020: Turn `zub_ctl` into a tested orchestration library
 
-- **Status:** proposed
+- **Status:** done (core serial-matching primitives extracted to `tools/zub_ctl/src/lib.rs`; `rust_library` + `rust_test` targets in BUILD.bazel; 14 unit tests cover compile_regexes, push_bytes_to_lines, match_line ordering/precedence/UTF-8, and build_xsct_tcl quoting; `run_watch_r5` now kills openocd after serial watch resolves instead of blocking on it; pseudo-terminal integration tests and structured log capture remain proposed future work)
 - **Work:** Split CLI parsing from serial matching, subprocess lifecycle, and
   board scenarios. Unit-test ordered regex matching, failure precedence,
   partial lines, invalid UTF-8, timeout boundaries, child exit/termination,
