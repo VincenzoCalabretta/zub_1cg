@@ -1,14 +1,10 @@
 """Board support package for AES-ZUB Cortex-R5F core 0."""
 
-_R5F_COPTS = [
-    "-mcpu=cortex-r5",
-    "-mfpu=vfpv3-d16",
-    "-mfloat-abi=hard",
-    "-marm",
-    "-DR5_STARTUP_TRACE=1",
-    "-ffreestanding",
-    "-fno-builtin",
-]
+load(":rules.bzl", "R5F_COPTS")
+
+# Startup trace flag: startup.S writes 0x52535431 ("RST1") to 0xFFFFFF00 as
+# its very first instruction, letting load_r5.tcl prove the reset handler ran.
+_BSP_COPTS = R5F_COPTS + ["-DR5_STARTUP_TRACE=1"]
 
 # Expose the linker script so apps can reference it with $(location ...).
 filegroup(
@@ -29,7 +25,7 @@ cc_library(
         "timer.h",
         "uart.h",
     ],
-    copts = _R5F_COPTS,
+    copts = _BSP_COPTS,
     includes = ["."],
     visibility = ["//visibility:public"],
 )
@@ -43,7 +39,7 @@ cc_library(
         "uart.c",
     ],
     hdrs = ["uart.h"],
-    copts = _R5F_COPTS,
+    copts = R5F_COPTS,
     includes = ["."],
     visibility = ["//visibility:public"],
 )

@@ -222,7 +222,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-023: Consolidate platform and BSP configuration
 
-- **Status:** proposed; can proceed alongside ZUB-022
+- **Status:** done (board/rpu/rules.bzl defines R5F_COPTS and r5_binary macro; board/rpu/BUILD.bazel imports R5F_COPTS from rules.bzl, extending with -DR5_STARTUP_TRACE=1 for BSP only; hello_world and bsp_test use r5_binary macro, no longer copying CPU/linker flags; A53 flags remain toolchain-managed via platform constraints)
 - **Work:** Centralize CPU/FPU ABI flags in toolchain/platform features instead
   of repeating them in libraries and applications. Move SoC base addresses,
   clocks, MIO selection, and memory layout to reviewed board headers/config

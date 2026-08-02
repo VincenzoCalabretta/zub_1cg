@@ -1,26 +1,11 @@
 """Bare-metal BSP smoke test for AES-ZUB Cortex-R5F (no ThreadX)."""
 
-cc_binary(
+load("//board/rpu:rules.bzl", "r5_binary")
+
+r5_binary(
     name = "bsp_test",
     srcs = ["main.c"],
-    additional_linker_inputs = ["//board/rpu:linker_script"],
-    copts = [
-        "-mcpu=cortex-r5",
-        "-mfpu=vfpv3-d16",
-        "-mfloat-abi=hard",
-        "-marm",
-        "-ffreestanding",
-        "-fno-builtin",
-    ],
-    linkopts = [
-        "-T$(location //board/rpu:linker_script)",
-        "-nostartfiles",
-        "--specs=nano.specs",
-        "--specs=nosys.specs",
-    ],
+    bsp = "//board/rpu:bsp_bare",
     visibility = ["//visibility:public"],
-    deps = [
-        "//board:test_proto",
-        "//board/rpu:bsp_bare",
-    ],
+    deps = ["//board:test_proto"],
 )
