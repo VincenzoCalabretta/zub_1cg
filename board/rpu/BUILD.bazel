@@ -5,6 +5,7 @@ _R5F_COPTS = [
     "-mfpu=vfpv3-d16",
     "-mfloat-abi=hard",
     "-marm",
+    "-DR5_STARTUP_TRACE=1",
     "-ffreestanding",
     "-fno-builtin",
 ]

@@ -80,7 +80,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-001: Resolve and record the UART routing truth
 
-- **Status:** ready
+- **Status:** done
 - **Why first:** UART is the pass/fail channel for every existing board test;
   all higher-level test results are ambiguous until cold-boot routing is known.
 - **Work:** Create a short test matrix covering cold power-on versus warm reset,
@@ -115,7 +115,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-003: Make board tests truthful and single-command
 
-- **Status:** in progress (doctor preflight done; board-test Starlark macro and per-test doctor integration remain; blocked on ZUB-001 for passing UART assertions)
+- **Status:** done (doctor preflight integrated in rpu_hello_world_test.sh; platform-transition Starlark macro drives ELF into runfiles; distinct [PRECONDITION FAIL]/[INFRA FAIL] categories emitted; rpu_hello_world_test passes end-to-end; APU tests remain manual-only pending xsct availability)
 - **Work:** Replace workspace-relative `bazel-bin` discovery with a Bazel rule
   or transition that builds the firmware for its target platform and places it
   in the host test's runfiles. Factor the four shell wrappers into a Starlark

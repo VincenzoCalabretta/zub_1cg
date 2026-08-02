@@ -168,16 +168,14 @@ proc full_init_from_reset {} {
     setup_uart
     if { ![load_elf $ELF] } { return 0 }
 
-    # Write sentinel pattern at the current ELF's _bss_start (0xFFFF2BF0)
-    # before R5 release.  This address must be inside .bss: the older
-    # 0xFFFF2BC0 probe fell in the preceding loadable image and could never
-    # be cleared by reset_handler.
-    # reset_handler zeros BSS on startup; if the sentinels survive 2 seconds
-    # of R5 running, reset_handler never ran (R5 not executing).
-    mww 0xFFFF2BF0 0xDEADBEEF
-    mww 0xFFFF2BF4 0xCAFEBABE
+    # Write a sentinel to a binary-independent OCM location before R5 release.
+    # startup.S (compiled with -DR5_STARTUP_TRACE=1) overwrites this with
+    # 0x52535431 ("RST1") as its very first instruction — before any stack
+    # setup or BSS zeroing.  If the sentinel survives 2 s of R5 running,
+    # reset_handler never fetched from 0xFFFF0000 (VINITHI not effective, or
+    # R5 stalled before the first instruction).
     mww 0xFFFFFF00 0xDEADDEAD
-    echo "DIAG: sentinel 0xDEADBEEF/0xCAFEBABE written to BSS before R5 release"
+    echo "DIAG: sentinel 0xDEADDEAD written to 0xFFFFFF00 before R5 release"
 
     # Release R5-0; R5-1 stays in reset (split mode, no partner fault)
     set rst_now [lindex [read_memory 0xFF5E023C 32 1] 0]
@@ -205,16 +203,12 @@ proc full_init_from_reset {} {
         set bg   [lindex [read_memory 0xFF000018 32 1] 0]
         set bd   [lindex [read_memory 0xFF000034 32 1] 0]
         set sr   [lindex [read_memory 0xFF00002C 32 1] 0]
-        set bss0 [lindex [read_memory 0xFFFF2BF0 32 1] 0]
-        set bss1 [lindex [read_memory 0xFFFF2BF4 32 1] 0]
         set reset_marker [lindex [read_memory 0xFFFFFF00 32 1] 0]
         echo [format "DIAG: UART0_CR=0x%08x MR=0x%08x BAUDGEN=%d BAUDDIV=%d SR=0x%08x" \
               $cr $mr $bg $bd $sr]
         # Braces are required here: Tcl evaluates square brackets in double-
         # quoted strings as commands, which used to hide this decisive check.
-        echo [format {DIAG: BSS[0xFFFF2BF0]=0x%08x BSS[0xFFFF2BF4]=0x%08x  (DEAD/CAFE if reset_handler did NOT zero BSS)} \
-              $bss0 $bss1]
-        echo [format {DIAG: reset marker[0xFFFFFF00]=0x%08x  (52535431 = reset_handler entered)} \
+        echo [format {DIAG: reset marker[0xFFFFFF00]=0x%08x  (52535431 = startup traced; deaddead = reset_handler never ran)} \
               $reset_marker]
         # Inject "PING\r\n" — newline-terminated so serial watch prints it
         if { ($sr & 0x10) == 0 } {

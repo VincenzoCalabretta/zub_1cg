@@ -722,3 +722,71 @@ After power-cycle (RST_LPD_TOP resets to 0x00188FD7 = R5 in reset):
 3. Poll BSS at 0xFFFF2BCC — expect 0 within 500ms (BSS zeroed)
 4. Check UART1 on /dev/ttyUSB1 at 115200 baud for "Hello, World!"
 
+---
+
+## Session 6 — UART confirmed, canonical boot path established  `2026-08-02`
+
+Board power-cycled, USB-JTAG cable connected (FT2232H enumerated as
+ttyUSB0/ttyUSB1). User in `uucp` group; udev rule `60-openocd.rules`
+installed.
+
+### Canonical boot sequence (no Vitis/xsct required)
+
+```
+nix develop --command openocd \
+    -f scripts/openocd/aes_zub.cfg \
+    -f scripts/openocd/psu_init_run.tcl \
+    -f scripts/openocd/load_r5.tcl
+```
+
+`psu_init_run.tcl` sources the Vitis-generated `board/zub_1cg/psu_init.tcl`
+directly via OpenOCD's AXI mem_ap, using `xsct_shim.tcl` to provide the
+XSCT-compatible helper procs (`mrd`, `mwr`, `mask_write`).  No Xilinx
+`hw_server` or `xsct` binary is required.
+
+### Session 6 run log (first run, Path A — fresh reset)
+
+Key observations from the first OpenOCD invocation:
+
+| Register | Value | Meaning |
+|---|---|---|
+| RPU_GLBL_CNTL | 0x00000008 | SLSPLIT=1, SLCLAMP=0 ✓ |
+| RPU_0_CFG | 0x00000005 | VINITHI=1 + NCPUHALT ✓ |
+| CPU_R5_CTRL | 0x03000302 | CLKACT bit24 set ✓ |
+| OCM[0xFFFF0000] | 0xe59ff018 | reset vector loaded ✓ |
+| UART0_CR | 0x00000114 | TX+RX enabled by firmware ✓ |
+| UART0 BAUDGEN/BAUDDIV | 124/6 | firmware set 115200 baud ✓ |
+| Reset marker[0xFFFFFF00] | 0x52535431 | "RST1" — startup.S executed ✓ |
+
+UART0 at 0xFF000000, MIO 10/11 (L3_SEL=6), routes to `/dev/ttyUSB1` via
+FT2232H channel 1 at 115200 8N1.
+
+### Three consecutive passes
+
+```
+bazel test --config=host --config=onboard //tests:rpu_hello_world_test
+```
+
+All three runs captured `[SERIAL] Hello, World!` and exited 0.  Path B
+(software reset via RST_LPD_TOP) worked correctly on subsequent runs:
+the test puts R5 back into module reset, re-runs `full_init_from_reset`,
+and releases R5 afresh — no power-cycle required between test runs.
+
+### Findings recorded
+
+- **UART route:** UART0 (0xFF000000), MIO 10/11 (L3_SEL=6) → FT2232H
+  channel 1 → ttyUSB1.  Confirmed via MIO register readback in psu_init.tcl
+  and firmware BAUDGEN/BAUDDIV register state.
+- **psu_init:** Two `mask_poll` timeouts (RPLL 0xFF5E0040, FPD PLL 0xFD1A0044)
+  during DDR bringup.  Non-fatal for UART/R5; PS UART and RPU subsystem are
+  fully functional.  DDR may need a psu_init update if DDR is used later.
+- **XPPU:** Locks CRL_APB/RPU registers once R5 is released.  load_r5.tcl
+  handles this by asserting reset before writing straps (Path A), or by
+  software-reset via RST_LPD_TOP on the second and subsequent runs (Path B).
+- **R5_STARTUP_TRACE:** Now enabled in `board/rpu:bsp` copts so
+  `reset marker[0xFFFFFF00]=0x52535431` is the primary proof that
+  reset_handler executed before uart_init.
+- **No inherited Vitis state:** verified — psu_init runs entirely via OpenOCD
+  AXI writes; no xsct/hw_server session required.
+
+**ZUB-001 exit condition met.**
