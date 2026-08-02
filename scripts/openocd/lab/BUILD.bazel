@@ -1,0 +1,51 @@
+"""OpenOCD lab scripts — bring-up probes, diagnostics, and one-off tools.
+
+These scripts answer specific diagnostic questions or explore hardware
+behaviour.  They are NOT used by integration tests and should NOT appear
+in test runfiles.  Use them with ad-hoc invocations only:
+
+  openocd -f scripts/openocd/aes_zub.cfg -f scripts/openocd/lab/<script>.tcl
+
+Classification:
+  diagnostic  — safe read-only probes or well-bounded register checks.
+  lab         — writes to hardware; may be unsafe without the right board state.
+  obsolete    — superseded by load_r5.tcl or incorporated into the BSP.
+
+  check_stickyerr.tcl   diagnostic  read DAP CTRL/STAT to check STICKYERR
+  check_xmpu.tcl        diagnostic  dump XMPU_OCM registers
+  check_ocm.tcl         diagnostic  verify OCM load and R5 state post-boot
+  check_reset_handler.tcl diagnostic prove reset_handler ran via sentinel read
+  check_literal_pool.tcl diagnostic inspect ARM literal pool near reset vector
+  scan_aps.tcl          (canonical, in parent)
+  diag_r5.tcl           diagnostic  probe R5 state without reset
+  diag_r5_debug.tcl     diagnostic  CoreSight debug register dump
+  diag_uart.tcl         diagnostic  read UART1 + clock registers after R5 runs
+  diag_uart0.tcl        diagnostic  read UART0 + clock registers
+  diag_bss_and_code.tcl diagnostic  read BSS and .text after ELF load
+  diag_canary.tcl       diagnostic  write and read back a canary value in OCM
+  diag_literal_pool.tcl diagnostic  dump the ARM literal pool region
+  diag_live_bss.tcl     diagnostic  read BSS while R5 is running
+  diag_romtable.tcl     diagnostic  walk CoreSight ROM table
+  diag_ap1_base.tcl     diagnostic  probe APB-AP 1 base address
+  diag_write_regs.tcl   diagnostic  write GIC/RPU registers and verify
+  halt_r5_debug.tcl     lab         halt R5 via CoreSight debug registers
+  halt_r5_inspect.tcl   lab         halt + dump R5 registers
+  restart_r5.tcl        lab         cycle R5 reset and observe BSS
+  restart_and_watch.tcl lab         restart R5 then read OCM / UART
+  load_and_uart.tcl     obsolete    early combined load+uart script (see load_r5.tcl)
+  fix_uart.tcl          lab         emergency UART re-init
+  probe_uart.tcl        lab         try each MIO bank for UART signal
+  uart_probe.tcl        lab         variant of probe_uart.tcl
+  read_mio_clk.tcl      lab         read MIO and clock registers
+  mio_sweep.tcl         lab         sweep all MIO pins for UART TX (UNSAFE on live board)
+  write_test.tcl        lab         write a test pattern to OCM
+  add_apb_target.cfg    lab         add cortex_r4 target (requires scan_aps first)
+  qspi_program.tcl      lab         program BOOT.BIN to QSPI flash
+"""
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(glob([
+    "*.cfg",
+    "*.tcl",
+]))

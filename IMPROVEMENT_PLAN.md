@@ -208,7 +208,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-022: Separate supported boot code from bring-up diagnostics
 
-- **Status:** proposed
+- **Status:** done (29 non-canonical scripts moved to scripts/openocd/lab/; root keeps 5 canonical files: aes_zub.cfg, psu_init_run.tcl, xsct_shim.tcl, load_r5.tcl, scan_aps.tcl; lab/BUILD.bazel inventories all scripts with supported/diagnostic/lab/obsolete classification; all_scripts filegroup now only exposes canonical files to test runfiles)
 - **Work:** Inventory the 32 OpenOCD Tcl files as `supported`, `diagnostic`, or
   `obsolete`. Extract address constants, safe reads/writes, STICKYERR handling,
   and reset sequencing into shared Tcl modules. Move exploratory scripts under
