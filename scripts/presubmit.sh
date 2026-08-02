@@ -30,6 +30,11 @@ RUST_SRCS=(
     tools/zub_ctl/src/main.rs
     tools/pm_decode/src/main.rs
     board/zub_1cg/artifact_integrity_test.rs
+    orbtrace/model/src/lib.rs
+    orbtrace/model/src/main.rs
+    orbtrace/firmware/common/src/lib.rs
+    orbtrace/firmware/a53/src/lib.rs
+    orbtrace/firmware/vexriscv/src/lib.rs
 )
 if rustfmt --edition 2021 --check "${RUST_SRCS[@]}" 2>&1; then
     ok "all Rust source files are formatted"
@@ -50,7 +55,12 @@ if bazel test --config=host \
     //tests:rpu_fault_test_elf_test \
     //tests:rpu_hello_world_size_test \
     //tests:rpu_bsp_test_size_test \
-    //tests:rpu_fault_test_size_test; then
+    //tests:rpu_fault_test_size_test \
+    //orbtrace/model:orbtrace_model_test \
+    //orbtrace/model:register_schema_test \
+    //orbtrace/firmware/common:firmware_common_test \
+    //orbtrace/firmware/a53:control_firmware_test \
+    //orbtrace/firmware/vexriscv:trace_workload_test; then
     ok "all host tests pass"
 else
     fail "host tests failed"

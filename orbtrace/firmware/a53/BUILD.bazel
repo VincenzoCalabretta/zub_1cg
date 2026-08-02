@@ -1,0 +1,15 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "control_firmware",
+    srcs = ["src/lib.rs"],
+    crate_name = "orbtrace_a53_firmware",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = ["//orbtrace/firmware/common:firmware_common"],
+)
+
+rust_test(
+    name = "control_firmware_test",
+    crate = ":control_firmware",
+)

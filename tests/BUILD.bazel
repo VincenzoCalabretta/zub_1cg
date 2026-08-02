@@ -112,6 +112,13 @@ onboard_firmware_test(
     test_script = "rpu_hello_world_test.sh",
 )
 
+sh_test(
+    name = "orbtrace_throughput_test",
+    srcs = ["orbtrace_throughput_test.sh"],
+    data = ["//orbtrace/model:orbtrace"],
+    tags = _HW_TAGS,
+)
+
 onboard_firmware_test(
     name = "rpu_bsp_test",
     data = [

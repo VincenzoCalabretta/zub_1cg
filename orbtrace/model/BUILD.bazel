@@ -1,0 +1,38 @@
+"""Independent Rust model and host client for the Orbtrace PL."""
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])
+
+rust_library(
+    name = "orbtrace_model",
+    srcs = ["src/lib.rs"],
+    crate_name = "orbtrace",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "orbtrace_model_test",
+    crate = ":orbtrace_model",
+)
+
+rust_binary(
+    name = "orbtrace",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [":orbtrace_model"],
+)
+
+sh_test(
+    name = "register_schema_test",
+    srcs = ["register_schema_test.sh"],
+    data = [
+        ":orbtrace",
+        "//orbtrace/rtl",
+    ],
+)

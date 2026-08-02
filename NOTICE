@@ -57,3 +57,8 @@ Bazel build rules:
   rules_cc 0.1.1        —  Apache-2.0   (Google LLC)
   rules_rust 0.62.0     —  Apache-2.0   (Google LLC / The rules_rust Authors)
   platforms 0.0.11      —  Apache-2.0   (Google LLC)
+Orbtrace-derived protocol behavior
+----------------------------------
+The files under orbtrace/ model protocol behavior from Orbtrace commit
+e416cd5b074fc725a04cf6b877d458e2074467ae. Orbtrace is distributed under the
+BSD 3-Clause License; copyright remains with the Orbtrace contributors.

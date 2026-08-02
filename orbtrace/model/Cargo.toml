@@ -1,0 +1,15 @@
+[package]
+name = "orbtrace"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "BSD-3-Clause"
+description = "ZUBoard Orbtrace wire models, control protocol, and host client"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "orbtrace"
+path = "src/main.rs"
+

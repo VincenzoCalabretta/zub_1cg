@@ -1,0 +1,14 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "firmware_common",
+    srcs = ["src/lib.rs"],
+    crate_name = "orbtrace_firmware_common",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "firmware_common_test",
+    crate = ":firmware_common",
+)

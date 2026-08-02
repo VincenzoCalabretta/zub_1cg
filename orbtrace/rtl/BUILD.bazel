@@ -1,0 +1,25 @@
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "rtl",
+    srcs = glob([
+        "*.v",
+        "*.sv",
+        "*.svh",
+    ]),
+)
+
+sh_test(
+    name = "rtl_unit_test",
+    srcs = ["rtl_unit_test.sh"],
+    data = glob([
+        "*.sv",
+        "*.svh",
+        "tb/*.sv",
+    ]),
+    tags = [
+        "local",
+        "manual",
+        "requires-vivado",
+    ],
+)
