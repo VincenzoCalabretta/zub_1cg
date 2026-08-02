@@ -84,6 +84,19 @@ firmware_elf_test(
     required_symbols = ["reset_handler"],
 )
 
+firmware_elf_test(
+    name = "rpu_fault_test_elf_test",
+    expected_entry = "0xffff00bc",
+    expected_machine = "arm",
+    expected_memory_range = "0xffff0000:0x100000000",
+    firmware = "//apps/rpu/fault_test:fault_test",
+    firmware_platform = "//platforms:rpu_r5_0",
+    required_symbols = [
+        "reset_handler",
+        "pm_save_from_exc",
+    ],
+)
+
 onboard_firmware_test(
     name = "rpu_hello_world_test",
     data = [
@@ -112,6 +125,21 @@ onboard_firmware_test(
     firmware_platform = "//platforms:rpu_r5_0",
     tags = _HW_TAGS,
     test_script = "rpu_bsp_test.sh",
+)
+
+onboard_firmware_test(
+    name = "rpu_fault_test",
+    data = [
+        "//board/zub_1cg:psu_init",
+        "//scripts/openocd:aes_zub_cfg",
+        "//scripts/openocd:all_scripts",
+        "//scripts/openocd:load_r5",
+        "//tools/zub_ctl",
+    ],
+    firmware = "//apps/rpu/fault_test:fault_test",
+    firmware_platform = "//platforms:rpu_r5_0",
+    tags = _HW_TAGS,
+    test_script = "rpu_fault_test.sh",
 )
 
 onboard_firmware_test(

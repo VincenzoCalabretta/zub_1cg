@@ -52,6 +52,13 @@ crate.from_cargo(
 )
 use_repo(crate, "elf_check_crates")
 
+crate.from_cargo(
+    name = "pm_decode_crates",
+    cargo_lockfile = "//tools/pm_decode:Cargo.lock",
+    manifests = ["//tools/pm_decode:Cargo.toml"],
+)
+use_repo(crate, "pm_decode_crates")
+
 # ── Env-based cross-toolchain capture ─────────────────────────────────────────
 # The Nix shellHook exports ARM_GCC_BIN and AARCH64_GCC_BIN; these repository
 # rules read them at fetch time and generate defs.bzl with pinned Nix-store

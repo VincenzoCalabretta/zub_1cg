@@ -249,7 +249,19 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-030: Add architecture-correct postmortem capture
 
-- **Status:** proposed; depends on ZUB-021 and ZUB-023
+- **Status:** done (board/rpu/postmortem.h + postmortem.c: pm_record_t at
+  fixed .noinit address 0xFFFFD800, pm_save_from_exc captures exc_type/spsr/
+  r0-r12/lr/pc/dfsr/dfar/ifsr, CRC32-sealed; board/rpu/startup_pm.S: real
+  exception handlers for UND/PREFETCH/DABT using a single .macro that saves
+  r0..r12 on the exception mode stack then calls pm_save_from_exc + weak
+  pm_on_exception hook; board/rpu/bsp_pm: startup_pm.S+uart.c+postmortem.c
+  for fault-capturing BSP; apps/rpu/fault_test: overrides pm_on_exception to
+  emit [TEST PASS] fault_capture after printing the record, injects ARM UDF #0;
+  tools/pm_decode: Rust binary that scans input for PM_MAGIC, verifies CRC32,
+  prints decoded report, annotates PC/LR via arm-none-eabi-addr2line --elf;
+  MODULE.bazel: pm_decode_crates registered; tests: rpu_fault_test_elf_test
+  + rpu_fault_test onboard test; elf_check: validate_memory and validate now
+  skip zero-size PT_LOAD segments to handle empty .data PHDRs)
 - **Work:** Use the staged postmortem approach documented in the reference
   project, but write independent exception capture for ARMv8-A and ARMv7-R.
   First preserve exception type, full register frame, fault/status registers,

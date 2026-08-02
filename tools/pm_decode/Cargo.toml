@@ -1,0 +1,10 @@
+[package]
+name = "pm_decode"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Host-side decoder for R5F postmortem records (ZUB-030)."
+
+[[bin]]
+name = "pm_decode"
+path = "src/main.rs"

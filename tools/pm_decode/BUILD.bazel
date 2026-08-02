@@ -1,0 +1,23 @@
+"""Host-side decoder for R5F postmortem records (ZUB-030)."""
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+exports_files(
+    [
+        "Cargo.toml",
+        "Cargo.lock",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+rust_binary(
+    name = "pm_decode",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "pm_decode_test",
+    crate = ":pm_decode",
+)

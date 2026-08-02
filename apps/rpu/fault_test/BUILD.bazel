@@ -1,0 +1,14 @@
+"""Bare-metal fault-capture smoke test for AES-ZUB Cortex-R5F (ZUB-030)."""
+
+load("//board/rpu:rules.bzl", "r5_binary")
+
+r5_binary(
+    name = "fault_test",
+    srcs = ["main.c"],
+    bsp = "//board/rpu:bsp_pm",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//board:test_proto",
+        "//board/rpu:postmortem",
+    ],
+)

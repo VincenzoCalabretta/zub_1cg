@@ -45,7 +45,21 @@ SECTIONS {
         _bss_end = .;
     } >OCM :data
 
-    _tx_first_unused_memory = .;
+    /*
+     * Postmortem record — NOLOAD at a fixed OCM address so the BSS-clear
+     * loop (which runs from _bss_start to _bss_end) never touches it, and
+     * so it survives a warm reset.  Address chosen to leave headroom above
+     * BSS and below the SVC stack's initial SP (0xFFFFE1FC).
+     */
+    .noinit 0xFFFFD800 (NOLOAD) : {
+        KEEP(*(.noinit))
+        . = ALIGN(4);
+    } >OCM
+
+    ASSERT(. <= 0xFFFFD900,
+           "R5 .noinit section overflows reserved 256-byte postmortem slot")
+
+    _tx_first_unused_memory = _bss_end;
     _stack_top = 0xFFFFFFFC;
     _stack_bottom = _stack_top - _irq_stack_size - _fiq_stack_size -
                     _abt_stack_size - _und_stack_size - _svc_stack_size -

@@ -294,33 +294,24 @@ fn parse_symbols(bytes: &[u8], class: Class) -> Result<Vec<Symbol>, String> {
 }
 
 /// Validates the hardened firmware segment layout.
+///
+/// Zero-size segments are excluded from all checks: they are linker artefacts
+/// that carry no address or permission information.
 pub fn validate(elf: &Elf) -> Result<(), String> {
-    if elf.load_segments.is_empty() {
-        return Err("ELF has no PT_LOAD segments".to_owned());
-    }
-    if elf
+    let non_empty: Vec<LoadSegment> = elf
         .load_segments
         .iter()
         .copied()
-        .any(LoadSegment::is_writable_and_executable)
-    {
+        .filter(|s| s.memory_size > 0)
+        .collect();
+    if non_empty.is_empty() {
+        return Err("ELF has no PT_LOAD segments with non-zero size".to_owned());
+    }
+    if non_empty.iter().copied().any(LoadSegment::is_writable_and_executable) {
         return Err("ELF has a writable-and-executable PT_LOAD segment".to_owned());
     }
-    if !elf
-        .load_segments
-        .iter()
-        .copied()
-        .any(LoadSegment::is_read_execute)
-    {
+    if !non_empty.iter().copied().any(LoadSegment::is_read_execute) {
         return Err("ELF has no read-execute PT_LOAD segment".to_owned());
-    }
-    if !elf
-        .load_segments
-        .iter()
-        .copied()
-        .any(LoadSegment::is_read_write)
-    {
-        return Err("ELF has no read-write PT_LOAD segment".to_owned());
     }
     Ok(())
 }
@@ -343,11 +334,18 @@ pub fn validate_identity(elf: &Elf, machine: u16, entry: u64) -> Result<(), Stri
 }
 
 /// Validates load-segment addresses and alignments against a target memory region.
+///
+/// Zero-size segments (MemSiz = 0) are skipped: they carry no address
+/// information and appear as a linker artefact when a PHDR is declared but no
+/// input sections are placed in it (e.g. an empty .data segment).
 pub fn validate_memory(elf: &Elf, start: u64, end: u64) -> Result<(), String> {
     if start >= end {
         return Err("memory range must have a non-zero size".to_owned());
     }
     for segment in &elf.load_segments {
+        if segment.memory_size == 0 {
+            continue;
+        }
         let segment_end = segment
             .virtual_address
             .checked_add(segment.memory_size)
@@ -517,6 +515,9 @@ mod tests {
             let offset = 64 + index * 56;
             bytes[offset..offset + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
             bytes[offset + 4..offset + 8].copy_from_slice(&flags.to_le_bytes());
+            // ELF64 p_memsz at PHDR offset 40: set non-zero so segments are
+            // not silently skipped by the zero-size filter in validate/validate_memory.
+            bytes[offset + 40..offset + 48].copy_from_slice(&0x1000_u64.to_le_bytes());
         }
         bytes
     }
@@ -539,16 +540,78 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_elf_and_missing_segment_classes() {
+    fn rejects_non_elf_input() {
         assert_eq!(
             parse(b"not an elf").unwrap_err(),
             "truncated ELF at offset 0x0"
         );
+    }
+
+    #[test]
+    fn accepts_executable_only_segment() {
+        // Text-only firmware (e.g. with only .noinit writable memory, no PT_LOAD
+        // for writable data) must pass — W+X absence is the critical check.
         let elf = parse(&elf64_with_segments(&[PF_R | PF_X])).unwrap();
+        validate(&elf).unwrap();
+    }
+
+    #[test]
+    fn rejects_elf_with_no_nonempty_segments() {
+        // An ELF whose only PT_LOAD segments have MemSiz = 0 is rejected.
+        // This matches the case where an empty PHDR creates a spurious segment.
+        let elf = Elf {
+            class: Class::Elf64,
+            machine: EM_AARCH64,
+            entry: 0x800,
+            load_segments: vec![LoadSegment {
+                flags: PF_R | PF_W,
+                virtual_address: 0,
+                memory_size: 0,
+                alignment: 0x1000,
+            }],
+            symbols: Vec::new(),
+        };
         assert_eq!(
             validate(&elf).unwrap_err(),
-            "ELF has no read-write PT_LOAD segment"
+            "ELF has no PT_LOAD segments with non-zero size"
         );
+    }
+
+    #[test]
+    fn rejects_writable_only_segment() {
+        // A PT_LOAD with only RW (no RX) is rejected — firmware must be executable.
+        let elf = parse(&elf64_with_segments(&[PF_R | PF_W])).unwrap();
+        assert_eq!(
+            validate(&elf).unwrap_err(),
+            "ELF has no read-execute PT_LOAD segment"
+        );
+    }
+
+    #[test]
+    fn skips_zero_size_segments_in_memory_range_check() {
+        // A zero-size segment at VMA 0x0 must not cause a range-check failure
+        // even when the valid range is entirely above 0x0.
+        let elf = Elf {
+            class: Class::Elf64,
+            machine: EM_AARCH64,
+            entry: 0xffff0000,
+            load_segments: vec![
+                LoadSegment {
+                    flags: PF_R | PF_X,
+                    virtual_address: 0xffff0000,
+                    memory_size: 0x1000,
+                    alignment: 0x1000,
+                },
+                LoadSegment {
+                    flags: PF_R | PF_W,
+                    virtual_address: 0x0,
+                    memory_size: 0, // spurious empty data segment
+                    alignment: 0x1000,
+                },
+            ],
+            symbols: Vec::new(),
+        };
+        validate_memory(&elf, 0xffff0000, 0x1_0000_0000).unwrap();
     }
 
     #[test]

@@ -43,3 +43,29 @@ cc_library(
     includes = ["."],
     visibility = ["//visibility:public"],
 )
+
+# Postmortem capture library.  Provides pm_save_from_exc(), pm_print(), and
+# the weak pm_on_exception() hook.  Requires uart_init() before pm_print().
+cc_library(
+    name = "postmortem",
+    srcs = ["postmortem.c"],
+    hdrs = ["postmortem.h"],
+    copts = R5F_COPTS,
+    includes = ["."],
+    visibility = ["//visibility:public"],
+)
+
+# BSP with postmortem exception capture.  Use for tests that inject faults
+# and need the .noinit record filled by the exception handler.
+cc_library(
+    name = "bsp_pm",
+    srcs = [
+        "startup_pm.S",
+        "uart.c",
+    ],
+    hdrs = ["uart.h"],
+    copts = R5F_COPTS,
+    includes = ["."],
+    visibility = ["//visibility:public"],
+    deps = [":postmortem"],
+)
