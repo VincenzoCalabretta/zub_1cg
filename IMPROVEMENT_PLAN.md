@@ -171,7 +171,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-013: Finish and isolate the documentation converter migration
 
-- **Status:** in progress
+- **Status:** done
 - **Work:** Land the existing Rust converter, its Bazel test, regenerated-output
   contract, and removal of the Python implementation as one coherent change.
   Test manifest cleanup, path safety, deterministic ordering, hash-based

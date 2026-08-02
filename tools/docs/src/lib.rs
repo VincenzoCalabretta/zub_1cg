@@ -1,5 +1,5 @@
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -16,7 +16,7 @@ pub struct Table {
     pub rows: Vec<Vec<String>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ManifestTable {
     category: String,
     page: usize,
@@ -25,7 +25,7 @@ struct ManifestTable {
     ordinal: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct DocumentManifest {
     source_pdf: String,
     output: String,
@@ -36,7 +36,7 @@ struct DocumentManifest {
     warning: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Manifest {
     format: u8,
     source: String,
@@ -318,15 +318,23 @@ fn run_pdftotext(pdf: &Path) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|error| error.to_string())
 }
 
-fn relative_path(path: &Path, root: &Path) -> Result<PathBuf, String> {
+/// Returns the portion of `path` that lies under `root`, or an error if
+/// `path` is not a child of `root`. Used to derive output paths and manifest
+/// keys from source PDF paths.
+pub fn relative_path(path: &Path, root: &Path) -> Result<PathBuf, String> {
     path.strip_prefix(root)
         .map(Path::to_owned)
         .map_err(|_| format!("{} is outside {}", path.display(), root.display()))
 }
+
 fn write_file(path: &Path, contents: &str) -> Result<(), String> {
     fs::create_dir_all(path.parent().unwrap()).map_err(io_error)?;
+    if fs::read_to_string(path).ok().as_deref() == Some(contents) {
+        return Ok(());
+    }
     fs::write(path, contents).map_err(io_error)
 }
+
 fn io_error(error: io::Error) -> String {
     error.to_string()
 }
@@ -348,10 +356,27 @@ fn ensure_ascii_json(json: String) -> String {
     escaped
 }
 
+/// Parses a manifest JSON string and returns a map of `source_pdf` → `sha256`
+/// for all recorded documents. Returns an empty map on any parse failure.
+pub fn parse_manifest_hashes(json: &str) -> HashMap<String, String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("documents")?.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|doc| {
+            let pdf = doc.get("source_pdf")?.as_str()?.to_owned();
+            let sha = doc.get("sha256")?.as_str()?.to_owned();
+            Some((pdf, sha))
+        })
+        .collect()
+}
+
 fn write_document(
     pdf: &Path,
     source_root: &Path,
     output_root: &Path,
+    sha256: String,
 ) -> Result<DocumentManifest, String> {
     let relative = relative_path(pdf, source_root)?;
     let doc_root = output_root.join(relative.with_extension(""));
@@ -443,7 +468,6 @@ fn write_document(
         &doc_root.join("tables/index.md"),
         &format!("{}\n", index.join("\n")),
     )?;
-    let bytes = fs::read(pdf).map_err(io_error)?;
     Ok(DocumentManifest {
         source_pdf: relative.to_string_lossy().replace('\\', "/"),
         output: doc_root
@@ -451,7 +475,7 @@ fn write_document(
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/"),
-        sha256: format!("{:x}", Sha256::digest(bytes)),
+        sha256,
         pages: pages.len(),
         text_characters: text.trim().chars().count(),
         tables: manifest_tables,
@@ -473,6 +497,21 @@ pub fn convert(source: &Path, output: &Path, clean: bool) -> Result<usize, Strin
     if clean && output.exists() {
         fs::remove_dir_all(output).map_err(io_error)?;
     }
+    let cached: HashMap<String, DocumentManifest> = if !clean {
+        let manifest_path = output.join("manifest.json");
+        fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|json| serde_json::from_str::<Manifest>(&json).ok())
+            .map(|m| {
+                m.documents
+                    .into_iter()
+                    .map(|d| (d.source_pdf.clone(), d))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     let mut lower_case_pdfs = Vec::new();
     let mut upper_case_pdfs = Vec::new();
     for entry in walk(source)? {
@@ -492,8 +531,20 @@ pub fn convert(source: &Path, output: &Path, clean: bool) -> Result<usize, Strin
     }
     let mut documents = Vec::new();
     for pdf in &pdfs {
+        let bytes = fs::read(pdf).map_err(io_error)?;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let relative_str = relative_path(pdf, source)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Some(entry) = cached.get(&relative_str) {
+            if entry.sha256 == sha256 {
+                eprintln!("Skipping {} (unchanged)", pdf.display());
+                documents.push(entry.clone());
+                continue;
+            }
+        }
         eprintln!("Converting {}", pdf.display());
-        documents.push(write_document(pdf, source, output)?);
+        documents.push(write_document(pdf, source, output, sha256)?);
     }
     fs::create_dir_all(output).map_err(io_error)?;
     let manifest = serde_json::to_string_pretty(&Manifest {
@@ -572,5 +623,106 @@ mod tests {
             ensure_ascii_json("{\"label\":\"µ—\"}".into()),
             "{\"label\":\"\\u00b5\\u2014\"}"
         );
+    }
+
+    #[test]
+    fn relative_path_rejects_path_outside_root() {
+        let result = relative_path(
+            Path::new("/tmp/other/docs/foo.pdf"),
+            Path::new("/tmp/source"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn relative_path_accepts_child_of_root() {
+        let result = relative_path(
+            Path::new("/tmp/source/sub/foo.pdf"),
+            Path::new("/tmp/source"),
+        );
+        assert_eq!(result.unwrap(), PathBuf::from("sub/foo.pdf"));
+    }
+
+    #[test]
+    fn parse_manifest_hashes_extracts_sha256_entries() {
+        let json = r#"{"format":1,"source":"docs","documents":[
+            {"source_pdf":"a/b.pdf","sha256":"abc123","output":"a/b","pages":5,"text_characters":1000,"tables":[],"warning":null},
+            {"source_pdf":"c.pdf","sha256":"def456","output":"c","pages":2,"text_characters":500,"tables":[],"warning":null}
+        ]}"#;
+        let hashes = parse_manifest_hashes(json);
+        assert_eq!(hashes.get("a/b.pdf").map(String::as_str), Some("abc123"));
+        assert_eq!(hashes.get("c.pdf").map(String::as_str), Some("def456"));
+        assert_eq!(hashes.len(), 2);
+    }
+
+    #[test]
+    fn parse_manifest_hashes_returns_empty_for_invalid_json() {
+        assert!(parse_manifest_hashes("not-json").is_empty());
+        assert!(parse_manifest_hashes("{}").is_empty());
+        assert!(parse_manifest_hashes(r#"{"documents":null}"#).is_empty());
+    }
+
+    #[test]
+    fn pdf_sort_puts_lowercase_extension_before_uppercase() {
+        let mut lower: Vec<PathBuf> = vec!["beta.pdf".into(), "alpha.pdf".into()];
+        let mut upper: Vec<PathBuf> = vec!["Delta.PDF".into(), "Charlie.PDF".into()];
+        lower.sort();
+        upper.sort();
+        lower.append(&mut upper);
+        assert_eq!(
+            lower,
+            vec![
+                PathBuf::from("alpha.pdf"),
+                PathBuf::from("beta.pdf"),
+                PathBuf::from("Charlie.PDF"),
+                PathBuf::from("Delta.PDF"),
+            ]
+        );
+    }
+
+    #[test]
+    fn register_table_is_extracted_and_categorized() {
+        let lines = [
+            "UART Control Register (UART_CR)",
+            "Register   Offset   Bits    Description",
+            "UART_CR    0x00     31:8    Reserved",
+            "UART_CR    0x00     7       TX_EN",
+            "UART_CR    0x00     6       RX_EN",
+        ]
+        .map(str::to_owned);
+        let tables = extract_tables(&lines, 12);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].category, "registers");
+        assert_eq!(tables[0].page, 12);
+    }
+
+    #[test]
+    fn pinout_table_is_extracted_and_categorized() {
+        let lines = [
+            "MIO Pin Assignments",
+            "Pin    Signal       IO Standard    Direction",
+            "MIO0   QSPI_CLK     LVCMOS18       Out",
+            "MIO1   QSPI_DQ0     LVCMOS18       In/Out",
+            "MIO2   QSPI_DQ1     LVCMOS18       In/Out",
+        ]
+        .map(str::to_owned);
+        let tables = extract_tables(&lines, 5);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].category, "pinout-and-io");
+    }
+
+    #[test]
+    fn configuration_table_is_extracted_and_categorized() {
+        let lines = [
+            "Boot Mode Switch Settings",
+            "Mode     SW4-1    SW4-2    SW4-3    Description",
+            "JTAG     OFF      OFF      OFF      JTAG debug",
+            "SD0      ON       OFF      OFF      Boot from SD",
+            "QSPI     OFF      ON       OFF      Boot from QSPI",
+        ]
+        .map(str::to_owned);
+        let tables = extract_tables(&lines, 3);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].category, "configuration");
     }
 }
