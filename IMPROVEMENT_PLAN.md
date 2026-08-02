@@ -235,7 +235,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-024: Make boot images first-class Bazel outputs
 
-- **Status:** proposed; depends on ZUB-010 and ZUB-023
+- **Status:** done (scripts/flash/BUILD.bazel provides a 5-step genrule chain: r5_firmware_for_flash applies RPU platform transition → hello_world_bin (arm-none-eabi-objcopy) → hello_world_data_o (aarch64-none-elf-objcopy) → a53_loader_elf (aarch64-none-elf-gcc) → boot_bin (bootgen); all steps tagged manual+local; scripts/flash/rules.bzl implements the RPU platform transition rule; board/a53_loader/BUILD.bazel exports individual files; legacy build_boot_a53.sh retained for SD-card copy)
 - **Work:** Replace the multi-step, workspace-writing flash script with Bazel
   rules/actions for R5 binary conversion, A53 loader embedding, loader link, and
   `BOOT.BIN` packaging. Keep SD-card or QSPI programming as explicit local

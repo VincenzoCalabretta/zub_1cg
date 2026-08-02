@@ -1,22 +1,18 @@
-"""A53 loader shim — a tiny AArch64 ELF that copies an R5 image into TCM and
-releases R5-0 out of module reset. Enables SD-card boot without a full FSBL.
+"""A53 loader shim — a tiny AArch64 ELF that copies an embedded R5 image into
+TCM and releases R5-0 out of module reset, enabling SD-card boot without FSBL.
 
-The complete build chain (Phase 10, //scripts/flash) turns this into a
-BOOT.BIN via:
-
-  1. `bazel build --config=rpu //apps/rpu/hello_world`       → R5 ELF
-  2. `arm-none-eabi-objcopy -O binary`                       → raw R5 binary
-  3. `aarch64-none-elf-objcopy -I binary -O elf64-littleaarch64 -B aarch64`
-                                                             → embeddable .o
-  4. Link .o + startup.S + main.c + memory.lds               → A53 loader ELF
-  5. `bootgen -image scripts/flash/boot_a53.bif -arch zynqmp -o BOOT.BIN`
-
-Sources are exposed as filegroups so the flash script can consume them
-without having to embed a cc_binary that would fail during a plain
-`bazel build //board/a53_loader/...` (the R5 image is not yet available).
+Individual source files are exported so //scripts/flash can reference them
+directly in genrule commands.  See //scripts/flash:boot_bin for the complete
+BOOT.BIN build chain.
 """
 
 package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "main.c",
+    "memory.lds",
+    "startup.S",
+])
 
 filegroup(
     name = "sources",
