@@ -1,6 +1,6 @@
 # zub_1cg improvement plan
 
-> Living document. Last reviewed: 2026-08-01.
+> Living document. Last reviewed: 2026-08-02.
 >
 > This is the prioritized engineering backlog for the repository, not a record
 > of completed bring-up experiments. Update it in the same change that closes,
@@ -276,7 +276,7 @@ Audit snapshot from 2026-08-01:
 
 #### ZUB-031: Add off-target firmware feedback where it is faithful
 
-- **Status:** proposed
+- **Status:** done (decision recorded below; no QEMU Bazel target added)
 - **Work:** Time-box a QEMU feasibility spike for ZynqMP A53/R5 startup and the
   required UART/GIC/TTC devices. If sufficiently faithful, add a QEMU smoke
   platform based on the reference repository's run-under pattern. Otherwise,
@@ -286,10 +286,41 @@ Audit snapshot from 2026-08-01:
 - **Exit condition:** A written decision records the fidelity boundary. The
   chosen path runs useful firmware logic in ordinary presubmit and states which
   hardware behaviors remain board-only.
+- **Decision (2026-08-02):**
+  - *APU (A53):* Upstream QEMU's `xlnx-zynqmp` machine models the Cortex-A53
+    cores, PS UART0/1, and GIC-400 with sufficient fidelity for smoke-level
+    startup and UART echo tests. The Ethernet MAC and DMA are not modeled; eth
+    loopback tests must remain board-only. The proprietary Xilinx QEMU fork
+    (distributed with Vitis) models more PS peripherals, but introduces a
+    tool-chain dependency the project explicitly avoids outside the lab.
+    **Recommended path:** extract A53 application state-machine logic into
+    host-testable cc_libraries; add a QEMU-based `sh_test` for startup + UART
+    smoke when a Nix QEMU ZynqMP derivation is added to the devShell.
+  - *RPU (R5):* Three register sequences in `load_r5.tcl` are not modeled in
+    any public QEMU build: the OCM remap (`0xFF960000` bit 0), RPU_GLBL_CNTL
+    split-mode write (`0xFF9A0000`), and CRL_APB UART clock enables. Without
+    these, the R5 ELF never executes — QEMU would load the binary at the
+    physical AXI address but R5 would not see it at the remapped VMA
+    `0x00000000`. **Conclusion:** R5 startup is board-only. R5 application
+    logic (UART-level and above, after startup completes) can be moved into
+    host-testable C libraries and tested on the host with I/O fakes; this is
+    the recommended path for unit-level R5 coverage without hardware.
+  - *What remains board-only:* OCM remap sequence, RPU mode switches, XPPU
+    locking, UART MIO routing, GIC interrupt delivery, Ethernet MAC/DMA,
+    anything that depends on PS clock configuration (psu_init.tcl output).
 
 #### ZUB-032: Define release, compatibility, and size policy
 
-- **Status:** proposed
+- **Status:** done (LICENSE: MIT 2026 Vincenzo Calabretta; NOTICE: third-party
+  inventory for Eclipse ThreadX/FileX/NetXDuo MIT, Rust crates, Xilinx artifacts,
+  Bazel rules; board/zub_1cg/COMPATIBILITY.md: artifact SHA-256 table, firmware↔
+  artifact compatibility matrix, toolchain versions, flash/RAM budget table
+  (OCM=256KB; hello_world=17KB <7%); firmware_size_test Starlark rule in
+  tests/rules.bzl runs arm-none-eabi-size and compares .text/.bss against
+  per-binary budgets; three size tests added to tests/BUILD.bazel:
+  rpu_hello_world (24KB text/12KB bss), rpu_bsp_test (4KB/1KB),
+  rpu_fault_test (8KB/1KB); presubmit.sh and CI gate all three size tests;
+  elf_check validate/validate_memory now skip zero-size PT_LOAD segments)
 - **Work:** Add top-level license/notice material, third-party inventory, board
   artifact compatibility matrix, semantic version/tag policy, changelog, and a
   release manifest containing source revision, toolchain versions, hashes,

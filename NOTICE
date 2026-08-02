@@ -1,0 +1,59 @@
+Third-party components incorporated by this project.
+
+────────────────────────────────────────────────────────────────────────────────
+Eclipse ThreadX v6.4.3  —  MIT License
+  https://github.com/eclipse-threadx/threadx
+  Copyright (c) Microsoft Corporation and ThreadX contributors.
+
+Eclipse FileX v6.5.1  —  MIT License
+  https://github.com/eclipse-threadx/filex
+  Copyright (c) Microsoft Corporation and FileX contributors.
+
+Eclipse NetX Duo v6.5.1  —  MIT License
+  https://github.com/eclipse-threadx/netxduo
+  Copyright (c) Microsoft Corporation and NetX Duo contributors.
+
+The MIT License text for the above three components is reproduced here:
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+────────────────────────────────────────────────────────────────────────────────
+Rust crates (host-side tools only — not shipped to device):
+
+  anyhow 1.x            —  MIT OR Apache-2.0  (David Tolnay)
+  clap 4.x              —  MIT OR Apache-2.0  (clap contributors)
+  regex 1.x             —  MIT OR Apache-2.0  (Alex Crichton et al.)
+  serialport 4.x        —  MPL-2.0            (serialport contributors)
+  sha2 0.10             —  MIT OR Apache-2.0  (RustCrypto project)
+
+  Full license texts are in each crate's source package on crates.io.
+
+────────────────────────────────────────────────────────────────────────────────
+Xilinx/AMD binary artifacts (board/zub_1cg/):
+
+  design_1_wrapper.bit and psu_init.tcl are derived from Vivado/Vitis
+  platform generation for the Avnet AES-ZUB-1CG-ED-G board.  These files
+  are subject to the Xilinx/AMD toolchain terms of use.  They are checked
+  in as convenience artifacts; see board/zub_1cg/COMPATIBILITY.md for
+  provenance details.
+
+────────────────────────────────────────────────────────────────────────────────
+Bazel build rules:
+
+  rules_cc 0.1.1        —  Apache-2.0   (Google LLC)
+  rules_rust 0.62.0     —  Apache-2.0   (Google LLC / The rules_rust Authors)
+  platforms 0.0.11      —  Apache-2.0   (Google LLC)

@@ -26,7 +26,9 @@ step "rustfmt --check"
 RUST_SRCS=(
     tools/elf_check/src/lib.rs
     tools/elf_check/src/main.rs
+    tools/zub_ctl/src/lib.rs
     tools/zub_ctl/src/main.rs
+    tools/pm_decode/src/main.rs
     board/zub_1cg/artifact_integrity_test.rs
 )
 if rustfmt --edition 2021 --check "${RUST_SRCS[@]}" 2>&1; then
@@ -36,14 +38,19 @@ else
 fi
 
 # ── Host tests ──────────────────────────────────────────────────────────────
-step "bazel test --config=host (unit + ELF invariant)"
+step "bazel test --config=host (unit + ELF invariant + size budget)"
 if bazel test --config=host \
     //tools/... \
     //board/zub_1cg:artifact_integrity_test \
     //tests:apu_blink_elf_test \
     //tests:apu_hello_world_elf_test \
     //tests:apu_eth_loopback_elf_test \
-    //tests:rpu_hello_world_elf_test; then
+    //tests:rpu_hello_world_elf_test \
+    //tests:rpu_bsp_test_elf_test \
+    //tests:rpu_fault_test_elf_test \
+    //tests:rpu_hello_world_size_test \
+    //tests:rpu_bsp_test_size_test \
+    //tests:rpu_fault_test_size_test; then
     ok "all host tests pass"
 else
     fail "host tests failed"

@@ -23,7 +23,7 @@ Environment variables (all optional):
   XSCT          — path to Xilinx xsct             (A53 and RPU tests)
 """
 
-load(":rules.bzl", "firmware_elf_test", "onboard_firmware_test")
+load(":rules.bzl", "firmware_elf_test", "firmware_size_test", "onboard_firmware_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -179,4 +179,32 @@ onboard_firmware_test(
     firmware_platform = "//platforms:apu_a53",
     tags = _HW_TAGS,
     test_script = "apu_eth_loopback_test.sh",
+)
+
+# ── Flash/RAM size budget tests (ZUB-032) ─────────────────────────────────────
+# Budgets are generous; tighten them as the firmware matures.  See
+# board/zub_1cg/COMPATIBILITY.md for the rationale.
+
+firmware_size_test(
+    name = "rpu_hello_world_size_test",
+    bss_limit_bytes = 12288,  # 12 KB — ThreadX thread stacks + state
+    firmware = "//apps/rpu/hello_world:hello_world",
+    firmware_platform = "//platforms:rpu_r5_0",
+    text_limit_bytes = 24576,  # 24 KB — ThreadX + RTOS + drivers
+)
+
+firmware_size_test(
+    name = "rpu_bsp_test_size_test",
+    bss_limit_bytes = 1024,  # 1 KB
+    firmware = "//apps/rpu/bsp_test:bsp_test",
+    firmware_platform = "//platforms:rpu_r5_0",
+    text_limit_bytes = 4096,  # 4 KB — bare-metal + UART only
+)
+
+firmware_size_test(
+    name = "rpu_fault_test_size_test",
+    bss_limit_bytes = 1024,  # 1 KB — includes pm_record_t (.noinit) = 92 B
+    firmware = "//apps/rpu/fault_test:fault_test",
+    firmware_platform = "//platforms:rpu_r5_0",
+    text_limit_bytes = 8192,  # 8 KB — bare-metal + UART + postmortem
 )

@@ -307,7 +307,11 @@ pub fn validate(elf: &Elf) -> Result<(), String> {
     if non_empty.is_empty() {
         return Err("ELF has no PT_LOAD segments with non-zero size".to_owned());
     }
-    if non_empty.iter().copied().any(LoadSegment::is_writable_and_executable) {
+    if non_empty
+        .iter()
+        .copied()
+        .any(LoadSegment::is_writable_and_executable)
+    {
         return Err("ELF has a writable-and-executable PT_LOAD segment".to_owned());
     }
     if !non_empty.iter().copied().any(LoadSegment::is_read_execute) {

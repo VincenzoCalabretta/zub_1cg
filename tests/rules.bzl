@@ -54,6 +54,65 @@ def onboard_firmware_test(name, test_script, firmware, firmware_platform, data, 
         tags = tags,
     )
 
+def _firmware_size_test_impl(ctx):
+    launcher = ctx.actions.declare_file(ctx.label.name)
+    ctx.actions.write(
+        output = launcher,
+        content = """#!/usr/bin/env bash
+set -euo pipefail
+elf="$TEST_SRCDIR/${{TEST_WORKSPACE:-_main}}/{firmware}"
+sizes=$(arm-none-eabi-size "$elf" | tail -1)
+text=$(echo "$sizes" | awk '{{print $1}}')
+bss=$(echo  "$sizes" | awk '{{print $3}}')
+ok=1
+if [ "$text" -gt {text_limit} ]; then
+    echo "size_test: .text $text bytes > budget {text_limit}" >&2; ok=0
+fi
+if [ "$bss" -gt {bss_limit} ]; then
+    echo "size_test: .bss  $bss  bytes > budget {bss_limit}" >&2; ok=0
+fi
+if [ "$ok" -eq 1 ]; then
+    echo "size_test: {name} OK (.text=$text .bss=$bss)"
+fi
+exit $((1 - ok))
+""".format(
+            firmware = ctx.executable.firmware.short_path,
+            name = ctx.label.name,
+            text_limit = ctx.attr.text_limit_bytes,
+            bss_limit = ctx.attr.bss_limit_bytes,
+        ),
+        is_executable = True,
+    )
+    return [DefaultInfo(
+        executable = launcher,
+        runfiles = ctx.runfiles(files = [ctx.executable.firmware]),
+    )]
+
+_firmware_size_test = rule(
+    implementation = _firmware_size_test_impl,
+    attrs = {
+        "firmware": attr.label(
+            cfg = _firmware_platform_transition,
+            executable = True,
+            mandatory = True,
+        ),
+        "firmware_platform": attr.string(mandatory = True),
+        "text_limit_bytes": attr.int(mandatory = True),
+        "bss_limit_bytes": attr.int(mandatory = True),
+    },
+    test = True,
+)
+
+def firmware_size_test(name, firmware, firmware_platform, text_limit_bytes, bss_limit_bytes):
+    """Fails if the firmware's .text or .bss section exceeds the stated byte limits."""
+    _firmware_size_test(
+        name = name,
+        firmware = firmware,
+        firmware_platform = firmware_platform,
+        text_limit_bytes = text_limit_bytes,
+        bss_limit_bytes = bss_limit_bytes,
+    )
+
 def _firmware_elf_test_impl(ctx):
     launcher = ctx.actions.declare_file(ctx.label.name)
     ctx.actions.write(

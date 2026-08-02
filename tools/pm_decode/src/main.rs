@@ -107,7 +107,10 @@ fn try_parse_and_print(buf: &[u8], elf: Option<&str>) -> bool {
         return false;
     }
     if le32(buf, OFF_VERSION) != PM_VERSION {
-        eprintln!("pm_decode: unsupported record version {}", le32(buf, OFF_VERSION));
+        eprintln!(
+            "pm_decode: unsupported record version {}",
+            le32(buf, OFF_VERSION)
+        );
         return false;
     }
     let stored_crc = le32(buf, OFF_CRC32);
@@ -151,7 +154,11 @@ fn try_parse_and_print(buf: &[u8], elf: Option<&str>) -> bool {
     println!("  ifsr      : {ifsr:#010x}");
     println!(
         "  crc32     : {stored_crc:#010x}  {}",
-        if crc_ok { "OK" } else { "BAD (record may be corrupt)" }
+        if crc_ok {
+            "OK"
+        } else {
+            "BAD (record may be corrupt)"
+        }
     );
     crc_ok
 }
