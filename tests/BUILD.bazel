@@ -117,6 +117,9 @@ sh_test(
     srcs = ["orbtrace_throughput_test.sh"],
     data = ["//orbtrace/model:orbtrace"],
     tags = _HW_TAGS,
+    # The test endpoint is the board's A53 Orbtrace service, not a separate
+    # host.  It defaults to 192.168.1.50 and can be overridden for another
+    # lab subnet with --test_env=ORBTRACE_BOARD_IP=... .
 )
 
 onboard_firmware_test(

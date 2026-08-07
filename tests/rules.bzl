@@ -15,7 +15,7 @@ def _onboard_firmware_test_impl(ctx):
         output = launcher,
         content = """#!/usr/bin/env bash
 set -euo pipefail
-exec \"$TEST_SRCDIR/${{TEST_WORKSPACE:-_main}}/{script}\" \"$@\"
+exec /usr/bin/env bash \"$TEST_SRCDIR/${{TEST_WORKSPACE:-_main}}/{script}\" \"$@\"
 """.format(script = ctx.file.test_script.short_path),
         is_executable = True,
     )

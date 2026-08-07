@@ -66,14 +66,14 @@ zub_1cg/
 
 ## Testing on the board
 
-Three integration tests are provided under `//tests/…`. Each is tagged
+Seven board tests are provided under `//tests/…`. Each is tagged
 `manual + exclusive + requires-hardware`, so wildcard `bazel test //...`
 does not run them. To run a single test:
 
 ```bash
-bazel test --config=host //tests:rpu_hello_world_test    # R5 JTAG boot
-bazel test --config=host //tests:apu_hello_world_test    # A53 xsct flash
-bazel test --config=host //tests:apu_eth_loopback_test   # A53 eth loopback
+bazel test --config=host --config=onboard //tests:rpu_hello_world_test    # R5 JTAG boot
+XSCT=/path/to/xsct bazel test --config=host --config=onboard //tests:apu_hello_world_test  # A53 xsct flash
+XSCT=/path/to/xsct bazel test --config=host --config=onboard //tests:apu_eth_loopback_test # A53 eth loopback
 ```
 
 Each test wraps [`zub_ctl`](tools/zub_ctl/README.md) — a Rust CLI that:
@@ -93,6 +93,7 @@ Each test wraps [`zub_ctl`](tools/zub_ctl/README.md) — a Rust CLI that:
 | `ZUB_BAUD` | `115200` | Baud rate |
 | `ZUB_TIMEOUT` | `30` | Serial-watch timeout in seconds |
 | `XSCT` | `/mnt/data/xilinx/Vitis/2023.2/bin/xsct` | A53 tests only |
+| `ORBTRACE_BOARD_IP` | `192.168.1.50` | Static IPv4 address of the ZUBoard's A53 Orbtrace service |
 
 ## Boot paths
 
