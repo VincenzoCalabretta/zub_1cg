@@ -1,4 +1,4 @@
-"""On-target integration tests driven by //tools/zub_ctl.
+"""On-target integration tests driven by //tooling/zub_ctl.
 
 All targets are tagged `manual`, `exclusive`, and `local`:
   manual    → excluded from wildcard `bazel test //...` runs
@@ -23,9 +23,15 @@ Environment variables (all optional):
   XSCT          — path to Xilinx xsct             (A53 and RPU tests)
 """
 
-load(":rules.bzl", "firmware_elf_test", "firmware_size_test", "onboard_firmware_test")
+load("//sdk/rules:defs.bzl", "firmware_elf_test", "firmware_size_test", "onboard_firmware_test")
 
 package(default_visibility = ["//visibility:public"])
+
+sh_test(
+    name = "dependency_boundaries_test",
+    srcs = ["dependency_boundaries.sh"],
+    tags = ["local"],
+)
 
 _HW_TAGS = [
     "manual",
@@ -39,8 +45,8 @@ firmware_elf_test(
     expected_entry = "0x0",
     expected_machine = "aarch64",
     expected_memory_range = "0x0:0x80000000",
-    firmware = "//apps/apu/blink:blink.elf",
-    firmware_platform = "//platforms:apu_a53",
+    firmware = "//applications/apu/blink:blink",
+    firmware_platform = "//sdk/platforms:apu_a53",
     required_symbols = ["_vector_table"],
 )
 
@@ -49,8 +55,8 @@ firmware_elf_test(
     expected_entry = "0x800",
     expected_machine = "aarch64",
     expected_memory_range = "0x0:0x80000000",
-    firmware = "//apps/apu/hello_world:hello_world_a53.elf",
-    firmware_platform = "//platforms:apu_a53",
+    firmware = "//applications/apu/hello_world:hello_world",
+    firmware_platform = "//sdk/platforms:apu_a53",
     required_symbols = ["_vector_table"],
 )
 
@@ -59,8 +65,8 @@ firmware_elf_test(
     expected_entry = "0x0",
     expected_machine = "aarch64",
     expected_memory_range = "0x0:0x80000000",
-    firmware = "//apps/apu/eth_loopback:eth_loopback_a53.elf",
-    firmware_platform = "//platforms:apu_a53",
+    firmware = "//applications/apu/eth_loopback:eth_loopback",
+    firmware_platform = "//sdk/platforms:apu_a53",
     required_symbols = ["_vector_table"],
 )
 
@@ -69,8 +75,8 @@ firmware_elf_test(
     expected_entry = "0xffff0140",
     expected_machine = "arm",
     expected_memory_range = "0xffff0000:0x100000000",
-    firmware = "//apps/rpu/hello_world:hello_world",
-    firmware_platform = "//platforms:rpu_r5_0",
+    firmware = "//applications/rpu/hello_world:hello_world",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
     required_symbols = ["reset_handler"],
 )
 
@@ -79,8 +85,8 @@ firmware_elf_test(
     expected_entry = "0xffff0094",
     expected_machine = "arm",
     expected_memory_range = "0xffff0000:0x100000000",
-    firmware = "//apps/rpu/bsp_test:bsp_test",
-    firmware_platform = "//platforms:rpu_r5_0",
+    firmware = "//applications/rpu/bsp_test:bsp_test",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
     required_symbols = ["reset_handler"],
 )
 
@@ -89,8 +95,8 @@ firmware_elf_test(
     expected_entry = "0xffff00bc",
     expected_machine = "arm",
     expected_memory_range = "0xffff0000:0x100000000",
-    firmware = "//apps/rpu/fault_test:fault_test",
-    firmware_platform = "//platforms:rpu_r5_0",
+    firmware = "//applications/rpu/fault_test:fault_test",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
     required_symbols = [
         "reset_handler",
         "pm_save_from_exc",
@@ -100,14 +106,14 @@ firmware_elf_test(
 onboard_firmware_test(
     name = "rpu_hello_world_test",
     data = [
-        "//board/zub_1cg:psu_init",
-        "//scripts/openocd:aes_zub_cfg",
-        "//scripts/openocd:all_scripts",
-        "//scripts/openocd:load_r5",
-        "//tools/zub_ctl",
+        "//sdk/boards/zub_1cg:psu_init",
+        "//tooling/openocd:aes_zub_cfg",
+        "//tooling/openocd:all_scripts",
+        "//tooling/openocd:load_r5",
+        "//tooling/zub_ctl",
     ],
-    firmware = "//apps/rpu/hello_world:hello_world",
-    firmware_platform = "//platforms:rpu_r5_0",
+    firmware = "//applications/rpu/hello_world:hello_world",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
     tags = _HW_TAGS,
     test_script = "rpu_hello_world_test.sh",
 )
@@ -115,7 +121,7 @@ onboard_firmware_test(
 sh_test(
     name = "orbtrace_throughput_test",
     srcs = ["orbtrace_throughput_test.sh"],
-    data = ["//orbtrace/model:orbtrace"],
+    data = ["//applications/orbtrace/model:orbtrace"],
     tags = _HW_TAGS,
     # The test endpoint is the board's A53 Orbtrace service, not a separate
     # host.  It defaults to 192.168.1.50 and can be overridden for another
@@ -125,14 +131,14 @@ sh_test(
 onboard_firmware_test(
     name = "rpu_bsp_test",
     data = [
-        "//board/zub_1cg:psu_init",
-        "//scripts/openocd:aes_zub_cfg",
-        "//scripts/openocd:all_scripts",
-        "//scripts/openocd:load_r5",
-        "//tools/zub_ctl",
+        "//sdk/boards/zub_1cg:psu_init",
+        "//tooling/openocd:aes_zub_cfg",
+        "//tooling/openocd:all_scripts",
+        "//tooling/openocd:load_r5",
+        "//tooling/zub_ctl",
     ],
-    firmware = "//apps/rpu/bsp_test:bsp_test",
-    firmware_platform = "//platforms:rpu_r5_0",
+    firmware = "//applications/rpu/bsp_test:bsp_test",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
     tags = _HW_TAGS,
     test_script = "rpu_bsp_test.sh",
 )
@@ -140,14 +146,14 @@ onboard_firmware_test(
 onboard_firmware_test(
     name = "rpu_fault_test",
     data = [
-        "//board/zub_1cg:psu_init",
-        "//scripts/openocd:aes_zub_cfg",
-        "//scripts/openocd:all_scripts",
-        "//scripts/openocd:load_r5",
-        "//tools/zub_ctl",
+        "//sdk/boards/zub_1cg:psu_init",
+        "//tooling/openocd:aes_zub_cfg",
+        "//tooling/openocd:all_scripts",
+        "//tooling/openocd:load_r5",
+        "//tooling/zub_ctl",
     ],
-    firmware = "//apps/rpu/fault_test:fault_test",
-    firmware_platform = "//platforms:rpu_r5_0",
+    firmware = "//applications/rpu/fault_test:fault_test",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
     tags = _HW_TAGS,
     test_script = "rpu_fault_test.sh",
 )
@@ -155,12 +161,12 @@ onboard_firmware_test(
 onboard_firmware_test(
     name = "apu_hello_world_test",
     data = [
-        "//board/zub_1cg:bitstream",
-        "//board/zub_1cg:psu_init",
-        "//tools/zub_ctl",
+        "//sdk/boards/zub_1cg:bitstream",
+        "//sdk/boards/zub_1cg:psu_init",
+        "//tooling/zub_ctl",
     ],
-    firmware = "//apps/apu/hello_world:hello_world_a53.elf",
-    firmware_platform = "//platforms:apu_a53",
+    firmware = "//applications/apu/hello_world:hello_world",
+    firmware_platform = "//sdk/platforms:apu_a53",
     tags = _HW_TAGS,
     test_script = "apu_hello_world_test.sh",
 )
@@ -168,12 +174,12 @@ onboard_firmware_test(
 onboard_firmware_test(
     name = "apu_blink_test",
     data = [
-        "//board/zub_1cg:bitstream",
-        "//board/zub_1cg:psu_init",
-        "//tools/zub_ctl",
+        "//sdk/boards/zub_1cg:bitstream",
+        "//sdk/boards/zub_1cg:psu_init",
+        "//tooling/zub_ctl",
     ],
-    firmware = "//apps/apu/blink:blink.elf",
-    firmware_platform = "//platforms:apu_a53",
+    firmware = "//applications/apu/blink:blink",
+    firmware_platform = "//sdk/platforms:apu_a53",
     tags = _HW_TAGS,
     test_script = "apu_blink_test.sh",
 )
@@ -181,12 +187,12 @@ onboard_firmware_test(
 onboard_firmware_test(
     name = "apu_eth_loopback_test",
     data = [
-        "//board/zub_1cg:bitstream",
-        "//board/zub_1cg:psu_init",
-        "//tools/zub_ctl",
+        "//sdk/boards/zub_1cg:bitstream",
+        "//sdk/boards/zub_1cg:psu_init",
+        "//tooling/zub_ctl",
     ],
-    firmware = "//apps/apu/eth_loopback:eth_loopback_a53.elf",
-    firmware_platform = "//platforms:apu_a53",
+    firmware = "//applications/apu/eth_loopback:eth_loopback",
+    firmware_platform = "//sdk/platforms:apu_a53",
     tags = _HW_TAGS,
     test_script = "apu_eth_loopback_test.sh",
 )
@@ -198,23 +204,23 @@ onboard_firmware_test(
 firmware_size_test(
     name = "rpu_hello_world_size_test",
     bss_limit_bytes = 12288,  # 12 KB — ThreadX thread stacks + state
-    firmware = "//apps/rpu/hello_world:hello_world",
-    firmware_platform = "//platforms:rpu_r5_0",
+    firmware = "//applications/rpu/hello_world:hello_world",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
     text_limit_bytes = 24576,  # 24 KB — ThreadX + RTOS + drivers
 )
 
 firmware_size_test(
     name = "rpu_bsp_test_size_test",
     bss_limit_bytes = 1024,  # 1 KB
-    firmware = "//apps/rpu/bsp_test:bsp_test",
-    firmware_platform = "//platforms:rpu_r5_0",
+    firmware = "//applications/rpu/bsp_test:bsp_test",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
     text_limit_bytes = 4096,  # 4 KB — bare-metal + UART only
 )
 
 firmware_size_test(
     name = "rpu_fault_test_size_test",
     bss_limit_bytes = 1024,  # 1 KB — includes pm_record_t (.noinit) = 92 B
-    firmware = "//apps/rpu/fault_test:fault_test",
-    firmware_platform = "//platforms:rpu_r5_0",
+    firmware = "//applications/rpu/fault_test:fault_test",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
     text_limit_bytes = 8192,  # 8 KB — bare-metal + UART + postmortem
 )

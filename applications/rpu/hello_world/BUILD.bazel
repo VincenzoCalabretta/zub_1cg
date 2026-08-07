@@ -1,0 +1,13 @@
+"""Hello World application for AES-ZUB Cortex-R5F."""
+
+load("//sdk/rules:defs.bzl", "r5_firmware")
+
+r5_firmware(
+    name = "hello_world",
+    srcs = ["main.c"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sdk/bsp:test_proto",
+        "//sdk/rtos:threadx_r5",
+    ],
+)

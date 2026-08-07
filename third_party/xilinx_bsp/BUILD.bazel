@@ -15,29 +15,51 @@ cc_library(
     name = "headers",
     hdrs = glob(["include/**/*.h"]),
     includes = ["include"],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//sdk/bsp/apu:__pkg__",
+        "//third_party/os_abstraction_layer/ThreadX:__pkg__",
+    ],
 )
 
 cc_import(
     name = "libxil",
     static_library = "lib/libxil.a",
-    visibility = ["//visibility:public"],
+    visibility = ["//sdk/bsp/apu:__pkg__"],
+)
+
+filegroup(
+    name = "libxil_archive",
+    srcs = ["lib/libxil.a"],
+    visibility = ["//sdk/bsp/apu:__pkg__"],
 )
 
 cc_import(
     name = "libxilstandalone",
     static_library = "lib/libxilstandalone.a",
-    visibility = ["//visibility:public"],
+    visibility = ["//sdk/bsp/apu:__pkg__"],
+    alwayslink = True,
+)
+
+filegroup(
+    name = "libxilstandalone_archive",
+    srcs = ["lib/libxilstandalone.a"],
+    visibility = ["//sdk/bsp/apu:__pkg__"],
 )
 
 cc_import(
     name = "libxiltimer",
     static_library = "lib/libxiltimer.a",
-    visibility = ["//visibility:public"],
+    visibility = ["//sdk/bsp/apu:__pkg__"],
+)
+
+filegroup(
+    name = "libxiltimer_archive",
+    srcs = ["lib/libxiltimer.a"],
+    visibility = ["//sdk/bsp/apu:__pkg__"],
 )
 
 filegroup(
     name = "xilinx_spec",
     srcs = ["Xilinx.spec"],
-    visibility = ["//visibility:public"],
+    visibility = ["//sdk/bsp/apu:__pkg__"],
 )

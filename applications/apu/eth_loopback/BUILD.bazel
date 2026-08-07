@@ -1,0 +1,7 @@
+load("//sdk/rules:defs.bzl", "a53_firmware")
+
+a53_firmware(
+    name = "eth_loopback",
+    srcs = ["src/eth_loopback.c"],
+    visibility = ["//visibility:public"],
+)

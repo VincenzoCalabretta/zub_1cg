@@ -26,12 +26,12 @@ if [[ ! -x "$XSCT" ]]; then
 fi
 
 RUN="${RUNFILES_DIR:-$TEST_SRCDIR}/_main"
-ZUB_CTL="$RUN/tools/zub_ctl/zub_ctl"
-BIT="$RUN/board/zub_1cg/design_1_wrapper.bit"
-PSI="$RUN/board/zub_1cg/psu_init.tcl"
+ZUB_CTL="$RUN/tooling/zub_ctl/zub_ctl"
+BIT="$RUN/sdk/boards/zub_1cg/design_1_wrapper.bit"
+PSI="$RUN/sdk/boards/zub_1cg/psu_init.tcl"
 
 # The test rule cross-compiles this ELF for A53 and supplies it in runfiles.
-ELF="$RUN/apps/apu/blink/blink.elf"
+ELF="$RUN/zub_firmware"
 if [[ ! -f "$ELF" ]]; then
     echo "FAIL: blink.elf is missing from test runfiles"
     exit 1

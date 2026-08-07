@@ -1,16 +1,16 @@
 """zub_1cg — mainline bare-metal + RTOS project for the Avnet AES-ZUB-1CG board.
 
 Targets (added progressively as phases land):
-  //apps/apu/...  — Cortex-A53 (APU0) applications on Xilinx ZynqMP BSP + ThreadX.
-  //apps/rpu/...  — Cortex-R5F (RPU0) applications on ThreadX.
-  //tests/...     — host-side integration tests driven by //tools/zub_ctl.
+  //applications/apu/...  — Cortex-A53 applications.
+  //applications/rpu/...  — Cortex-R5F applications.
+  //tests/...             — host-side integration tests driven by //tooling/zub_ctl.
 
-Toolchains registered from //toolchains/... in phases 2 and 3.
+Cross toolchains are registered transitively from //sdk/toolchains/....
 """
 
 module(
     name = "zub_1cg",
-    version = "0.0.1",
+    version = "0.1.0",
 )
 
 bazel_dep(name = "rules_cc", version = "0.1.1")
@@ -33,59 +33,62 @@ register_toolchains("@rust_toolchains//:all")
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "zub_ctl_crates",
-    cargo_lockfile = "//tools/zub_ctl:Cargo.lock",
-    manifests = ["//tools/zub_ctl:Cargo.toml"],
+    cargo_lockfile = "//tooling/zub_ctl:Cargo.lock",
+    manifests = ["//tooling/zub_ctl:Cargo.toml"],
 )
 use_repo(crate, "zub_ctl_crates")
 
 crate.from_cargo(
     name = "docs_crates",
-    cargo_lockfile = "//tools/docs:Cargo.lock",
-    manifests = ["//tools/docs:Cargo.toml"],
+    cargo_lockfile = "//internal/docs_tool:Cargo.lock",
+    manifests = ["//internal/docs_tool:Cargo.toml"],
 )
 use_repo(crate, "docs_crates")
 
 crate.from_cargo(
     name = "elf_check_crates",
-    cargo_lockfile = "//tools/elf_check:Cargo.lock",
-    manifests = ["//tools/elf_check:Cargo.toml"],
+    cargo_lockfile = "//tooling/elf_check:Cargo.lock",
+    manifests = ["//tooling/elf_check:Cargo.toml"],
 )
 use_repo(crate, "elf_check_crates")
 
 crate.from_cargo(
     name = "pm_decode_crates",
-    cargo_lockfile = "//tools/pm_decode:Cargo.lock",
-    manifests = ["//tools/pm_decode:Cargo.toml"],
+    cargo_lockfile = "//tooling/pm_decode:Cargo.lock",
+    manifests = ["//tooling/pm_decode:Cargo.toml"],
 )
 use_repo(crate, "pm_decode_crates")
 
 # ── Env-based cross-toolchain capture ─────────────────────────────────────────
 # The Nix shellHook exports ARM_GCC_BIN and AARCH64_GCC_BIN; these repository
 # rules read them at fetch time and generate defs.bzl with pinned Nix-store
-# paths. Consumed by //toolchains/*/config.bzl.
+# paths. Consumed by //sdk/toolchains/*/config.bzl.
 arm_gcc_ext = use_extension(
-    "//toolchains/arm_none_eabi:env_ext.bzl",
+    "//sdk/toolchains/arm_none_eabi:env_ext.bzl",
     "arm_gcc_config_ext",
 )
 use_repo(arm_gcc_ext, "arm_gcc_config")
 
 aarch64_gcc_ext = use_extension(
-    "//toolchains/aarch64_none_elf:env_ext.bzl",
+    "//sdk/toolchains/aarch64_none_elf:env_ext.bzl",
     "aarch64_gcc_config_ext",
 )
 use_repo(aarch64_gcc_ext, "aarch64_gcc_config")
 
 register_toolchains(
-    "//toolchains/arm_none_eabi:arm_none_eabi_toolchain",
-    "//toolchains/aarch64_none_elf:aarch64_none_elf_toolchain",
+    "//sdk/toolchains/arm_none_eabi:arm_none_eabi_toolchain",
+    "//sdk/toolchains/aarch64_none_elf:aarch64_none_elf_toolchain",
 )
 
+sdk_tools = use_extension("//sdk/toolchains:tools_ext.bzl", "tools_ext")
+use_repo(sdk_tools, "zub_cross_tools", "zub_host_tools")
+
 # ── Third-party sources (fetched by extensions.bzl) ───────────────────────────
-threadx_ext = use_extension("//:extensions.bzl", "threadx_extension")
+threadx_ext = use_extension("//third_party:extensions.bzl", "threadx_extension")
 use_repo(threadx_ext, "threadx")
 
-filex_ext = use_extension("//:extensions.bzl", "filex_extension")
+filex_ext = use_extension("//third_party:extensions.bzl", "filex_extension")
 use_repo(filex_ext, "filex")
 
-netxduo_ext = use_extension("//:extensions.bzl", "netxduo_extension")
+netxduo_ext = use_extension("//third_party:extensions.bzl", "netxduo_extension")
 use_repo(netxduo_ext, "netxduo")

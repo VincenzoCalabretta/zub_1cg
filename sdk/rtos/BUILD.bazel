@@ -1,0 +1,25 @@
+"""Supported RTOS facade; upstream repository names are implementation details."""
+
+alias(
+    name = "threadx_a53",
+    actual = "@threadx//:threadx_a53",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "threadx_r5",
+    actual = "@threadx//:threadx_r5",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "filex",
+    actual = "@filex//:filex",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "netxduo",
+    actual = "@netxduo//:netxduo",
+    visibility = ["//visibility:public"],
+)

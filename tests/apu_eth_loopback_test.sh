@@ -17,11 +17,11 @@ if [[ ! -x "$XSCT" ]]; then
 fi
 
 RUN="${RUNFILES_DIR:-$TEST_SRCDIR}/_main"
-ZUB_CTL="$RUN/tools/zub_ctl/zub_ctl"
-BIT="$RUN/board/zub_1cg/design_1_wrapper.bit"
-PSI="$RUN/board/zub_1cg/psu_init.tcl"
+ZUB_CTL="$RUN/tooling/zub_ctl/zub_ctl"
+BIT="$RUN/sdk/boards/zub_1cg/design_1_wrapper.bit"
+PSI="$RUN/sdk/boards/zub_1cg/psu_init.tcl"
 
-ELF="$RUN/apps/apu/eth_loopback/eth_loopback_a53.elf"
+ELF="$RUN/zub_firmware"
 if [[ ! -f "$ELF" ]]; then
     echo "FAIL: eth_loopback_a53.elf is missing from test runfiles"
     exit 1

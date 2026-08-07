@@ -1,0 +1,78 @@
+"""Board support package for AES-ZUB Cortex-R5F core 0."""
+
+R5F_COPTS = [
+    "-mcpu=cortex-r5",
+    "-mfpu=vfpv3-d16",
+    "-mfloat-abi=hard",
+    "-marm",
+    "-ffreestanding",
+    "-fno-builtin",
+]
+
+# Startup trace flag: startup.S writes 0x52535431 ("RST1") to 0xFFFFFF00 as
+# its very first instruction, letting load_r5.tcl prove the reset handler ran.
+_BSP_COPTS = R5F_COPTS + ["-DR5_STARTUP_TRACE=1"]
+
+# Expose the linker script so apps can reference it with $(location ...).
+filegroup(
+    name = "linker_script",
+    srcs = ["memory.lds"],
+    visibility = ["//visibility:public"],
+)
+
+# BSP library: startup, UART, GIC + timer (requires ThreadX for IRQ dispatch).
+cc_library(
+    name = "bsp",
+    srcs = [
+        "startup.S",
+        "timer.c",
+        "uart.c",
+    ],
+    hdrs = [
+        "timer.h",
+        "uart.h",
+    ],
+    copts = _BSP_COPTS,
+    includes = ["."],
+    visibility = ["//visibility:public"],
+)
+
+# Bare-metal BSP subset: startup + UART only.  No ThreadX dependency.
+# Use for tests that do not need the timer or IRQ dispatch.
+cc_library(
+    name = "bsp_bare",
+    srcs = [
+        "startup_bare.S",
+        "uart.c",
+    ],
+    hdrs = ["uart.h"],
+    copts = R5F_COPTS,
+    includes = ["."],
+    visibility = ["//visibility:public"],
+)
+
+# Postmortem capture library.  Provides pm_save_from_exc(), pm_print(), and
+# the weak pm_on_exception() hook.  Requires uart_init() before pm_print().
+cc_library(
+    name = "postmortem",
+    srcs = ["postmortem.c"],
+    hdrs = ["postmortem.h"],
+    copts = R5F_COPTS,
+    includes = ["."],
+    visibility = ["//visibility:public"],
+)
+
+# BSP with postmortem exception capture.  Use for tests that inject faults
+# and need the .noinit record filled by the exception handler.
+cc_library(
+    name = "bsp_pm",
+    srcs = [
+        "startup_pm.S",
+        "uart.c",
+    ],
+    hdrs = ["uart.h"],
+    copts = R5F_COPTS,
+    includes = ["."],
+    visibility = ["//visibility:public"],
+    deps = [":postmortem"],
+)

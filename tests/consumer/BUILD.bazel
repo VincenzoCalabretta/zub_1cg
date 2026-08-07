@@ -1,0 +1,50 @@
+load("@zub_1cg//sdk/rules:defs.bzl", "a53_firmware", "firmware_elf_test", "firmware_size_test", "r5_firmware", "zub_boot_image")
+
+a53_firmware(
+    name = "minimal_a53",
+    srcs = ["a53.c"],
+    tags = ["manual"],
+)
+
+r5_firmware(
+    name = "minimal_r5",
+    srcs = ["r5.c"],
+    tags = ["manual"],
+    deps = ["@zub_1cg//sdk/rtos:threadx_r5"],
+)
+
+firmware_elf_test(
+    name = "minimal_r5_elf_test",
+    expected_entry = "0xffff0108",
+    expected_machine = "arm",
+    expected_memory_range = "0xffff0000:0x100000000",
+    firmware = ":minimal_r5",
+    required_symbols = ["reset_handler"],
+    tags = ["manual"],
+)
+
+firmware_size_test(
+    name = "minimal_r5_size_test",
+    bss_limit_bytes = 16384,
+    firmware = ":minimal_r5",
+    tags = ["manual"],
+    text_limit_bytes = 32768,
+)
+
+zub_boot_image(
+    name = "minimal_boot",
+    r5_firmware = ":minimal_r5",
+    tags = ["manual"],
+)
+
+filegroup(
+    name = "board_workflow",
+    srcs = [
+        "@zub_1cg//sdk/boards/zub_1cg:artifacts_manifest",
+        "@zub_1cg//sdk/boards/zub_1cg:bitstream",
+        "@zub_1cg//sdk/boards/zub_1cg:psu_init",
+        "@zub_1cg//tooling/openocd:all_scripts",
+        "@zub_1cg//tooling/zub_ctl",
+    ],
+    tags = ["manual"],
+)

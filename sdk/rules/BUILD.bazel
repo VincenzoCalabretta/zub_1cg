@@ -1,0 +1,9 @@
+exports_files(
+    [
+        "defs.bzl",
+        "firmware.bzl",
+        "tests.bzl",
+        "boot_image.bzl",
+    ],
+    visibility = ["//visibility:public"],
+)

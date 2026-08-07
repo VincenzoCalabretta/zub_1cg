@@ -22,7 +22,7 @@ TIMEOUT_S="${ZUB_TIMEOUT:-30}"
 
 RUN="${RUNFILES_DIR:-$TEST_SRCDIR}/_main"
 
-ZUB_CTL="$RUN/tools/zub_ctl/zub_ctl"
+ZUB_CTL="$RUN/tooling/zub_ctl/zub_ctl"
 if [[ ! -x "$ZUB_CTL" ]]; then
     ZUB_CTL="$(command -v zub_ctl || true)"
 fi
@@ -31,11 +31,11 @@ if [[ -z "$ZUB_CTL" || ! -x "$ZUB_CTL" ]]; then
     exit 1
 fi
 
-OPENOCD_CFG="$RUN/scripts/openocd/aes_zub.cfg"
-LOAD_R5="$RUN/scripts/openocd/load_r5.tcl"
-PSU_INIT_RUN="$RUN/scripts/openocd/psu_init_run.tcl"
+OPENOCD_CFG="$RUN/tooling/openocd/aes_zub.cfg"
+LOAD_R5="$RUN/tooling/openocd/load_r5.tcl"
+PSU_INIT_RUN="$RUN/tooling/openocd/psu_init_run.tcl"
 
-ELF="$RUN/apps/rpu/bsp_test/bsp_test"
+ELF="$RUN/zub_firmware"
 if [[ ! -f "$ELF" ]]; then
     echo "[INFRA FAIL] R5 bare-metal ELF is missing from test runfiles" >&2
     exit 1

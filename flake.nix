@@ -1,5 +1,5 @@
 {
-  description = "zub_1cg — AES-ZUB-1CG mainline (Bazel 8 + Nix, hermetic devShell)";
+  description = "Reusable AES-ZUB-1CG board SDK (Bazel 8 + Nix)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -7,121 +7,95 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
-      let
-        pkgs = import nixpkgs { inherit system; };
-
-        # ── bootgen ──────────────────────────────────────────────────────────
-        # Xilinx boot-image packager (not in nixpkgs). Pinned to the commit
-        # verified during original R5 bring-up.
-        bootgen = pkgs.stdenv.mkDerivation {
-          pname   = "bootgen";
-          version = "2026.1";
-          src = pkgs.fetchFromGitHub {
-            owner  = "Xilinx";
-            repo   = "bootgen";
-            rev    = "e576e5e1e227a74c31e54607623c1bb7f38eec12";
-            sha256 = "sha256-gz15FkMQ5aQahGVLe0k6KDA/1WhTVIZUA4qCq2iWTFM=";
-          };
-          nativeBuildInputs = [ pkgs.gnumake pkgs.gcc pkgs.openssl.dev ];
-          buildInputs       = [ pkgs.openssl ];
-          # GCC 14+ / OpenSSL 3.x: bootgen uses deprecated SHA256_Init / RSA_*
-          # APIs and has char*<->uint32_t* casts.
-          env.NIX_CFLAGS_COMPILE =
-            "-Wno-deprecated-declarations -Wno-incompatible-pointer-types";
-          makeFlags = [
-            "CXXFLAGS=-std=c++14 -O -Wall -Wno-reorder -Wno-aligned-new -Wno-misleading-indentation -Wno-class-memaccess"
-          ];
-          installPhase = ''
-            mkdir -p $out/bin
-            cp build/bin/bootgen $out/bin/
-          '';
-          meta.description = "Xilinx Boot Image Generator (BOOT.BIN packager)";
+    let
+      mkBootgen = pkgs: pkgs.stdenv.mkDerivation {
+        pname = "bootgen";
+        version = "2026.1";
+        src = pkgs.fetchFromGitHub {
+          owner = "Xilinx";
+          repo = "bootgen";
+          rev = "e576e5e1e227a74c31e54607623c1bb7f38eec12";
+          sha256 = "sha256-gz15FkMQ5aQahGVLe0k6KDA/1WhTVIZUA4qCq2iWTFM=";
         };
+        nativeBuildInputs = [ pkgs.gnumake pkgs.gcc pkgs.openssl.dev ];
+        buildInputs = [ pkgs.openssl ];
+        env.NIX_CFLAGS_COMPILE =
+          "-Wno-deprecated-declarations -Wno-incompatible-pointer-types";
+        makeFlags = [
+          "CXXFLAGS=-std=c++14 -O -Wall -Wno-reorder -Wno-aligned-new -Wno-misleading-indentation -Wno-class-memaccess"
+        ];
+        installPhase = ''
+          mkdir -p $out/bin
+          cp build/bin/bootgen $out/bin/
+        '';
+      };
 
-        # ── Cross-compilers (native GCC binaries provided by nixpkgs) ────────
-        armGcc     = pkgs.gcc-arm-embedded;                              # arm-none-eabi
-        aarch64Gcc = pkgs.pkgsCross.aarch64-embedded.buildPackages.gcc;  # aarch64-none-elf
-
-      in {
-        packages.bootgen = bootgen;
-
-        devShells.default = pkgs.mkShell {
-          name = "zub_1cg";
-
+      mkDevShell = {
+        system,
+        pkgs ? import nixpkgs { inherit system; },
+        extraPackages ? [ ],
+        extraShellHook ? "",
+      }:
+        let
+          bootgen = mkBootgen pkgs;
+          armGcc = pkgs.gcc-arm-embedded;
+          aarch64Gcc = pkgs.pkgsCross.aarch64-embedded.buildPackages.gcc;
+        in pkgs.mkShell {
+          name = "zub_1cg-sdk";
           packages = [
-            # ── Cross toolchains ───────────────────────────────────────────
-            armGcc                  # arm-none-eabi-{gcc,ld,ar,objcopy,…}
-            aarch64Gcc              # aarch64-none-elf-{gcc,ld,ar,objcopy,…}
-
-            # ── Build system ───────────────────────────────────────────────
+            armGcc
+            aarch64Gcc
             pkgs.bazel_8
-
-            # ── Rust (for //tools/zub_ctl and integration test driver) ─────
+            pkgs.buildifier
             pkgs.rustc
             pkgs.cargo
             pkgs.rustfmt
             pkgs.clippy
             pkgs.pkg-config
-            pkgs.systemdMinimal     # provides libudev for the serialport crate
-            pkgs.poppler-utils      # provides pdftotext for //tools/docs
-
-            # ── Firmware packaging + on-target tooling ─────────────────────
+            pkgs.systemdMinimal
+            pkgs.poppler-utils
             bootgen
-            pkgs.openocd            # R5 JTAG boot
-            pkgs.picocom            # ad-hoc UART console (Ctrl-A Ctrl-X to exit)
-            pkgs.openssl            # bootgen link-time dep at runtime
-
-            # ── SD-card + USB helpers ──────────────────────────────────────
-            pkgs.udisks2            # mount SD card without sudo
-            pkgs.usbutils           # lsusb
-            pkgs.util-linux         # lsblk, etc.
-
-            # ── General ────────────────────────────────────────────────────
+            pkgs.openocd
+            pkgs.picocom
+            pkgs.openssl
+            pkgs.udisks2
+            pkgs.usbutils
+            pkgs.util-linux
             pkgs.git
             pkgs.file
             pkgs.which
             pkgs.jq
-          ];
-
-          # ── Shell hook ─────────────────────────────────────────────────────
-          # 1. Export ARM_GCC_BIN and AARCH64_GCC_BIN so the Bazel toolchain
-          #    repository rules can capture the Nix-store compiler paths.
-          # 2. Write .bazelrc.user (git-ignored) with the baked-in paths so
-          #    the paths survive across environment resets.
+          ] ++ extraPackages;
           shellHook = ''
-            export ARM_GCC_BIN="$(dirname "$(which arm-none-eabi-gcc)")"
-            export AARCH64_GCC_BIN="$(dirname "$(which aarch64-none-elf-gcc)")"
-
-            # Make libudev.pc visible to pkg-config inside the Bazel sandbox.
+            export ARM_GCC_BIN="${armGcc}/bin"
+            export AARCH64_GCC_BIN="${aarch64Gcc}/bin"
+            export BOOTGEN="${bootgen}/bin/bootgen"
+            export OPENOCD="${pkgs.openocd}/bin/openocd"
             export PKG_CONFIG_PATH="${pkgs.systemdMinimal.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-
-            cat > "$PWD/.bazelrc.user" <<EOF
-# Generated by nix flake shellHook — do not commit.
-# Bakes Nix-store compiler paths into Bazel's repository cache.
-build --action_env=PKG_CONFIG_PATH=$PKG_CONFIG_PATH
-build --action_env=ARM_GCC_BIN=$ARM_GCC_BIN
-build --action_env=AARCH64_GCC_BIN=$AARCH64_GCC_BIN
-build --action_env=PATH=$PATH
-EOF
-
-            echo ""
-            echo "╔════════════════════════════════════════════════════════════╗"
-            echo "║  zub_1cg devShell  (all tools from Nix store)             ║"
-            echo "╠════════════════════════════════════════════════════════════╣"
-            printf "║  bazel   %-50s║\n" "$(bazel --version 2>/dev/null)"
-            printf "║  arm-gcc %-50s║\n" "$(arm-none-eabi-gcc --version | head -1 | cut -c1-50)"
-            printf "║  a64-gcc %-50s║\n" "$(aarch64-none-elf-gcc --version | head -1 | cut -c1-50)"
-            printf "║  rustc   %-50s║\n" "$(rustc --version)"
-            printf "║  openocd %-50s║\n" "$(openocd --version 2>&1 | head -1 | cut -c1-50)"
-            printf "║  bootgen %-50s║\n" "$(bootgen 2>&1 | head -1 | cut -c1-50)"
-            echo "╚════════════════════════════════════════════════════════════╝"
-            echo ""
-            echo "  Build APU  :  bazel build --config=apu //apps/apu/..."
-            echo "  Build RPU  :  bazel build --config=rpu //apps/rpu/..."
-            echo "  Host tests :  bazel test  --config=host //tests/..."
-            echo ""
+            ${extraShellHook}
           '';
         };
+    in {
+      lib.mkDevShell = mkDevShell;
+    } // flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+        bootgen = mkBootgen pkgs;
+        toolBundle = pkgs.symlinkJoin {
+          name = "zub_1cg-tools";
+          paths = [
+            bootgen
+            pkgs.openocd
+            pkgs.gcc-arm-embedded
+            pkgs.pkgsCross.aarch64-embedded.buildPackages.gcc
+          ];
+        };
+      in {
+        packages = {
+          inherit bootgen;
+          tooling = toolBundle;
+          default = toolBundle;
+        };
+        devShells.default = mkDevShell { inherit system pkgs; };
       });
 }

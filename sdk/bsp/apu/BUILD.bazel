@@ -1,0 +1,49 @@
+"""Board support for ZynqMP A53 bare-metal ThreadX."""
+
+filegroup(
+    name = "linker_script",
+    srcs = ["lscript_a53.ld"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "bsp",
+    srcs = [
+        "timer.c",
+        "tx_initialize_low_level.S",
+        "tx_thread_stack_build.S",
+    ],
+    hdrs = ["timer.h"],
+    includes = ["."],
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [":xilinx_runtime"],
+    # alwayslink: the BSP defines _tx_initialize_low_level, IRQHandler, and the
+    # exception vector table — symbols only referenced by ThreadX libraries, not
+    # directly by the binary's own objects.  Without this flag the linker drops
+    # the archive before resolving those cross-library references.
+    alwayslink = True,
+)
+
+cc_library(
+    name = "xilinx_runtime",
+    additional_linker_inputs = [
+        "//third_party/xilinx_bsp:libxil_archive",
+        "//third_party/xilinx_bsp:libxilstandalone_archive",
+        "//third_party/xilinx_bsp:libxiltimer_archive",
+    ],
+    linkopts = [
+        "-Wl,--start-group",
+        "$(location //third_party/xilinx_bsp:libxil_archive)",
+        "$(location //third_party/xilinx_bsp:libxilstandalone_archive)",
+        "$(location //third_party/xilinx_bsp:libxiltimer_archive)",
+        "-lgcc",
+        "-lc",
+        "-Wl,--end-group",
+    ],
+    visibility = ["//visibility:public"],
+    deps = ["//third_party/xilinx_bsp:headers"],
+)

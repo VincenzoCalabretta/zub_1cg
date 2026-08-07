@@ -4,7 +4,7 @@ set -euo pipefail
 # control and Orbflow TCP ports after the Orbtrace image has been deployed.
 # A lab with a different static subnet can override this address.
 ORBTRACE_BOARD_IP="${ORBTRACE_BOARD_IP:-192.168.1.50}"
-orbtrace="${TEST_SRCDIR}/${TEST_WORKSPACE}/orbtrace/model/orbtrace"
+orbtrace="${TEST_SRCDIR}/${TEST_WORKSPACE}/applications/orbtrace/model/orbtrace"
 capture="${TEST_TMPDIR}/orbflow.bin"
 
 if ! timeout 3 bash -c "</dev/tcp/${ORBTRACE_BOARD_IP}/3401"; then

@@ -1,0 +1,35 @@
+"""Aggregate contract for the complete Orbtrace application."""
+
+filegroup(
+    name = "application",
+    srcs = [
+        "//applications/orbtrace/firmware/a53:control_firmware",
+        "//applications/orbtrace/firmware/common:firmware_common",
+        "//applications/orbtrace/firmware/vexriscv:trace_workload",
+        "//applications/orbtrace/model:orbtrace_model",
+        "//applications/orbtrace/rtl",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "tests",
+    tests = [
+        "//applications/orbtrace/firmware/a53:control_firmware_test",
+        "//applications/orbtrace/firmware/common:firmware_common_test",
+        "//applications/orbtrace/firmware/vexriscv:trace_workload_test",
+        "//applications/orbtrace/model:orbtrace_model_test",
+        "//applications/orbtrace/model:register_schema_test",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "vivado_tests",
+    tags = [
+        "manual",
+        "requires-vivado",
+    ],
+    tests = ["//applications/orbtrace/rtl:rtl_unit_test"],
+    visibility = ["//visibility:public"],
+)

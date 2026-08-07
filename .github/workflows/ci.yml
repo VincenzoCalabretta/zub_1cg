@@ -43,7 +43,7 @@ jobs:
             bazel-${{ runner.os }}-
 
       - name: Presubmit
-        run: nix develop --command scripts/presubmit.sh
+        run: nix develop --command internal/presubmit/presubmit.sh
 
   manual-build:
     name: Manual-target link check (hardware test binaries)
@@ -70,15 +70,15 @@ jobs:
 
       - name: Build APU hardware-test firmware
         run: |
-          nix develop --command bazel build --config=apu \
-            //apps/apu/blink:blink.elf \
-            //apps/apu/hello_world:hello_world_a53.elf \
-            //apps/apu/eth_loopback:eth_loopback_a53.elf
+          nix develop --command bazel build \
+            //applications/apu/blink:blink \
+            //applications/apu/hello_world:hello_world \
+            //applications/apu/eth_loopback:eth_loopback
 
       - name: Build RPU hardware-test firmware
         run: |
-          nix develop --command bazel build --config=rpu \
-            //apps/rpu/hello_world:hello_world
+          nix develop --command bazel build \
+            //applications/rpu/hello_world:hello_world
 
       - name: Build zub_ctl host binary
-        run: nix develop --command bazel build --config=host //tools/zub_ctl:zub_ctl
+        run: nix develop --command bazel build --config=host //tooling/zub_ctl:zub_ctl

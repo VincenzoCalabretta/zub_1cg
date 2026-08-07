@@ -1,0 +1,16 @@
+"""Optional proprietary XSCT workflow for the AES-ZUB-1CG."""
+
+sh_binary(
+    name = "xsct_jtag_flash",
+    srcs = ["//tooling/xsct:jtag_flash.sh"],
+    data = [
+        "//sdk/boards/zub_1cg:bitstream",
+        "//sdk/boards/zub_1cg:psu_init",
+    ],
+    tags = [
+        "local",
+        "manual",
+        "requires-xsct",
+    ],
+    visibility = ["//visibility:public"],
+)

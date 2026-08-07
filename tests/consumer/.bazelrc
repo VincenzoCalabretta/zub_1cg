@@ -1,0 +1,8 @@
+common --enable_bzlmod
+build --action_env=ARM_GCC_BIN
+build --action_env=AARCH64_GCC_BIN
+build --action_env=BOOTGEN
+build --action_env=OPENOCD
+build --action_env=PKG_CONFIG_PATH
+build --sandbox_add_mount_pair=/nix
+build --verbose_failures

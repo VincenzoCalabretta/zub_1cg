@@ -28,7 +28,7 @@
 - Regenerate it with:
 
   ```sh
-  bazel run --config=host //tools/docs:pdf_to_markdown -- --clean
+  bazel run --config=host //internal/docs_tool:pdf_to_markdown -- --clean
   ```
 
 - The converter relies on Poppler's `pdftotext -layout`, which is supplied by

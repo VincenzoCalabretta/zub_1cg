@@ -1,0 +1,18 @@
+module(
+    name = "zub_1cg_consumer",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "zub_1cg", version = "0.1.0")
+
+# Published consumers use this revision in git_override; the fixture substitutes
+# the checkout below so uncommitted SDK changes are testable.
+# git_override(
+#     module_name = "zub_1cg",
+#     remote = "ssh://git@10.10.0.101/v/zub_1cg.git",
+#     commit = "85a35fdb7edaf79f67dadb1252dcbbf636bea588",
+# )
+local_path_override(
+    module_name = "zub_1cg",
+    path = "../..",
+)

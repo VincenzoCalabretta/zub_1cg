@@ -27,7 +27,7 @@ cc_library(
         "@platforms//os:none",
         "@platforms//cpu:aarch64",
     ],
-    visibility = ["//visibility:public"],
+    visibility = ["//third_party:__subpackages__"],
     deps = [
         "//third_party/os_abstraction_layer/Common:common",
         "//third_party/xilinx_bsp:headers",
@@ -47,9 +47,9 @@ cc_library(
         "@platforms//os:none",
         "@platforms//cpu:aarch64",
     ],
-    visibility = ["//visibility:public"],
+    visibility = ["//third_party:__subpackages__"],
     deps = [
-        "//board/apu:bsp",
+        "//sdk/bsp/apu:bsp",
         "//third_party/xilinx_bsp:headers",
         "@netxduo",
         "@threadx//:threadx_a53",

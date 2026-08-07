@@ -1,0 +1,27 @@
+"""A53 loader shim — a tiny AArch64 ELF that copies an embedded R5 image into
+TCM and releases R5-0 out of module reset, enabling SD-card boot without FSBL.
+
+The public boot-image rule consumes these sources through definition-repository
+labels.
+"""
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "main.c",
+    "memory.lds",
+    "startup.S",
+])
+
+filegroup(
+    name = "sources",
+    srcs = [
+        "main.c",
+        "startup.S",
+    ],
+)
+
+filegroup(
+    name = "linker_script",
+    srcs = ["memory.lds"],
+)

@@ -5,6 +5,6 @@ cc_library(
     hdrs = ["OS.hpp"],
     include_prefix = "encore/OS",
     strip_include_prefix = "/third_party/os_abstraction_layer",
-    visibility = ["//visibility:public"],
+    visibility = ["//third_party:__subpackages__"],
     deps = ["//third_party/os_abstraction_layer/Common:common"],
 )

@@ -12,8 +12,8 @@ This mainline covers both cores:
 
 | Core | Cross-toolchain | Bazel platform | Config |
 |---|---|---|---|
-| APU (Cortex-A53) | aarch64-none-elf | `//platforms:apu_a53` | `--config=apu` |
-| RPU (Cortex-R5F) | arm-none-eabi | `//platforms:rpu_r5_0` | `--config=rpu` |
+| APU (Cortex-A53) | aarch64-none-elf | `//sdk/platforms:apu_a53` | firmware macro transition |
+| RPU (Cortex-R5F) | arm-none-eabi | `//sdk/platforms:rpu_r5_0` | firmware macro transition |
 
 ## R5 memory map (runtime)
 
