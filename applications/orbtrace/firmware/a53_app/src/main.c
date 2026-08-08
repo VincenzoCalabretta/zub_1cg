@@ -136,18 +136,33 @@ static void diag_thread_entry(ULONG arg)
             xil_printf("\r\n");
         }
 
-        /* Temporary bring-up diagnostic: raw RX BD ring state. When RXUSED
-         * fires and rx_frames stops advancing, this shows whether software
-         * (rx_tail) and hardware (RXQBASE, and each BD's own NEW/WRAP bits)
-         * actually agree on what's next, or have desynced. */
-        if (rxused_count > 0) {
+        /* Temporary bring-up diagnostic: raw RX BD ring state, printed every
+         * cycle (not just when RXUSED fires) — a new stall signature shows
+         * isr_calls advancing by exactly one extra FRAMERX interrupt with
+         * rx_frames never following (rxused_count staying 0), which the old
+         * rxused_count-gated print never captures. This shows whether
+         * software (rx_tail) and hardware (RXQBASE, and each BD's own
+         * NEW/WRAP bits) actually agree on what's next, or have desynced. */
+        {
             unsigned int bd_rx_tail, rxqbase, rx_bd_base, addr_words[4], stat_words[4];
             gem2_diag_get_rx_bd_dump(&bd_rx_tail, &rxqbase, &rx_bd_base, addr_words, stat_words);
             xil_printf("diag3: rx_tail=%u rxqbase=0x%x rx_bd_base=0x%x rxqbase_slot=%d "
                        "bd0=%x/%x bd1=%x/%x bd2=%x/%x bd3=%x/%x\r\n",
-                       bd_rx_tail, rxqbase, rx_bd_base, (int)((rxqbase - rx_bd_base) / 64),
+                       bd_rx_tail, rxqbase, rx_bd_base, (int)((rxqbase - rx_bd_base) / 16 /* GEM2_BD_STRIDE */),
                        addr_words[0], stat_words[0], addr_words[1], stat_words[1],
                        addr_words[2], stat_words[2], addr_words[3], stat_words[3]);
+        }
+
+        /* Temporary bring-up diagnostic: raw TX BD ring state, once tx_count
+         * has stopped draining (more submitted than completed). */
+        if (tx_count > 0) {
+            unsigned int t_head, t_tail, t_count, txqbase, tx_bd_base, taddr_words[4], tstat_words[4];
+            gem2_diag_get_tx_bd_dump(&t_head, &t_tail, &t_count, &txqbase, &tx_bd_base, taddr_words, tstat_words);
+            xil_printf("diag4: tx_head=%u tx_tail=%u tx_count=%u txqbase=0x%x tx_bd_base=0x%x txqbase_slot=%d "
+                       "bd0=%x/%x bd1=%x/%x bd2=%x/%x bd3=%x/%x\r\n",
+                       t_head, t_tail, t_count, txqbase, tx_bd_base, (int)((txqbase - tx_bd_base) / 16 /* GEM2_BD_STRIDE */),
+                       taddr_words[0], tstat_words[0], taddr_words[1], tstat_words[1],
+                       taddr_words[2], tstat_words[2], taddr_words[3], tstat_words[3]);
         }
     }
 }

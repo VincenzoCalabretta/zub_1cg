@@ -80,11 +80,50 @@ extern void xil_printf(const char *fmt, ...);
  * Restored to GEM2_BD_COUNT now that framing is fixed. */
 #define GEM2_TX_BD_COUNT GEM2_BD_COUNT
 
-/* XEmacPs DMA requires 64-byte aligned BDs */
+/* XEmacPs DMA requires the BD *ring base* to be 64-byte aligned on aarch64
+ * (XEMACPS_DMABD_MINIMUM_ALIGNMENT) — this only constrains the starting
+ * address, used for the per-slot buffer/array alignment attribute and as
+ * the Alignment argument to XEmacPs_BdRingCreate(). */
 #define GEM2_BD_ALIGN    64U
+
+/* The actual byte spacing between consecutive hardware descriptors. Root-
+ * caused on real hardware: XEmacPs_BdRingCreate() (xemacps_bdring.c) always
+ * sets RingPtr->Separation = sizeof(XEmacPs_Bd) — 16 bytes on aarch64
+ * (XEMACPS_BD_NUM_WORDS=4) — regardless of the Alignment parameter passed
+ * in, which only validates the ring's *base* address. Every BD accessor in
+ * this file previously multiplied the slot index by GEM2_BD_ALIGN (64), 4x
+ * the DMA engine's real stride, so only slot 0 ever coincided with a byte
+ * offset the hardware actually walked; slots 1-3 (and the WRAP bit meant
+ * for the ring's last BD) lived in memory the DMA never touched, and the
+ * DMA's internal descriptor pointer instead wrapped back through 4 native
+ * 16-byte descriptors packed inside what software thought was just slot 0's
+ * padding. Confirmed live via a raw RXQBASE dump during a stall: the
+ * register auto-advanced in exact 16-byte steps, never reaching software's
+ * 64-byte-spaced "slot 1" address, and RX died permanently after exactly
+ * one frame on every reflash regardless of PHY tap_sel. */
+#define GEM2_BD_STRIDE   ((u32)sizeof(XEmacPs_Bd))
 
 /* Maximum receive frame size (Ethernet MTU 1500 + 14 header; no FCS) */
 #define GEM2_RX_BUFSIZE  1536U
+
+/* Bytes of dead space the DMA engine writes before each received frame
+ * (NWCFG.RXOFFS below), so the IP header lands 4-byte aligned after the
+ * 14-byte Ethernet header is stripped. Root-caused on real hardware:
+ * _nx_ip_checksum_compute() (nx_ip_checksum_compute.c) casts
+ * nx_packet_prepend_ptr straight to ULONG* and dereferences it — it
+ * requires 4-byte alignment. NX_PACKET pool buffers start 4-aligned, but
+ * this driver wrote received frames flush against that alignment and then
+ * advanced past a 14-byte (2 mod 4) Ethernet header, leaving the IP header
+ * 2 bytes off the boundary NetX's checksum routine assumes. That silently
+ * computed the wrong checksum for every single received IP packet — never
+ * a wire/PHY corruption issue, confirmed by manually recomputing the exact
+ * bytes captured from the DMA buffer in Python and getting a valid
+ * checksum every time NetX's own nx_ip_receive_checksum_errors counter
+ * incremented. RXOFFS makes the DMA insert this many pad bytes before the
+ * frame while keeping the BD's own buffer address itself 4-aligned (the
+ * descriptor format's requirement, since bits[1:0] of that word are
+ * NEW/WRAP flags). */
+#define GEM2_RX_OFFSET   2U
 
 /* Number of TX poll iterations before declaring TX timeout */
 #define GEM2_TX_POLL     500000U
@@ -186,8 +225,26 @@ void gem2_diag_get_rx_bd_dump(u32 *rx_tail, u32 *rxqbase, u32 *rx_bd_base, u32 a
     *rxqbase = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_RXQBASE_OFFSET);
     *rx_bd_base = (u32)(UINTPTR)sCtx.rx_bd;
     for (u32 i = 0U; i < GEM2_BD_COUNT; i++) {
-        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + i * GEM2_BD_ALIGN);
-        Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_ALIGN);
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + i * GEM2_BD_STRIDE);
+        Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_STRIDE);
+        addr_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
+        stat_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_STAT_OFFSET);
+    }
+}
+
+/* Temporary bring-up diagnostic: raw TX BD ring state — same idea as
+ * gem2_diag_get_rx_bd_dump(), for chasing why tx_count stops draining. */
+void gem2_diag_get_tx_bd_dump(u32 *tx_head, u32 *tx_tail, u32 *tx_count, u32 *txqbase, u32 *tx_bd_base,
+                               u32 addr_words[4], u32 stat_words[4])
+{
+    *tx_head = sCtx.tx_head;
+    *tx_tail = sCtx.tx_tail;
+    *tx_count = sCtx.tx_count;
+    *txqbase = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXQBASE_OFFSET);
+    *tx_bd_base = (u32)(UINTPTR)sCtx.tx_bd;
+    for (u32 i = 0U; i < GEM2_TX_BD_COUNT; i++) {
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.tx_bd + i * GEM2_BD_STRIDE);
+        Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_STRIDE);
         addr_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
         stat_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_STAT_OFFSET);
     }
@@ -436,6 +493,10 @@ static void gem2_initialize(NX_IP_DRIVER *req)
     nwcfg &= ~XEMACPS_NWCFG_MDCCLKDIV_MASK;
     nwcfg |= (6U << 18U);                              /* MDC ÷48 */
     nwcfg |= XEMACPS_NWCFG_FDEN_MASK;
+    /* See GEM2_RX_OFFSET: pad every received frame by that many bytes so
+     * the IP header lands 4-byte aligned for NetX's checksum routine. */
+    nwcfg &= ~XEMACPS_NWCFG_RXOFFS_MASK;
+    nwcfg |= (GEM2_RX_OFFSET << 14U);
     XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCFG_OFFSET, nwcfg);
 
     /* The Orbtrace throughput acceptance gate (400 Mbit/s) is unreachable at
@@ -652,8 +713,8 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
     }
 
     /* Set up TX BD */
-    XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.tx_bd + slot * GEM2_BD_ALIGN);
-    memset(bd, 0, GEM2_BD_ALIGN);
+    XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.tx_bd + slot * GEM2_BD_STRIDE);
+    memset(bd, 0, GEM2_BD_STRIDE);
     XEmacPs_BdSetAddressTx(bd, (UINTPTR)(sCtx.tx_buf[slot]));
     XEmacPs_BdWrite(bd, XEMACPS_BD_STAT_OFFSET,
                     (total & 0x3FFFU)       |
@@ -662,7 +723,7 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
                     ((slot == GEM2_TX_BD_COUNT - 1U) ? XEMACPS_TXBUF_WRAP_MASK : 0U));
 
     Xil_DCacheFlushRange((UINTPTR)sCtx.tx_buf[slot], total);
-    Xil_DCacheFlushRange((UINTPTR)bd, GEM2_BD_ALIGN);
+    Xil_DCacheFlushRange((UINTPTR)bd, GEM2_BD_STRIDE);
 
     sCtx.tx_pkts[slot] = pkt;
     sCtx.tx_head = (slot + 1U) % GEM2_TX_BD_COUNT;
@@ -680,9 +741,9 @@ static void gem2_rx_process(void)
 {
     for (u32 i = 0U; i < GEM2_BD_COUNT; i++) {
         u32 slot = sCtx.rx_tail;
-        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + slot * GEM2_BD_ALIGN);
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + slot * GEM2_BD_STRIDE);
 
-        Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_ALIGN);
+        Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_STRIDE);
         u32 addr_word = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
 
         if (!(addr_word & XEMACPS_RXBUF_NEW_MASK)) {
@@ -694,10 +755,11 @@ static void gem2_rx_process(void)
         sCtx.diag_rx_frames++;
 
         NX_PACKET *pkt = sCtx.rx_pkts[slot];
-        Xil_DCacheInvalidateRange((UINTPTR)pkt->nx_packet_prepend_ptr, frame_len);
+        Xil_DCacheInvalidateRange((UINTPTR)pkt->nx_packet_prepend_ptr, GEM2_RX_OFFSET + frame_len);
 
-        /* Determine EtherType (bytes 12–13 of Ethernet header) */
-        u8  *eth  = (u8 *)pkt->nx_packet_prepend_ptr;
+        /* The DMA engine wrote GEM2_RX_OFFSET pad bytes before the actual
+         * frame (NWCFG.RXOFFS) — see GEM2_RX_OFFSET. */
+        u8  *eth  = (u8 *)pkt->nx_packet_prepend_ptr + GEM2_RX_OFFSET;
         u16  etype = (u16)((eth[12] << 8) | eth[13]);
         sCtx.diag_last_etype = etype;
         sCtx.diag_last_len = frame_len;
@@ -708,8 +770,11 @@ static void gem2_rx_process(void)
             memcpy(sCtx.diag_ip_header_dump, eth + NX_ETHERNET_SIZE, dump_len);
         }
 
-        /* Adjust pointers past the Ethernet header */
-        pkt->nx_packet_prepend_ptr += NX_ETHERNET_SIZE;
+        /* Adjust pointers past the pad and the Ethernet header — the result
+         * (GEM2_RX_OFFSET + NX_ETHERNET_SIZE = 16, a multiple of 4) lands
+         * exactly on the IP header, 4-byte aligned as NetX's checksum
+         * routine requires. */
+        pkt->nx_packet_prepend_ptr += GEM2_RX_OFFSET + NX_ETHERNET_SIZE;
         pkt->nx_packet_length       = frame_len - NX_ETHERNET_SIZE;
         pkt->nx_packet_append_ptr   = pkt->nx_packet_prepend_ptr + pkt->nx_packet_length;
 
@@ -738,9 +803,9 @@ static void gem2_tx_cleanup(void)
 {
     while (sCtx.tx_count > 0U) {
         u32 slot = sCtx.tx_tail;
-        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.tx_bd + slot * GEM2_BD_ALIGN);
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.tx_bd + slot * GEM2_BD_STRIDE);
 
-        Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_ALIGN);
+        Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_STRIDE);
         u32 stat = XEmacPs_BdRead(bd, XEMACPS_BD_STAT_OFFSET);
         sCtx.diag_last_tx_stat = stat;
 
@@ -772,7 +837,7 @@ static UINT gem2_alloc_rx_packet(u32 slot)
 
     sCtx.rx_pkts[slot] = pkt;
 
-    XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + slot * GEM2_BD_ALIGN);
+    XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + slot * GEM2_BD_STRIDE);
 
     /* Clear stat word; set BD address with DMA-owns (bit 0 = 0) */
     XEmacPs_BdWrite(bd, XEMACPS_BD_STAT_OFFSET, 0U);
@@ -793,7 +858,7 @@ static UINT gem2_alloc_rx_packet(u32 slot)
      * once, RX silently stalls forever. */
     XEmacPs_BdClearRxNew(bd);
 
-    Xil_DCacheFlushRange((UINTPTR)bd, GEM2_BD_ALIGN);
+    Xil_DCacheFlushRange((UINTPTR)bd, GEM2_BD_STRIDE);
     Xil_DCacheFlushRange((UINTPTR)pkt->nx_packet_prepend_ptr, GEM2_RX_BUFSIZE);
 
     return NX_SUCCESS;
@@ -839,7 +904,7 @@ void gem2_irq_handler(void)
         u32 ctrl = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET);
         XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
                           ctrl & ~XEMACPS_NWCTRL_RXEN_MASK);
-        UINTPTR next_bd = (UINTPTR)(sCtx.rx_bd + sCtx.rx_tail * GEM2_BD_ALIGN);
+        UINTPTR next_bd = (UINTPTR)(sCtx.rx_bd + sCtx.rx_tail * GEM2_BD_STRIDE);
         XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_RXQBASE_OFFSET,
                           (u32)(next_bd & 0xFFFFFFFFU));
 #if defined(__aarch64__)

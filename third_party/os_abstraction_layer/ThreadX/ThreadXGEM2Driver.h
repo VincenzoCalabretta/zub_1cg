@@ -51,6 +51,9 @@ void gem2_diag_get_ip_dump(unsigned char *out40);
 void gem2_diag_get_tx_extra(unsigned int *txused_count, unsigned int *last_txsr);
 void gem2_diag_get_rx_bd_dump(unsigned int *rx_tail, unsigned int *rxqbase, unsigned int *rx_bd_base,
                                unsigned int addr_words[4], unsigned int stat_words[4]);
+void gem2_diag_get_tx_bd_dump(unsigned int *tx_head, unsigned int *tx_tail, unsigned int *tx_count,
+                               unsigned int *txqbase, unsigned int *tx_bd_base,
+                               unsigned int addr_words[4], unsigned int stat_words[4]);
 
 #ifdef __cplusplus
 }
