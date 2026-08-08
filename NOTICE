@@ -62,3 +62,11 @@ Orbtrace-derived protocol behavior
 The files under orbtrace/ model protocol behavior from Orbtrace commit
 e416cd5b074fc725a04cf6b877d458e2074467ae. Orbtrace is distributed under the
 BSD 3-Clause License; copyright remains with the Orbtrace contributors.
+
+Vendor reference documentation
+------------------------------
+Arm processor manuals, AMD/Xilinx technical manuals, and Avnet/Tria board
+guides, schematics, and bills of materials are not distributed by this
+repository and are not covered by its MIT license. `internal/reference_docs/`
+links to the publishers. Local copies and generated text/table extractions are
+ignored and must remain in the access-controlled documentation archive.

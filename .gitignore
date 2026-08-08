@@ -13,3 +13,11 @@ tooling/elf_check/target/
 .Xil/
 *.jou
 vivado*.log
+
+# Vendor reference documents are kept in the private documentation archive.
+docs/*.pdf
+docs/*.PDF
+documentation/pdf/
+internal/reference_docs/*
+!internal/reference_docs/README.md
+internal/documentation/pdf/

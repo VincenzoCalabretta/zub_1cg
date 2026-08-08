@@ -1,13 +1,20 @@
 # PDF documentation conversion
 
-Convert every PDF under `docs/` into agent-readable Markdown:
+This tool converts local PDFs into agent-readable Markdown for private
+engineering use. Vendor PDFs and generated extractions must not be committed
+to the public `zub_1cg` repository.
+
+With the access-controlled documentation repository checked out as a sibling,
+run:
 
 ```bash
-bazel run //internal/docs_tool:pdf_to_markdown -- --clean
+bazel run //internal/docs_tool:pdf_to_markdown -- \
+  --source ../zub_1cg_documentation_private/internal/reference_docs \
+  --output ../zub_1cg_documentation_private/internal/documentation/pdf \
+  --clean
 ```
 
-The generated output lives in `documentation/pdf/` and is intentionally not
-hand edited. Each PDF gets:
+The output is intentionally not hand edited. Each PDF gets:
 
 - `document.md`: layout-preserving text, separated by source page.
 - `tables/<category>.md`: Markdown tables grouped into practical categories
