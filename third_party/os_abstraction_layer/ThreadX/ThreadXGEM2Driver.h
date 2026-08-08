@@ -48,6 +48,7 @@ void gem2_diag_get(unsigned int *rx_frames, unsigned int *tx_frames, unsigned in
                     unsigned int *driver_cmd_count, unsigned int *last_driver_cmd,
                     unsigned int *last_driver_status);
 void gem2_diag_get_ip_dump(unsigned char *out40);
+void gem2_diag_get_tx_extra(unsigned int *txused_count, unsigned int *last_txsr);
 
 #ifdef __cplusplus
 }

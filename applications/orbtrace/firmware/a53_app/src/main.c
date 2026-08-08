@@ -100,12 +100,30 @@ static void diag_thread_entry(ULONG arg)
         gem2_diag_get(&rx_frames, &tx_frames, &isr_calls, &last_etype, &last_len, &tx_complete, &last_tx_stat,
                       &tx_head, &tx_tail, &tx_count, &last_isr, &rxused_count,
                       &driver_cmd_count, &last_driver_cmd, &last_driver_status);
+        unsigned int txused_count, last_txsr;
+        gem2_diag_get_tx_extra(&txused_count, &last_txsr);
         xil_printf("diag: ISR=0x%lx NWSR=0x%lx isr_calls=%u rx_frames=%u tx_frames=%u last_etype=0x%x "
                    "last_len=%u tx_complete=%u last_tx_stat=0x%x tx_head=%u tx_tail=%u tx_count=%u "
-                   "last_isr=0x%x rxused_count=%u drv_cmds=%u last_cmd=%u last_status=%d\r\n",
+                   "last_isr=0x%x rxused_count=%u txused_count=%u last_txsr=0x%x drv_cmds=%u last_cmd=%u last_status=%d\r\n",
                    isr, nwsr, isr_calls, rx_frames, tx_frames, last_etype, last_len,
                    tx_complete, last_tx_stat, tx_head, tx_tail, tx_count, last_isr, rxused_count,
-                   driver_cmd_count, last_driver_cmd, (int)last_driver_status);
+                   txused_count, last_txsr, driver_cmd_count, last_driver_cmd, (int)last_driver_status);
+
+        /* Temporary bring-up diagnostic: NetX's own drop/error counters
+         * (NX_IP_INFO / NX_TCP_INFO are on by default — not disabled
+         * anywhere in this build). If a SYN is received by the driver
+         * (rx_frames increments, last_etype=0x800) but none of these move
+         * and no further driver command follows, the packet is being
+         * silently dropped somewhere between _nx_ip_packet_receive and
+         * _nx_tcp_packet_process without incrementing any of NetX's own
+         * accounting — narrows the search to a specific layer. */
+        xil_printf("diag2: ip_invalid=%lu ip_csum_err=%lu ip_dropped=%lu tcp_invalid=%lu tcp_csum_err=%lu "
+                   "tcp_dropped=%lu tcp_conns=%lu tcp_passive_conns=%lu active_listen=%p\r\n",
+                   ip.nx_ip_invalid_packets, ip.nx_ip_receive_checksum_errors,
+                   ip.nx_ip_receive_packets_dropped, ip.nx_ip_tcp_invalid_packets,
+                   ip.nx_ip_tcp_checksum_errors, ip.nx_ip_tcp_receive_packets_dropped,
+                   ip.nx_ip_tcp_connections, ip.nx_ip_tcp_passive_connections,
+                   (void *)ip.nx_ip_tcp_active_listen_requests);
         if (last_etype == 0x0800) {
             unsigned char ip_dump[40];
             gem2_diag_get_ip_dump(ip_dump);

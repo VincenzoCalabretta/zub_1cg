@@ -420,3 +420,104 @@ until this is resolved. Suggested next steps, in order of likely leverage:
    printed for the last IP-type frame received. Both were useful this
    session and are cheap to keep; remove once the handshake completes and
    they've stopped earning their keep.
+
+## Follow-up session 3. One real TX bug fixed; handshake still blocked, now on an intermittent link-reliability issue
+
+Same request ("implement this report's suggested next steps, get Orbtrace
+running on target"), a later session. Picked up at "Open: TCP handshake
+still does not complete" above.
+
+### Real bug found and fixed: TXSR "used bit read" (TXUSED) was never handled
+
+`XEMACPS_IXR_TXUSED_MASK` (TXSR bit 0, "Tx buffer used bit read" — the
+TX-side mirror of the already-fixed RXUSED) was not enabled in
+`gem2_enable()` and not handled in `gem2_irq_handler()`. Confirmed on real
+hardware: after link-up, TX completes exactly once (the first ARP reply)
+and then stalls forever — `tx_count` grows without bound, `tx_tail` never
+advances, `gem2_tx_cleanup()` never sees another completion, and NetX's
+outbound ARP request to resolve the TCP peer (needed to send a SYN-ACK)
+silently never reaches the driver. This alone explained why ARP sometimes
+appeared to "already work" (the one-time free TX) but nothing after it
+ever did.
+
+First fix attempt caused a live incident on real hardware: reacting to
+every TXUSED by reprogramming the TXQ0 queue pointer to `tx_tail` and
+re-kicking `STARTTX` immediately re-triggered TXUSED and spun into an
+interrupt storm (`isr_calls`/`txused_count` climbing into the millions per
+second, UART output visibly corrupted from CPU starvation). Root cause:
+ZynqMP GEM checks the TXQ1 priority queue before TXQ0 on *every* transmit
+cycle, not just once at reset — the permanently `USED|WRAP` dummy BD parked
+at TXQ1 (see the existing TXQ1 workaround comment in this file) trips
+TXSR's used-bit-read condition on every single legitimate send, which is
+benign and expected, not evidence of a genuine TXQ0 stall. Recovered by
+reflashing (a full JTAG reset) and replaced the handler with a safe,
+storm-free version: acknowledge (read + write-1-to-clear) TXSR and count
+it, but do not touch the queue pointer or re-kick — `gem2_tx_cleanup()`
+(TXCOMPL) and the next `gem2_packet_send()` call are sufficient for the
+normal case. `applications/orbtrace/firmware/a53_app/src/main.c` gained a
+`diag2:` print line exposing NetX's own drop/error counters
+(`nx_ip_invalid_packets`, `nx_ip_receive_checksum_errors`,
+`nx_ip_tcp_checksum_errors`, etc. — live and on by default in this build,
+not disabled anywhere) for exactly this kind of "packet arrived at the
+driver but nothing downstream happened" investigation.
+
+### New finding: the link itself is intermittently unreliable, independent of any code path in this repo
+
+With the TXUSED fix in place, ARP resolution and SYN reception both
+**sometimes** work cleanly end-to-end (confirmed via `ip neigh show`
+reaching `REACHABLE`, and via `diag2`'s raw IP-header dump showing a
+byte-correct, checksum-valid TCP SYN arriving at port 3401) — but not
+reliably. In the same session, on the same flashed image, with no code
+changes in between:
+
+- A 20-ping sweep (`ping -c 20 -i 0.3 192.168.1.50`) came back **100%
+  loss**, "No route to host" (ARP failure) on most sequence numbers.
+- `nx_ip_receive_checksum_errors` (exposed via the new `diag2` line)
+  climbed to 4 over the session from otherwise-ordinary broadcast UDP
+  traffic on the segment — the board is intermittently receiving corrupted
+  frames, not just failing to receive them.
+- `rxused_count` (the RXUSED recovery this session's predecessor already
+  wired up) fired **14 times** in one short burst of ping/connect
+  attempts — RX repeatedly needs mid-stream recovery under load, which is
+  not expected behavior for a solid link.
+- A TCP SYN was confirmed received intact (valid IP header checksum,
+  correct destination port, `diag2`'s TCP-layer counters — invalid/
+  checksum-error/dropped — all stayed at zero) with **zero** further driver
+  activity afterward: no ARP re-resolution attempt, no SYN-ACK send
+  attempt, nothing. The likely explanation tying this together: NetX
+  needed to (re-)resolve ARP for the peer to address the SYN-ACK frame,
+  that resolution attempt was itself lost on the same flaky link, and
+  NetX gave up after exhausting its internal ARP retry count — a failure
+  mode with no counter this session's diagnostics track, several layers
+  removed from the TCP packet processing code actually being watched.
+
+This is consistent with, not a new problem separate from, the original RGMII
+timing/skew concern raised earlier in this report (see "Remaining open
+issue: RGMII TX timing" above, and `gem2_phy_enable_tx_delay()`'s
+KSZ9131RNX DLL bring-up): the link works often enough to look "basically
+fine" in a short test but loses/corrupts frames unpredictably under any
+sustained exchange, at both RX and TX, independent of frame type
+(broadcast UDP, ARP, and TCP SYN were all observed affected on this session
+alone). No further NetX/driver *logic* bug was found or is suspected at
+this point — every packet that arrives intact is handled correctly, and
+the remaining checksum errors on cleanly-parseable frames indicate wire-
+level corruption, not a software miscalculation (manually verified: the
+IP header bytes captured in `diag2`'s dump checksum to zero when computed
+independently in Python for every frame checked this session, including
+the SYN itself).
+
+### Suggested next step
+
+Closing this out for real needs the PHY/RGMII skew characterization the
+original report already flagged as out of reach without an oscilloscope or
+protocol analyzer: either fine-tune `gem2_phy_enable_tx_delay()`'s
+KSZ9131RNX DLL config beyond the current on/off bypass toggle (a manually
+swept fixed `txdll_tap_sel`, MMD 2h register `0x4D` bits `[11:6]`, and/or
+the Clock Pad Skew Register at MMD 2h `0x08`, per DS00002841D §5.3.70), or
+verify PS8-side RGMII delay/skew settings in the Vivado block design
+(`applications/orbtrace/vivado/`) match what the KSZ9131RNX expects given
+whichever DLL bypass configuration is finally settled on. Until then,
+expect the control service to work intermittently rather than reliably —
+this is a hardware signal-integrity issue, not something further changes
+in `applications/orbtrace/firmware/` or `third_party/os_abstraction_layer/`
+are likely to fix.

@@ -136,6 +136,8 @@ typedef struct {
     u32 diag_last_tx_stat;
     u32 diag_last_isr;
     u32 diag_rxused_count;
+    u32 diag_txused_count;
+    u32 diag_last_txsr;
     u32 diag_driver_cmd_count;
     u32 diag_last_driver_cmd;
     u32 diag_last_driver_status;
@@ -165,6 +167,13 @@ void gem2_diag_get(u32 *rx_frames, u32 *tx_frames, u32 *isr_calls, u32 *last_ety
     *last_driver_status = sCtx.diag_last_driver_status;
     *last_isr = sCtx.diag_last_isr;
     *rxused_count = sCtx.diag_rxused_count;
+}
+
+/* Temporary bring-up diagnostic accessor — see main.c's diag_thread_entry. */
+void gem2_diag_get_tx_extra(u32 *txused_count, u32 *last_txsr)
+{
+    *txused_count = sCtx.diag_txused_count;
+    *last_txsr = sCtx.diag_last_txsr;
 }
 
 /* Temporary bring-up diagnostic: copies the last received IP frame's first
@@ -500,16 +509,21 @@ static void gem2_enable(NX_IP_DRIVER *req)
      * gem2_initialize(). */
     gem2_phy_enable_tx_delay(&sCtx.mac);
 
-    /* Enable RX, TX-complete, and RX-buffer-unavailable interrupts in the
-     * MAC. RXUSED must be enabled here, not just handled in the ISR: the
-     * DMA engine halts RX scanning at the hardware level the moment it
-     * finds a descriptor still marked used, regardless of whether that
-     * condition is masked into an interrupt — masking it just means the
-     * CPU is never told the DMA stopped, so gem2_irq_handler() never runs
-     * again and RX goes silently and permanently dead. */
+    /* Enable RX, TX-complete, RX-buffer-unavailable, and TX-buffer-used
+     * interrupts in the MAC. RXUSED/TXUSED must be enabled here, not just
+     * handled in the ISR: the DMA engine halts scanning at the hardware
+     * level the moment it finds a descriptor still marked used, regardless
+     * of whether that condition is masked into an interrupt — masking it
+     * just means the CPU is never told the DMA stopped, so
+     * gem2_irq_handler() never runs again and RX/TX goes silently and
+     * permanently dead. TXUSED (TXSR bit 0, "Tx buffer used bit read") is
+     * the TX-side mirror of RXUSED: confirmed on real hardware that TX
+     * completes exactly once after link-up and then stalls forever with
+     * tx_count growing unboundedly — the same DMA-halts-on-used-bit
+     * behavior seen on RX, just never wired up on the TX side. */
     XEmacPs_IntEnable(&sCtx.mac,
                       XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_TXCOMPL_MASK |
-                      XEMACPS_IXR_RXUSED_MASK);
+                      XEMACPS_IXR_RXUSED_MASK | XEMACPS_IXR_TXUSED_MASK);
 
     req->nx_ip_driver_interface->nx_interface_link_up = NX_TRUE;
     req->nx_ip_driver_status = NX_SUCCESS;
@@ -789,5 +803,27 @@ void gem2_irq_handler(void)
     }
     if (isr & XEMACPS_IXR_TXCOMPL_MASK) {
         gem2_tx_cleanup();
+    }
+    if (isr & XEMACPS_IXR_TXUSED_MASK) {
+        sCtx.diag_txused_count++;
+        /* TXUSED ("Tx buffer used bit read") fires on real hardware every
+         * time the DMA engine's descriptor scan reads the permanently
+         * USED|WRAP "dummy" BD parked at TXQ1 (see the ZynqMP TXQ1
+         * workaround at the top of this file) — ZynqMP GEM checks TXQ1
+         * before TXQ0 on *every* transmit cycle, not just once at reset, so
+         * this is expected and benign on every single send, not evidence of
+         * a genuine stall. Confirmed on real hardware the hard way: an
+         * earlier version of this handler reprogrammed the TXQ0 queue
+         * pointer and re-kicked STARTTX in response to every TXUSED, which
+         * immediately re-triggered the same TXQ1 dummy scan and spun into
+         * an interrupt storm (isr_calls/txused_count climbing into the
+         * millions per second). Just acknowledge TXSR here; do not touch
+         * the queue pointer or re-kick — gem2_tx_cleanup() (TXCOMPL) and
+         * the next gem2_packet_send() call are sufficient for the normal
+         * case, and genuine TX stalls need a distinguishable signal from
+         * TXQ0 specifically, not this shared/aggregate status bit. */
+        u32 txsr = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXSR_OFFSET);
+        sCtx.diag_last_txsr = txsr;
+        XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXSR_OFFSET, txsr);
     }
 }
