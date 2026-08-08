@@ -71,6 +71,16 @@ firmware_elf_test(
 )
 
 firmware_elf_test(
+    name = "orbtrace_a53_app_elf_test",
+    expected_entry = "0x800",
+    expected_machine = "aarch64",
+    expected_memory_range = "0x0:0x80000000",
+    firmware = "//applications/orbtrace/firmware/a53_app:a53_app",
+    firmware_platform = "//sdk/platforms:apu_a53",
+    required_symbols = ["_vector_table"],
+)
+
+firmware_elf_test(
     name = "rpu_hello_world_elf_test",
     expected_entry = "0xffff0140",
     expected_machine = "arm",
@@ -195,6 +205,22 @@ onboard_firmware_test(
     firmware_platform = "//sdk/platforms:apu_a53",
     tags = _HW_TAGS,
     test_script = "apu_eth_loopback_test.sh",
+)
+
+# Confirms the Orbtrace A53 service boots and brings its network stack up;
+# does not itself talk to it over TCP (see //tests:orbtrace_throughput_test,
+# which requires the host's Ethernet interface on 192.168.1.0/24).
+onboard_firmware_test(
+    name = "orbtrace_a53_app_test",
+    data = [
+        "//sdk/boards/zub_1cg:bitstream",
+        "//sdk/boards/zub_1cg:psu_init",
+        "//tooling/zub_ctl",
+    ],
+    firmware = "//applications/orbtrace/firmware/a53_app:a53_app",
+    firmware_platform = "//sdk/platforms:apu_a53",
+    tags = _HW_TAGS,
+    test_script = "orbtrace_a53_app_test.sh",
 )
 
 # ── Flash/RAM size budget tests (ZUB-032) ─────────────────────────────────────

@@ -46,6 +46,9 @@
 #include "xil_cache.h"
 #include "xparameters.h"
 
+/* Temporary bring-up instrumentation (see gem2_initialize/gem2_enable). */
+extern void xil_printf(const char *fmt, ...);
+
 /* Ethernet protocol constants — not exported by NetX public headers;
  * defined locally following the pattern in nx_ram_network_driver.c. */
 #ifndef NX_ETHERNET_IP
@@ -113,9 +116,32 @@ typedef struct {
     u32 rx_tail;
 
     UINT initialized;
+
+    /* Temporary bring-up diagnostics: total frames the ISR path has
+     * actually processed, independent of any raw register snapshot. */
+    u32 diag_rx_frames;
+    u32 diag_tx_frames;
+    u32 diag_isr_calls;
+    u32 diag_last_etype;
+    u32 diag_last_len;
+    u32 diag_tx_complete;
+    u32 diag_last_tx_stat;
 } Gem2Ctx;
 
 static Gem2Ctx sCtx;
+
+/* Temporary bring-up diagnostic accessor — see main.c's diag_thread_entry. */
+void gem2_diag_get(u32 *rx_frames, u32 *tx_frames, u32 *isr_calls, u32 *last_etype, u32 *last_len,
+                    u32 *tx_complete, u32 *last_tx_stat)
+{
+    *rx_frames = sCtx.diag_rx_frames;
+    *tx_frames = sCtx.diag_tx_frames;
+    *isr_calls = sCtx.diag_isr_calls;
+    *last_etype = sCtx.diag_last_etype;
+    *last_len = sCtx.diag_last_len;
+    *tx_complete = sCtx.diag_tx_complete;
+    *last_tx_stat = sCtx.diag_last_tx_stat;
+}
 
 /* ── Forward declarations ──────────────────────────────────────────────── */
 static void gem2_initialize(NX_IP_DRIVER *req);
@@ -125,6 +151,135 @@ static void gem2_packet_send(NX_IP_DRIVER *req);
 static void gem2_rx_process(void);
 static void gem2_tx_cleanup(void);
 static UINT gem2_alloc_rx_packet(u32 slot);
+static void gem2_phy_enable_tx_delay(XEmacPs *mac);
+
+/* ── KSZ9131 PHY bring-up: enable the TXC internal DLL delay ─────────────
+ *
+ * Per Microchip KSZ9131RNX datasheet DS00002841D §4.9.3.1: the RXC delay
+ * DLL is enabled by default, but the TXC delay DLL is *disabled* by
+ * default (bypass_txdll = 1 in the TX DLL Control Register, MMD device
+ * 2h / register 0x4Dh, §5.3.70). With no PS8-side compensating delay
+ * either, RGMII TXC/TXD timing at the PHY's sampling latches is unmet:
+ * the GEM's own TX DMA reports every descriptor complete (it only tracks
+ * its own AXI-side work, not what the PHY does with the bits), but the
+ * PHY never latches a decodable frame, so nothing reaches the wire. RX is
+ * unaffected because the PHY's RXC delay needs no cooperation from the
+ * MAC side. Confirmed by direct-register MDIO scan and packet capture in
+ * this session — see ORBTRACE_TEST_REPORT follow-up notes.
+ *
+ * MDIO indirect MMD access follows the standard IEEE 802.3 clause 22.2.4.3
+ * two-register procedure at direct registers 0Dh (MMD Access Control) /
+ * 0Eh (MMD Access Address/Data Register), per §5.3 of the same datasheet.
+ */
+#define KSZ9131_PHY_ID1              0x0022U
+#define KSZ9131_MMD_CTRL_REG         0x0DU
+#define KSZ9131_MMD_DATA_REG         0x0EU
+#define KSZ9131_MMD_FUNC_ADDR        0x0000U
+#define KSZ9131_MMD_FUNC_DATA        0x4000U
+#define KSZ9131_MMD_DEV_PCS_EXT      0x02U
+#define KSZ9131_RX_DLL_CTRL_REG      0x4CU
+#define KSZ9131_BYPASS_RXDLL_BIT     (1U << 12)
+#define KSZ9131_RXDLL_RESET_BIT      (1U << 13)
+#define KSZ9131_TX_DLL_CTRL_REG      0x4DU
+#define KSZ9131_BYPASS_TXDLL_BIT     (1U << 12)
+#define KSZ9131_TXDLL_RESET_BIT      (1U << 13)
+
+static UINT gem2_phy_find(XEmacPs *mac, u32 *phy_addr)
+{
+    for (u32 addr = 0U; addr < 32U; addr++) {
+        u16 id1 = 0U;
+        if (XEmacPs_PhyRead(mac, addr, 2U, &id1) == XST_SUCCESS && id1 == KSZ9131_PHY_ID1) {
+            *phy_addr = addr;
+            return XST_SUCCESS;
+        }
+    }
+    return XST_FAILURE;
+}
+
+static void gem2_mmd_select(XEmacPs *mac, u32 phy_addr, u16 mmd_dev, u16 reg)
+{
+    XEmacPs_PhyWrite(mac, phy_addr, KSZ9131_MMD_CTRL_REG, KSZ9131_MMD_FUNC_ADDR | mmd_dev);
+    XEmacPs_PhyWrite(mac, phy_addr, KSZ9131_MMD_DATA_REG, reg);
+    XEmacPs_PhyWrite(mac, phy_addr, KSZ9131_MMD_CTRL_REG, KSZ9131_MMD_FUNC_DATA | mmd_dev);
+}
+
+static u16 gem2_mmd_read(XEmacPs *mac, u32 phy_addr, u16 mmd_dev, u16 reg)
+{
+    u16 value = 0U;
+    gem2_mmd_select(mac, phy_addr, mmd_dev, reg);
+    XEmacPs_PhyRead(mac, phy_addr, KSZ9131_MMD_DATA_REG, &value);
+    return value;
+}
+
+static void gem2_mmd_write(XEmacPs *mac, u32 phy_addr, u16 mmd_dev, u16 reg, u16 value)
+{
+    gem2_mmd_select(mac, phy_addr, mmd_dev, reg);
+    XEmacPs_PhyWrite(mac, phy_addr, KSZ9131_MMD_DATA_REG, value);
+}
+
+static void gem2_mmd_reset_pulse(XEmacPs *mac, u32 phy_addr, u16 reg, u16 value, u16 reset_bit)
+{
+    gem2_mmd_write(mac, phy_addr, KSZ9131_MMD_DEV_PCS_EXT, reg, value);
+    /* "These bits are not self-clearing and must be set then reset by
+     * software" (§4.9.3.1) — pulse *dll_reset after changing DLL config. */
+    gem2_mmd_write(mac, phy_addr, KSZ9131_MMD_DEV_PCS_EXT, reg, (u16)(value | reset_bit));
+    gem2_mmd_write(mac, phy_addr, KSZ9131_MMD_DEV_PCS_EXT, reg, value);
+}
+
+static void gem2_phy_enable_tx_delay(XEmacPs *mac)
+{
+    u32 phy_addr;
+    if (gem2_phy_find(mac, &phy_addr) != XST_SUCCESS) {
+        xil_printf("gem2: PHY not found on MDIO bus\r\n");
+        return;
+    }
+
+    /* The PHY chip is not reset by JTAG/PS resets — only by a full board
+     * power cycle — so its register state can carry over from an earlier
+     * run (bit us once this session: bypass_rxdll left set from a control
+     * experiment persisted across several reflashes). Deterministically
+     * set both RX and TX DLL bypass bits explicitly rather than assuming
+     * either is at its power-on default. */
+    u16 rx_before = gem2_mmd_read(mac, phy_addr, KSZ9131_MMD_DEV_PCS_EXT, KSZ9131_RX_DLL_CTRL_REG);
+    u16 rx_enabled = (u16)(rx_before & ~KSZ9131_BYPASS_RXDLL_BIT);
+    gem2_mmd_reset_pulse(mac, phy_addr, KSZ9131_RX_DLL_CTRL_REG, rx_enabled, KSZ9131_RXDLL_RESET_BIT);
+
+    u16 before = gem2_mmd_read(mac, phy_addr, KSZ9131_MMD_DEV_PCS_EXT, KSZ9131_TX_DLL_CTRL_REG);
+    u16 enabled = (u16)(before & ~KSZ9131_BYPASS_TXDLL_BIT);
+    gem2_mmd_reset_pulse(mac, phy_addr, KSZ9131_TX_DLL_CTRL_REG, enabled, KSZ9131_TXDLL_RESET_BIT);
+
+    u16 rx_after = gem2_mmd_read(mac, phy_addr, KSZ9131_MMD_DEV_PCS_EXT, KSZ9131_RX_DLL_CTRL_REG);
+    u16 after = gem2_mmd_read(mac, phy_addr, KSZ9131_MMD_DEV_PCS_EXT, KSZ9131_TX_DLL_CTRL_REG);
+    xil_printf("gem2: PHY@%lu RX DLL before=0x%x after=0x%x, TX DLL before=0x%x after=0x%x\r\n",
+               (unsigned long)phy_addr, rx_before, rx_after, before, after);
+
+    /* IEEE clause-22 PHYs commonly only re-apply internal timing config at
+     * link (re)establishment; force one via BMCR so the new DLL settings
+     * are live from link-up rather than hot-swapped under an already-
+     * established link the PHY never re-timed. */
+    u16 bmcr = 0U;
+    XEmacPs_PhyRead(mac, phy_addr, 0U, &bmcr);
+    XEmacPs_PhyWrite(mac, phy_addr, 0U, (u16)(bmcr | (1U << 9))); /* Restart Auto-Negotiation */
+
+    UINT waited;
+    u16 bmsr = 0U;
+    /* IEEE 802.3 clause 28 auto-negotiation commonly takes 1-3s to
+     * complete; the per-iteration spin duration here is uncalibrated, so
+     * this loop is sized generously rather than to a specific wall-clock
+     * target. No scheduler is running yet (this runs from
+     * tx_application_define(), before tx_kernel_enter() starts it), so
+     * tx_thread_sleep() isn't usable here. */
+    for (waited = 0U; waited < 5000U; waited++) {
+        XEmacPs_PhyRead(mac, phy_addr, 1U, &bmsr);
+        if (bmsr & (1U << 2)) { /* Link Status */
+            break;
+        }
+        for (volatile u32 spin = 0U; spin < 200000U; spin++) {
+        }
+    }
+    xil_printf("gem2: PHY@%lu link renegotiated iter=%u BMSR=0x%x\r\n",
+               (unsigned long)phy_addr, (unsigned)waited, bmsr);
+}
 
 /* ── Driver entry point ────────────────────────────────────────────────── */
 
@@ -142,6 +297,12 @@ void nx_driver_gem2(NX_IP_DRIVER *req)
             break;
         case NX_LINK_PACKET_SEND:
         case NX_LINK_PACKET_BROADCAST:
+        /* ARP/RARP request and ARP-response transmission use dedicated
+         * commands (see nx_arp_packet_receive.c, nx_arp_packet_send.c) —
+         * all are just "transmit this already-built packet" to the driver. */
+        case NX_LINK_ARP_SEND:
+        case NX_LINK_ARP_RESPONSE_SEND:
+        case NX_LINK_RARP_SEND:
             gem2_packet_send(req);
             break;
         case NX_LINK_MULTICAST_JOIN:
@@ -176,10 +337,18 @@ static void gem2_initialize(NX_IP_DRIVER *req)
 
     /* 1. Init XEmacPs driver */
     XEmacPs_Config *cfg = XEmacPs_LookupConfig(XPAR_XEMACPS_0_BASEADDR);
-    if (!cfg) { req->nx_ip_driver_status = NX_NOT_SUCCESSFUL; return; }
+    if (!cfg) {
+        xil_printf("gem2: XEmacPs_LookupConfig failed\r\n");
+        req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
+        return;
+    }
 
     rc = XEmacPs_CfgInitialize(&sCtx.mac, cfg, cfg->BaseAddress);
-    if (rc != XST_SUCCESS) { req->nx_ip_driver_status = NX_NOT_SUCCESSFUL; return; }
+    if (rc != XST_SUCCESS) {
+        xil_printf("gem2: XEmacPs_CfgInitialize failed rc=%ld\r\n", rc);
+        req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
+        return;
+    }
 
     /* 2. Configure MAC speed, disable all MAC interrupts (polled init) */
     XEmacPs_IntDisable(&sCtx.mac, 0x7FFFFFFFU);
@@ -187,8 +356,17 @@ static void gem2_initialize(NX_IP_DRIVER *req)
     u32 nwcfg = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCFG_OFFSET);
     nwcfg &= ~XEMACPS_NWCFG_MDCCLKDIV_MASK;
     nwcfg |= (6U << 18U);                              /* MDC ÷48 */
-    nwcfg |= XEMACPS_NWCFG_100_MASK | XEMACPS_NWCFG_FDEN_MASK;
+    nwcfg |= XEMACPS_NWCFG_FDEN_MASK;
     XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCFG_OFFSET, nwcfg);
+
+    /* The Orbtrace throughput acceptance gate (400 Mbit/s) is unreachable at
+     * 100 Mbps, so this driver runs the link at Gigabit unconditionally
+     * rather than negotiating a rate from the PHY over MDIO. Sets both the
+     * NWCFG speed/1000 bits and the GEM_CLK_CTRL reference-clock divisors
+     * for 1000 Mbps (the divisors for 10/100 Mbps differ and are wrong for
+     * a Gigabit link partner). A link partner that cannot do Gigabit will
+     * not connect. */
+    XEmacPs_SetOperatingSpeed(&sCtx.mac, 1000U);
 
     /* 3. Set MAC options */
     rc = XEmacPs_SetOptions(&sCtx.mac,
@@ -211,22 +389,32 @@ static void gem2_initialize(NX_IP_DRIVER *req)
             &XEmacPs_GetTxRing(&sCtx.mac),
             (UINTPTR)sCtx.tx_bd, (UINTPTR)sCtx.tx_bd,
             GEM2_BD_ALIGN, GEM2_BD_COUNT);
-    if (rc != XST_SUCCESS) { req->nx_ip_driver_status = NX_NOT_SUCCESSFUL; return; }
+    if (rc != XST_SUCCESS) {
+        xil_printf("gem2: TX BdRingCreate failed rc=%ld\r\n", rc);
+        req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
+        return;
+    }
 
     /* 6. RX BD ring */
     rc = XEmacPs_BdRingCreate(
             &XEmacPs_GetRxRing(&sCtx.mac),
             (UINTPTR)sCtx.rx_bd, (UINTPTR)sCtx.rx_bd,
             GEM2_BD_ALIGN, GEM2_BD_COUNT);
-    if (rc != XST_SUCCESS) { req->nx_ip_driver_status = NX_NOT_SUCCESSFUL; return; }
+    if (rc != XST_SUCCESS) {
+        xil_printf("gem2: RX BdRingCreate failed rc=%ld\r\n", rc);
+        req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
+        return;
+    }
 
     /* 7. Pre-allocate RX packets and point BDs at their data areas */
     for (i = 0U; i < GEM2_BD_COUNT; i++) {
         if (gem2_alloc_rx_packet(i) != NX_SUCCESS) {
+            xil_printf("gem2: RX packet alloc failed at slot %lu\r\n", (unsigned long)i);
             req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
             return;
         }
     }
+    xil_printf("gem2: initialize OK\r\n");
 
     /* 8. ZynqMP TXQ1 dummy BD — park a USED+WRAP sentinel so the DMA skips
      *    priority queue 1 and falls through to our real frames on queue 0.
@@ -251,7 +439,11 @@ static void gem2_initialize(NX_IP_DRIVER *req)
 
 static void gem2_enable(NX_IP_DRIVER *req)
 {
-    if (!sCtx.initialized) { req->nx_ip_driver_status = NX_NOT_SUCCESSFUL; return; }
+    if (!sCtx.initialized) {
+        xil_printf("gem2: enable called before initialize\r\n");
+        req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
+        return;
+    }
 
     /* Point HW at BD rings (required for ZynqMP GEM) */
     XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sCtx.tx_q1_dummy, 1U, 1U);
@@ -260,12 +452,21 @@ static void gem2_enable(NX_IP_DRIVER *req)
 
     XEmacPs_Start(&sCtx.mac);
 
+    /* MDIO (management port) is only live once XEmacPs_Start() has set
+     * NWCTRL's MPE bit, so the PHY fix must run after Start(), not in
+     * gem2_initialize(). */
+    gem2_phy_enable_tx_delay(&sCtx.mac);
+
     /* Enable RX and TX complete interrupts in the MAC */
     XEmacPs_IntEnable(&sCtx.mac,
                       XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_TXCOMPL_MASK);
 
     req->nx_ip_driver_interface->nx_interface_link_up = NX_TRUE;
     req->nx_ip_driver_status = NX_SUCCESS;
+    xil_printf("gem2: enable OK, NWCTRL=0x%lx NWCFG=0x%lx NWSR=0x%lx\r\n",
+               (unsigned long)XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET),
+               (unsigned long)XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCFG_OFFSET),
+               (unsigned long)XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWSR_OFFSET));
 }
 
 /* ── LINK_DISABLE ──────────────────────────────────────────────────────── */
@@ -320,6 +521,7 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
     sCtx.tx_pkts[slot] = pkt;
     sCtx.tx_head = (slot + 1U) % GEM2_BD_COUNT;
     sCtx.tx_count++;
+    sCtx.diag_tx_frames++;
 
     XEmacPs_Transmit(&sCtx.mac);  /* set STARTTX in NWCTRL */
 
@@ -343,6 +545,7 @@ static void gem2_rx_process(void)
 
         u32 stat_word = XEmacPs_BdRead(bd, XEMACPS_BD_STAT_OFFSET);
         u32 frame_len = stat_word & XEMACPS_RXBUF_LEN_MASK;
+        sCtx.diag_rx_frames++;
 
         NX_PACKET *pkt = sCtx.rx_pkts[slot];
         Xil_DCacheInvalidateRange((UINTPTR)pkt->nx_packet_prepend_ptr, frame_len);
@@ -350,6 +553,8 @@ static void gem2_rx_process(void)
         /* Determine EtherType (bytes 12–13 of Ethernet header) */
         u8  *eth  = (u8 *)pkt->nx_packet_prepend_ptr;
         u16  etype = (u16)((eth[12] << 8) | eth[13]);
+        sCtx.diag_last_etype = etype;
+        sCtx.diag_last_len = frame_len;
 
         /* Adjust pointers past the Ethernet header */
         pkt->nx_packet_prepend_ptr += NX_ETHERNET_SIZE;
@@ -385,10 +590,12 @@ static void gem2_tx_cleanup(void)
 
         Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_ALIGN);
         u32 stat = XEmacPs_BdRead(bd, XEMACPS_BD_STAT_OFFSET);
+        sCtx.diag_last_tx_stat = stat;
 
         if (!(stat & XEMACPS_TXBUF_USED_MASK)) {
             break;  /* DMA still owns this BD */
         }
+        sCtx.diag_tx_complete++;
 
         /* Release the associated NX_PACKET */
         if (sCtx.tx_pkts[slot]) {
@@ -436,6 +643,7 @@ static UINT gem2_alloc_rx_packet(u32 slot)
 void gem2_irq_handler(void)
 {
     if (!sCtx.initialized) { return; }
+    sCtx.diag_isr_calls++;
 
     u32 isr = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_ISR_OFFSET);
 

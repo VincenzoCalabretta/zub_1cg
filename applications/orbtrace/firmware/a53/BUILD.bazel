@@ -1,8 +1,13 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library", "rust_test")
+
+_SRCS = [
+    "src/lib.rs",
+    "src/ffi.rs",
+]
 
 rust_library(
     name = "control_firmware",
-    srcs = ["src/lib.rs"],
+    srcs = _SRCS,
     crate_name = "orbtrace_a53_firmware",
     edition = "2021",
     visibility = ["//visibility:public"],
@@ -12,4 +17,22 @@ rust_library(
 rust_test(
     name = "control_firmware_test",
     crate = ":control_firmware",
+)
+
+# Linked into applications/orbtrace/firmware/a53_app via a53_firmware's `deps`.
+# `-C panic=abort` is required: crate_type=staticlib resolves lang items at
+# this compilation (there is no further Rust link stage to defer to), and
+# without an unwinder rustc otherwise looks for `eh_personality`.
+rust_static_library(
+    name = "control_firmware_a53",
+    srcs = _SRCS,
+    crate_name = "orbtrace_a53_firmware",
+    edition = "2021",
+    rustc_flags = ["-Cpanic=abort"],
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//visibility:public"],
+    deps = ["//applications/orbtrace/firmware/common:firmware_common"],
 )

@@ -1,7 +1,7 @@
 # Vivado 2023.2 batch entry point. Run from any directory:
-# vivado -mode batch -source orbtrace/vivado/build.tcl
+# vivado -mode batch -source applications/orbtrace/vivado/build.tcl
 set script_dir [file dirname [file normalize [info script]]]
-set repo_dir [file normalize [file join $script_dir ../..]]
+set repo_dir [file normalize [file join $script_dir ../../..]]
 set output_dir [file join $repo_dir bazel-out orbtrace-vivado]
 file mkdir $output_dir
 
@@ -9,11 +9,11 @@ create_project -force zub_orbtrace $output_dir -part xczu1cg-sbva484-1-e
 set_property target_language Verilog [current_project]
 set_property simulator_language Mixed [current_project]
 
-foreach source [glob [file join $repo_dir orbtrace rtl *.sv]] { read_verilog -sv $source }
-foreach source [glob [file join $repo_dir orbtrace rtl *.v]] { read_verilog $source }
-add_files -norecurse [file join $repo_dir orbtrace rtl orbtrace_regs.svh]
+foreach source [glob [file join $repo_dir applications orbtrace rtl *.sv]] { read_verilog -sv $source }
+foreach source [glob [file join $repo_dir applications orbtrace rtl *.v]] { read_verilog $source }
+add_files -norecurse [file join $repo_dir applications orbtrace rtl orbtrace_regs.svh]
 set_property file_type {Verilog Header} [get_files orbtrace_regs.svh]
-set_property include_dirs [list [file join $repo_dir orbtrace rtl]] [get_filesets sources_1]
+set_property include_dirs [list [file join $repo_dir applications orbtrace rtl]] [get_filesets sources_1]
 read_xdc [file join $script_dir orbtrace.xdc]
 source [file join $script_dir create_bd.tcl]
 

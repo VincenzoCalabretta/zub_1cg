@@ -3,10 +3,17 @@
 Downloaded and injected by netxduo_extension in extensions.bzl.
 Paths are relative to the NetX Duo repo root.
 
-Only the core IP stack (nx_*/nxd_* in common/src) and the cortex_a7/gnu port
-are compiled here.  NetX Duo ships no cortex_a53 port; cortex_a7/gnu is the
-closest AArch32/AArch64-compatible GNU port and nx_port.h is pure C defines.
-Protocol add-ons (HTTP, FTP, MQTT, TLS, etc.) in addons/ are excluded.
+Only the core IP stack (nx_*/nxd_*/nxe_* in common/src) and the cortex_a7/gnu
+port are compiled here.  NetX Duo ships no cortex_a53 port; cortex_a7/gnu is
+the closest AArch32/AArch64-compatible GNU port and nx_port.h is pure C
+defines. Protocol add-ons (HTTP, FTP, MQTT, TLS, etc.) in addons/ are
+excluded.
+
+`nxe_*.c` are the public API's error-checking wrapper definitions
+(`_nxe_ip_create` etc.) — separate translation units from their `_nx_*`
+implementations, unconditionally compiled upstream regardless of whether a
+consumer defines NX_DISABLE_ERROR_CHECKING. `nx_*.c` alone (matching neither
+`nxd_` nor `nxe_`) omits all 132 of them.
 """
 
 cc_library(
@@ -15,6 +22,7 @@ cc_library(
         [
             "common/src/nx_*.c",
             "common/src/nxd_*.c",
+            "common/src/nxe_*.c",
         ],
     ),
     hdrs = glob([

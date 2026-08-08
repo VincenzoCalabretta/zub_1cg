@@ -1,0 +1,49 @@
+"""Rust cross toolchain for aarch64 bare-metal targets (APU A53, no_std).
+
+rules_rust 0.62.0's `rust` extension does not include `aarch64-unknown-none`
+in its supported-triple table, so `rust.toolchain(extra_target_triples = ...)`
+cannot fetch a matching rust-std for it. This package wires a manual
+rust_toolchain instead:
+  - rustc / rustc_lib / cargo / rustdoc come from the host 1.86.0 toolchain
+    already registered in MODULE.bazel (rustc itself can cross-compile;
+    only the target's precompiled core/alloc rlibs were missing), and
+  - rust_std comes from @rust_std_aarch64_unknown_none, the vendored
+    rust-std-1.86.0-aarch64-unknown-none component fetched in MODULE.bazel.
+"""
+
+load("@rules_rust//rust:toolchain.bzl", "rust_toolchain")
+
+_HOST_TOOLS = "@rust_linux_x86_64__x86_64-unknown-linux-gnu__stable_tools"
+
+rust_toolchain(
+    name = "aarch64_unknown_none_toolchain_impl",
+    rustc = _HOST_TOOLS + "//:rustc",
+    rustc_lib = _HOST_TOOLS + "//:rustc_lib",
+    rust_doc = _HOST_TOOLS + "//:rustdoc",
+    cargo = _HOST_TOOLS + "//:cargo",
+    rust_std = "@rust_std_aarch64_unknown_none//:rust_std-aarch64-unknown-none",
+    binary_ext = "",
+    staticlib_ext = ".a",
+    dylib_ext = ".so",
+    stdlib_linkflags = [],
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_triple = "aarch64-unknown-none",
+    default_edition = "2021",
+    visibility = ["//visibility:public"],
+    tags = ["rust_version=1.86.0"],
+)
+
+toolchain(
+    name = "aarch64_unknown_none_toolchain",
+    exec_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    toolchain = ":aarch64_unknown_none_toolchain_impl",
+    toolchain_type = "@rules_rust//rust:toolchain",
+    visibility = ["//visibility:public"],
+)

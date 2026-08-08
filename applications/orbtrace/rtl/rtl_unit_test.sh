@@ -2,7 +2,7 @@
 set -euo pipefail
 
 : "${XILINX_VIVADO:?set XILINX_VIVADO to the Vivado installation directory}"
-rtl_dir="${TEST_SRCDIR}/${TEST_WORKSPACE}/orbtrace/rtl"
+rtl_dir="${TEST_SRCDIR}/${TEST_WORKSPACE}/applications/orbtrace/rtl"
 work_dir="${TEST_TMPDIR}/orbtrace-xsim"
 mkdir -p "${work_dir}"
 cd "${work_dir}"

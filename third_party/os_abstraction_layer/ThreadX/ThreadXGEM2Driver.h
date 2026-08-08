@@ -35,6 +35,15 @@ void nx_driver_gem2(NX_IP_DRIVER *driver_req_ptr);
  */
 void gem2_irq_handler(void);
 
+/**
+ * @brief Temporary bring-up diagnostic: cumulative RX frames processed, TX
+ * frames submitted, and GEM2 ISR invocations since gem2_initialize().
+ * Not part of the stable driver API.
+ */
+void gem2_diag_get(unsigned int *rx_frames, unsigned int *tx_frames, unsigned int *isr_calls,
+                    unsigned int *last_etype, unsigned int *last_len,
+                    unsigned int *tx_complete, unsigned int *last_tx_stat);
+
 #ifdef __cplusplus
 }
 #endif

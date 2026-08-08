@@ -7,7 +7,8 @@
 #   BITSTREAM — path to the PL bitstream (.bit)
 #
 # The PSINIT and BITSTREAM defaults point to the in-repo copies under
-# board/zub_1cg/.  Override them if you have board-specific variants.
+# sdk/boards/zub_1cg/.  Override them if you have board-specific variants
+# (e.g. a different PL design's bitstream, such as Orbtrace's).
 set -euo pipefail
 
 # Resolve the workspace root: when called via `bazel run`, $BUILD_WORKSPACE_DIRECTORY
@@ -15,8 +16,8 @@ set -euo pipefail
 WORKSPACE_ROOT="${BUILD_WORKSPACE_DIRECTORY:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 XSCT="${XSCT:-/mnt/data/xilinx/Vitis/2023.2/bin/xsct}"
-PSINIT="${PSINIT:-${WORKSPACE_ROOT}/board/zub_1cg/psu_init.tcl}"
-BITSTREAM="${BITSTREAM:-${WORKSPACE_ROOT}/board/zub_1cg/design_1_wrapper.bit}"
+PSINIT="${PSINIT:-${WORKSPACE_ROOT}/sdk/boards/zub_1cg/psu_init.tcl}"
+BITSTREAM="${BITSTREAM:-${WORKSPACE_ROOT}/sdk/boards/zub_1cg/design_1_wrapper.bit}"
 ELF="${1:?Usage: jtag_flash.sh <path-to-elf>}"
 
 if [[ ! -x "$XSCT" ]]; then

@@ -1,0 +1,18 @@
+load("//sdk/rules:defs.bzl", "a53_firmware")
+
+a53_firmware(
+    name = "a53_app",
+    srcs = [
+        "src/main.c",
+        "src/platform.c",
+        "src/platform.h",
+        "src/xuartps_hw.c",
+    ],
+    bsp = "//sdk/bsp/apu:bsp",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//applications/orbtrace/firmware/a53:control_firmware_a53",
+        "//sdk/rtos:threadx_a53",
+        "//third_party/os_abstraction_layer/ThreadX:threadx_gem2_drv",
+    ],
+)

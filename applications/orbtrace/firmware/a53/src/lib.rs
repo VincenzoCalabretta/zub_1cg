@@ -4,6 +4,21 @@ use orbtrace_firmware_common::{
     FrameDecoder, FrameError, MAX_CONTROL_PAYLOAD, MAX_DAP_PACKET, PROTOCOL_VERSION,
 };
 
+mod ffi;
+
+// The `#[panic_handler]` lang item must be resolved inside whichever crate is
+// compiled as the final `staticlib` artifact (this one) rather than deferred
+// to a downstream Rust binary, since no further Rust linking happens after
+// that point. `-C panic=abort` on the rust_static_library target means no
+// eh_personality/unwinding lang items are needed alongside it. Host unit
+// tests link against std, which supplies its own handler, so this is only
+// compiled into the on-target artifact.
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
 pub const ORBTRACE_AXI_BASE: usize = 0xa000_0000;
 pub const AXI_DMA_BASE: usize = 0xa001_0000;
 const REG_CONTROL: usize = 0x08;
