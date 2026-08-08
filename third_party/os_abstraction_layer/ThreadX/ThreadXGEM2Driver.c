@@ -176,6 +176,23 @@ void gem2_diag_get_tx_extra(u32 *txused_count, u32 *last_txsr)
     *last_txsr = sCtx.diag_last_txsr;
 }
 
+/* Temporary bring-up diagnostic: raw RX BD ring state (all GEM2_BD_COUNT
+ * descriptors' ADDR/STAT words), software's rx_tail, and the hardware's own
+ * RXQBASE register — to see directly whether software and hardware agree
+ * on which descriptor is "next" when RXUSED gets stuck. */
+void gem2_diag_get_rx_bd_dump(u32 *rx_tail, u32 *rxqbase, u32 *rx_bd_base, u32 addr_words[4], u32 stat_words[4])
+{
+    *rx_tail = sCtx.rx_tail;
+    *rxqbase = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_RXQBASE_OFFSET);
+    *rx_bd_base = (u32)(UINTPTR)sCtx.rx_bd;
+    for (u32 i = 0U; i < GEM2_BD_COUNT; i++) {
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + i * GEM2_BD_ALIGN);
+        Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_ALIGN);
+        addr_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
+        stat_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_STAT_OFFSET);
+    }
+}
+
 /* Temporary bring-up diagnostic: copies the last received IP frame's first
  * 40 bytes (past the Ethernet header) so it can be dumped over UART and
  * compared byte-for-byte against a host-side capture. */
@@ -809,13 +826,26 @@ void gem2_irq_handler(void)
          * whatever the hardware pointer already was) does not bring it
          * back in sync, and RXUSED keeps re-firing forever. Re-pointing the
          * RX queue base at software's current rx_tail slot forces the DMA
-         * engine to resume from a position we know is actually free. */
+         * engine to resume from a position we know is actually free.
+         *
+         * XEmacPs_SetQueuePtr() itself cannot be used here: it silently
+         * no-ops ("if already started, then there is nothing to do") once
+         * XEmacPs_Start() has run, which it always has by the time RXUSED
+         * can fire. Every past invocation of this recovery path (since it
+         * was added) has therefore done nothing at all — confirmed on real
+         * hardware via a raw RXQBASE dump during a stall, which never moved
+         * off its post-Start() value. Write the same two registers that
+         * function would have written, directly, bypassing the guard. */
         u32 ctrl = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET);
         XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
                           ctrl & ~XEMACPS_NWCTRL_RXEN_MASK);
-        XEmacPs_SetQueuePtr(&sCtx.mac,
-                            (UINTPTR)(sCtx.rx_bd + sCtx.rx_tail * GEM2_BD_ALIGN),
-                            0U, 0U);
+        UINTPTR next_bd = (UINTPTR)(sCtx.rx_bd + sCtx.rx_tail * GEM2_BD_ALIGN);
+        XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_RXQBASE_OFFSET,
+                          (u32)(next_bd & 0xFFFFFFFFU));
+#if defined(__aarch64__)
+        XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_MSBBUF_RXQBASE_OFFSET,
+                          (u32)((u64)next_bd >> 32));
+#endif
         XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
                           ctrl | XEMACPS_NWCTRL_RXEN_MASK);
     }

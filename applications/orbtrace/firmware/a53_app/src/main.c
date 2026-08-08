@@ -135,6 +135,20 @@ static void diag_thread_entry(ULONG arg)
             }
             xil_printf("\r\n");
         }
+
+        /* Temporary bring-up diagnostic: raw RX BD ring state. When RXUSED
+         * fires and rx_frames stops advancing, this shows whether software
+         * (rx_tail) and hardware (RXQBASE, and each BD's own NEW/WRAP bits)
+         * actually agree on what's next, or have desynced. */
+        if (rxused_count > 0) {
+            unsigned int bd_rx_tail, rxqbase, rx_bd_base, addr_words[4], stat_words[4];
+            gem2_diag_get_rx_bd_dump(&bd_rx_tail, &rxqbase, &rx_bd_base, addr_words, stat_words);
+            xil_printf("diag3: rx_tail=%u rxqbase=0x%x rx_bd_base=0x%x rxqbase_slot=%d "
+                       "bd0=%x/%x bd1=%x/%x bd2=%x/%x bd3=%x/%x\r\n",
+                       bd_rx_tail, rxqbase, rx_bd_base, (int)((rxqbase - rx_bd_base) / 64),
+                       addr_words[0], stat_words[0], addr_words[1], stat_words[1],
+                       addr_words[2], stat_words[2], addr_words[3], stat_words[3]);
+        }
     }
 }
 
