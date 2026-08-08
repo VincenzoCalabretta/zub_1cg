@@ -224,6 +224,22 @@ static void gem2_phy_enable_tx_delay(XEmacPs *mac);
 #define KSZ9131_TX_DLL_CTRL_REG      0x4DU
 #define KSZ9131_BYPASS_TXDLL_BIT     (1U << 12)
 #define KSZ9131_TXDLL_RESET_BIT      (1U << 13)
+#define KSZ9131_DLL_TAP_SEL_SHIFT    6U
+#define KSZ9131_DLL_TAP_SEL_MASK     (0x3FU << KSZ9131_DLL_TAP_SEL_SHIFT)
+
+/* Empirical RGMII skew sweep (bring-up only, see ORBTRACE_TEST_REPORT's
+ * "Suggested next step" for follow-up session 3): no oscilloscope/protocol
+ * analyzer is available to characterize the link directly, so this narrows
+ * on a working tap_sel by testing link reliability at each candidate value
+ * on real hardware. 0x1B (27) is the chip's power-on default (§5.3.70) —
+ * override via -DGEM2_TX_DLL_TAP_SEL=<0-63> to sweep. RX left at its
+ * default; only TX has shown corruption/loss symptoms so far. */
+#ifndef GEM2_TX_DLL_TAP_SEL
+#define GEM2_TX_DLL_TAP_SEL 0x1BU
+#endif
+#ifndef GEM2_RX_DLL_TAP_SEL
+#define GEM2_RX_DLL_TAP_SEL 0x1BU
+#endif
 
 static UINT gem2_phy_find(XEmacPs *mac, u32 *phy_addr)
 {
@@ -281,11 +297,13 @@ static void gem2_phy_enable_tx_delay(XEmacPs *mac)
      * set both RX and TX DLL bypass bits explicitly rather than assuming
      * either is at its power-on default. */
     u16 rx_before = gem2_mmd_read(mac, phy_addr, KSZ9131_MMD_DEV_PCS_EXT, KSZ9131_RX_DLL_CTRL_REG);
-    u16 rx_enabled = (u16)(rx_before & ~KSZ9131_BYPASS_RXDLL_BIT);
+    u16 rx_enabled = (u16)(rx_before & ~KSZ9131_BYPASS_RXDLL_BIT & ~KSZ9131_DLL_TAP_SEL_MASK);
+    rx_enabled = (u16)(rx_enabled | ((GEM2_RX_DLL_TAP_SEL << KSZ9131_DLL_TAP_SEL_SHIFT) & KSZ9131_DLL_TAP_SEL_MASK));
     gem2_mmd_reset_pulse(mac, phy_addr, KSZ9131_RX_DLL_CTRL_REG, rx_enabled, KSZ9131_RXDLL_RESET_BIT);
 
     u16 before = gem2_mmd_read(mac, phy_addr, KSZ9131_MMD_DEV_PCS_EXT, KSZ9131_TX_DLL_CTRL_REG);
-    u16 enabled = (u16)(before & ~KSZ9131_BYPASS_TXDLL_BIT);
+    u16 enabled = (u16)(before & ~KSZ9131_BYPASS_TXDLL_BIT & ~KSZ9131_DLL_TAP_SEL_MASK);
+    enabled = (u16)(enabled | ((GEM2_TX_DLL_TAP_SEL << KSZ9131_DLL_TAP_SEL_SHIFT) & KSZ9131_DLL_TAP_SEL_MASK));
     gem2_mmd_reset_pulse(mac, phy_addr, KSZ9131_TX_DLL_CTRL_REG, enabled, KSZ9131_TXDLL_RESET_BIT);
 
     u16 rx_after = gem2_mmd_read(mac, phy_addr, KSZ9131_MMD_DEV_PCS_EXT, KSZ9131_RX_DLL_CTRL_REG);

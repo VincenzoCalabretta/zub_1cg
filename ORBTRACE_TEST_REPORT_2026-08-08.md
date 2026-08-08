@@ -521,3 +521,109 @@ expect the control service to work intermittently rather than reliably —
 this is a hardware signal-integrity issue, not something further changes
 in `applications/orbtrace/firmware/` or `third_party/os_abstraction_layer/`
 are likely to fix.
+
+## Follow-up session 4. Machine-local xsct fixed properly; full tap sweep on real hardware rules out skew as today's cause; RX now completely dead, not intermittent
+
+Same request ("implement this report's suggested next steps, get Orbtrace
+running on target"), a later session, same board without a power cycle
+since session 3.
+
+### Machine-local: xsct's `/bin/bash` shebang and a new `libcrypt.so.1` gap, fixed
+
+Neither is a repo issue. `xsct` (and the `loader` binary it execs) has a
+literal `#!/bin/bash` shebang; this machine has no `/bin/bash` (NixOS,
+`bash` only on `$PATH`, `/bin/sh` a symlink). Separately, `rdi_xsct` itself
+is missing `libcrypt.so.1` — a new gap (nixpkgs' `libxcrypt` moved on since
+session 2's `libtinfo.so.5` fix), same category. Fixed the same way as that
+earlier fix, both applied outside this repo:
+
+- Symlinked `libcrypt.so.1` from `nixpkgs#libxcrypt-legacy` into
+  `/home/v/opt/vitis/Vitis/2023.2/lib/lnx64.o/` (same directory, same
+  pattern as the existing `libtinfo.so.5` symlink from session 2).
+- Used the pre-built `xsct-bwrap` FHS wrapper already present in the Nix
+  store (`/nix/store/.../xsct-bwrap`, built from a `xsct-fhs` derivation)
+  instead of the raw `xsct` binary — it mounts its own FHS rootfs's
+  `/bin/bash`, resolving the shebang gap without touching system `/bin`.
+
+With both fixed, `zub_ctl watch-a53 --xsct <xsct-bwrap path> ...` flashes
+and boots repeatably again, same as session 2 established for a different
+symptom of the same underlying gap.
+
+### Full KSZ9131 tap_sel sweep: RX/TX skew ruled out as today's cause
+
+Parametrized both `gem2_phy_enable_tx_delay()`'s TX *and* RX DLL tap_sel
+(previously only the bypass bit was ever toggled; the tap amount itself,
+defaulting to the chip's power-on `0x1B`, had never been swept) via
+`-DGEM2_TX_DLL_TAP_SEL=<0-63>` / `-DGEM2_RX_DLL_TAP_SEL=<0-63>` build
+flags, defaulting to `0x1B` to preserve existing behavior.
+
+Swept TX at `{0x00, 0x1B}` and RX at `{0x00, 0x08, 0x1B, 0x20, 0x30, 0x3F}`
+— a spread across the full 6-bit range — rebuilding, reflashing, and
+testing each on real hardware (sustained `ping` with live UART diag
+capture). **Every single combination produced the identical failure
+signature**: `rx_frames` climbs to ~5 in the first second after link-up,
+then freezes completely; `rxused_count` (the RXUSED recovery path from
+session 2) climbs continuously thereafter (tens of times over 20-60s)
+without ever unsticking it; zero ping replies, zero ARP replies observed
+in host-side `tcpdump`, in every case.
+
+This uniformity across the *entire* tap range is itself informative: a
+genuine skew problem should show at least some variation in reliability
+across an 0x00-0x3F sweep (some values working better, some worse). Seeing
+byte-identical failure at every single point argues **against** skew being
+today's actual proximate cause, contrary to this report's own prior
+"Suggested next step."
+
+### Ruled out: `NX_PACKET` pool exhaustion
+
+`gem2_alloc_rx_packet()` returns early on `nx_packet_allocate()` failure
+*without* clearing the just-processed BD's `NEW` bit (see the function
+body) — a real bug if it were triggering, since a stuck `NEW=1` bit means
+that ring slot can never be handed back to the DMA engine, which would
+produce exactly the observed "freezes after a handful of frames, RXUSED
+fires forever" signature independent of any PHY register. Added a
+`pool_available`/`pool_total` diagnostic (`NX_PACKET_POOL`'s own counters)
+to `diag2:` and confirmed on hardware: `pool_available` sits fixed at 10
+(of 14 total) for the entire freeze window, never dropping. Pool
+exhaustion is not happening; ruled out.
+
+### Current best hypothesis, unconfirmed: PHY may be stuck in a bad analog state, or the link has degraded since session 3
+
+Two threads point the same direction:
+
+1. Session 3 (same calendar day, earlier) reported this link working
+   *intermittently but genuinely* — ARP resolving repeatedly, a TCP SYN
+   observed byte-correct at the driver — which is qualitatively different
+   from today's **complete, deterministic** RX death after ~5 frames on
+   every single one of 8 tested configurations.
+2. This report has noted since session 2 that **the KSZ9131 PHY chip is
+   not reset by JTAG or PS resets, only a full board power cycle** — and
+   this session (like session 3) ran many DLL reconfigurations
+   (bypass toggles, tap_sel sweeps, forced BMCR renegotiations) back to
+   back on a PHY that was never power-cycled in between. It is plausible
+   the PHY's internal DLL/calibration state does not fully re-settle from
+   a register-only reconfigure-and-renegotiate cycle the way a real
+   power-on does, and repeated churn across this and session 3 left it in
+   a state a register write can't get back out of.
+
+Neither is confirmed. Distinguishing them needs a full board power cycle
+(not JTAG/PS reset) followed by a single clean flash at the known-default
+`0x1B`/`0x1B` tap configuration and a fresh reliability test — genuinely
+new information, not more sweeping, and not something achievable without
+physically power-cycling the board.
+
+### Suggested next step
+
+1. **Power-cycle the board**, then reflash the default configuration
+   (`GEM2_TX_DLL_TAP_SEL`/`GEM2_RX_DLL_TAP_SEL` both unset → `0x1B`) and
+   rerun the same sustained-ping-plus-live-diag test this session used.
+   If RX comes back to session-3-like intermittent behavior, the "PHY
+   stuck from repeated churn" hypothesis is confirmed and the tap sweep
+   this session ran (now cheap to rerun with `sweep_rx_tap.sh`-style
+   scripting) becomes meaningful data again. If it's still completely
+   dead, the problem is elsewhere (cabling, connector, a genuine PL/PS8
+   RGMII configuration issue) and the tap sweep was never going to find
+   it regardless of PHY state.
+2. Only after (1) rules the PHY-state hypothesis in or out does resuming
+   the tap_sel / Clock Pad Skew Register sweep from this report's earlier
+   "Suggested next step" make sense.

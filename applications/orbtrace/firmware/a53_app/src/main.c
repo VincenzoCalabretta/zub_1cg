@@ -118,12 +118,14 @@ static void diag_thread_entry(ULONG arg)
          * _nx_tcp_packet_process without incrementing any of NetX's own
          * accounting — narrows the search to a specific layer. */
         xil_printf("diag2: ip_invalid=%lu ip_csum_err=%lu ip_dropped=%lu tcp_invalid=%lu tcp_csum_err=%lu "
-                   "tcp_dropped=%lu tcp_conns=%lu tcp_passive_conns=%lu active_listen=%p\r\n",
+                   "tcp_dropped=%lu tcp_conns=%lu tcp_passive_conns=%lu active_listen=%p "
+                   "pool_available=%lu pool_total=%lu\r\n",
                    ip.nx_ip_invalid_packets, ip.nx_ip_receive_checksum_errors,
                    ip.nx_ip_receive_packets_dropped, ip.nx_ip_tcp_invalid_packets,
                    ip.nx_ip_tcp_checksum_errors, ip.nx_ip_tcp_receive_packets_dropped,
                    ip.nx_ip_tcp_connections, ip.nx_ip_tcp_passive_connections,
-                   (void *)ip.nx_ip_tcp_active_listen_requests);
+                   (void *)ip.nx_ip_tcp_active_listen_requests,
+                   pool.nx_packet_pool_available, pool.nx_packet_pool_total);
         if (last_etype == 0x0800) {
             unsigned char ip_dump[40];
             gem2_diag_get_ip_dump(ip_dump);
