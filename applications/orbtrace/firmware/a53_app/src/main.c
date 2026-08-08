@@ -85,7 +85,20 @@ static UCHAR arp_cache_memory[1024] __attribute__((aligned(4)));
 #define GEM2_RXQBASE_OFF 0x18UL
 
 static TX_THREAD diag_thread;
-static ULONG diag_stack[1024];
+/* 4x'd from the original 1024 ULONGs (4KB). Root-caused on real hardware
+ * (see ORBTRACE_TEST_REPORT session 6): this thread's body makes several
+ * nested calls (gem2_diag_get_*() plus multiple 15-20-argument xil_printf()
+ * calls with local hex-dump buffers and loops) that plausibly exceeded 4KB
+ * of stack at its deepest point, silently overflowing into adjacent .bss
+ * statics (this array sits directly next to several TX_THREAD control
+ * blocks and, a bit further down, arp_cache_memory — see the linker
+ * symbol map). That is the leading suspect for garbage later observed in
+ * NetX's ARP table (a bit pattern proven impossible from any legitimate
+ * ARP-parsing code path) despite the ARP request delivered to NetX by this
+ * driver being independently confirmed byte-perfect. Not yet proven by a
+ * stack high-water-mark measurement — increased as a direct, cheap test of
+ * the hypothesis. */
+static ULONG diag_stack[4096];
 
 static void diag_thread_entry(ULONG arg)
 {
@@ -107,15 +120,26 @@ static void diag_thread_entry(ULONG arg)
         gem2_diag_get_tx_recover(&tx_recover_attempts, &tx_recover_txqbase_before, &tx_recover_txqbase_after);
         unsigned int tx_dst_msw, tx_dst_lsw, tx_dst_cmd;
         gem2_diag_get_tx_dst(&tx_dst_msw, &tx_dst_lsw, &tx_dst_cmd);
+        unsigned int tx_dropped_bad_dst = gem2_diag_get_tx_dropped_bad_dst();
         xil_printf("diag: ISR=0x%lx NWSR=0x%lx isr_calls=%u rx_frames=%u tx_frames=%u last_etype=0x%x "
                    "last_len=%u tx_complete=%u last_tx_stat=0x%x tx_head=%u tx_tail=%u tx_count=%u "
                    "last_isr=0x%x rxused_count=%u txused_count=%u last_txsr=0x%x drv_cmds=%u last_cmd=%u last_status=%d "
-                   "tx_recover_attempts=%u tx_recover_txqbase=0x%x->0x%x tx_dst=%x:%08x tx_dst_cmd=%u\r\n",
+                   "tx_recover_attempts=%u tx_recover_txqbase=0x%x->0x%x tx_dst=%x:%08x tx_dst_cmd=%u "
+                   "tx_dropped_bad_dst=%u\r\n",
                    isr, nwsr, isr_calls, rx_frames, tx_frames, last_etype, last_len,
                    tx_complete, last_tx_stat, tx_head, tx_tail, tx_count, last_isr, rxused_count,
                    txused_count, last_txsr, driver_cmd_count, last_driver_cmd, (int)last_driver_status,
                    tx_recover_attempts, tx_recover_txqbase_before, tx_recover_txqbase_after,
-                   tx_dst_msw, tx_dst_lsw, tx_dst_cmd);
+                   tx_dst_msw, tx_dst_lsw, tx_dst_cmd, tx_dropped_bad_dst);
+        {
+            unsigned int arp_cache_count, arp_cache_ip[4], arp_cache_msw[4], arp_cache_lsw[4];
+            gem2_diag_get_arp_cache(&arp_cache_count, arp_cache_ip, arp_cache_msw, arp_cache_lsw);
+            xil_printf("diag: arp_cache_count=%u", arp_cache_count);
+            for (unsigned i = 0; i < arp_cache_count; i++) {
+                xil_printf(" [%u]=%08x->%04x:%08x", i, arp_cache_ip[i], arp_cache_msw[i], arp_cache_lsw[i]);
+            }
+            xil_printf("\r\n");
+        }
 
         /* Temporary bring-up diagnostic: NetX's own drop/error counters
          * (NX_IP_INFO / NX_TCP_INFO are on by default — not disabled
@@ -140,6 +164,29 @@ static void diag_thread_entry(ULONG arg)
             xil_printf("diag: ip_dump=");
             for (unsigned i = 0; i < sizeof(ip_dump); i++) {
                 xil_printf("%02x", ip_dump[i]);
+            }
+            xil_printf("\r\n");
+        }
+        {
+            unsigned char arp_dump[28];
+            unsigned int arp_dump_valid;
+            gem2_diag_get_arp_dump(arp_dump, &arp_dump_valid);
+            if (arp_dump_valid) {
+                xil_printf("diag: arp_dump=");
+                for (unsigned i = 0; i < sizeof(arp_dump); i++) {
+                    xil_printf("%02x", arp_dump[i]);
+                }
+                xil_printf("\r\n");
+            }
+        }
+        {
+            unsigned int req_addr_lo, req_addr_hi, req_sizeof;
+            unsigned char req_bytes[48];
+            gem2_diag_get_req_dump(&req_addr_lo, &req_addr_hi, &req_sizeof, req_bytes);
+            xil_printf("diag: req_addr=%08x%08x sizeof_req=%u req_bytes=",
+                       req_addr_hi, req_addr_lo, req_sizeof);
+            for (unsigned i = 0; i < sizeof(req_bytes); i++) {
+                xil_printf("%02x", req_bytes[i]);
             }
             xil_printf("\r\n");
         }

@@ -128,6 +128,11 @@ extern void xil_printf(const char *fmt, ...);
 /* Number of TX poll iterations before declaring TX timeout */
 #define GEM2_TX_POLL     500000U
 
+/* Number of peers this driver's own ARP cache remembers — see
+ * gem2_arp_learn()/gem2_arp_lookup(). Small on purpose: this bring-up
+ * firmware talks to a handful of LAN peers at most. */
+#define GEM2_ARP_CACHE_SIZE 4U
+
 /* GEM2 local MAC address (locally-administered) */
 static u8 sMAC[6] = { 0x00, 0x0A, 0x35, 0x00, 0x01, 0x02 };
 
@@ -186,7 +191,20 @@ typedef struct {
     u32 diag_last_tx_dst_msw;
     u32 diag_last_tx_dst_lsw;
     u32 diag_last_tx_cmd;
+    u32 diag_last_req_addr_lo;
+    u32 diag_last_req_addr_hi;
+    u32 diag_last_req_sizeof;
+    u8  diag_last_req_bytes[48];
     u8  diag_ip_header_dump[40];
+    u8  diag_arp_dump[28];
+    u32 diag_arp_dump_valid;
+    u32 diag_tx_dropped_bad_dst;
+
+    /* Driver-local ARP cache — see gem2_arp_learn()/gem2_arp_lookup(). */
+    u32 arp_cache_ip[GEM2_ARP_CACHE_SIZE];
+    u32 arp_cache_msw[GEM2_ARP_CACHE_SIZE];
+    u32 arp_cache_lsw[GEM2_ARP_CACHE_SIZE];
+    u32 arp_cache_count;
 } Gem2Ctx;
 
 static Gem2Ctx sCtx;
@@ -288,6 +306,52 @@ void gem2_diag_get_ip_dump(unsigned char *out40)
     memcpy(out40, sCtx.diag_ip_header_dump, sizeof(sCtx.diag_ip_header_dump));
 }
 
+/* Temporary bring-up diagnostic: raw bytes of the last received ARP
+ * message (28 bytes: hwtype/ptype/hlen/plen/oper/SHA/SPA/THA/TPA), captured
+ * by our driver *before* handing the packet to
+ * _nx_arp_packet_deferred_receive() — independent of anything NetX does to
+ * it afterward. Added to determine whether a garbage destination MAC later
+ * observed in NetX's ARP table (see ORBTRACE_TEST_REPORT session 6) is
+ * already present in the bytes we deliver (an RX-side bug in this driver)
+ * or only appears after NetX processes them (a NetX-side bug — ruled
+ * unlikely by reading _nx_arp_packet_receive.c end to end, but not yet
+ * proven either way). */
+void gem2_diag_get_arp_dump(unsigned char *out28, unsigned int *valid)
+{
+    memcpy(out28, sCtx.diag_arp_dump, sizeof(sCtx.diag_arp_dump));
+    *valid = sCtx.diag_arp_dump_valid;
+}
+
+/* Temporary bring-up diagnostic accessor — see the comment where
+ * diag_last_req_bytes is captured in gem2_packet_send(). */
+void gem2_diag_get_req_dump(u32 *addr_lo, u32 *addr_hi, u32 *sizeof_req, unsigned char *out48)
+{
+    *addr_lo = sCtx.diag_last_req_addr_lo;
+    *addr_hi = sCtx.diag_last_req_addr_hi;
+    *sizeof_req = sCtx.diag_last_req_sizeof;
+    memcpy(out48, sCtx.diag_last_req_bytes, sizeof(sCtx.diag_last_req_bytes));
+}
+
+/* Temporary bring-up diagnostic accessor: count of outbound sends dropped
+ * by the dst_msw > 0xFFFF invariant check in gem2_packet_send() — see that
+ * check's comment. */
+u32 gem2_diag_get_tx_dropped_bad_dst(void)
+{
+    return sCtx.diag_tx_dropped_bad_dst;
+}
+
+/* Temporary bring-up diagnostic accessor: this driver's own ARP cache —
+ * see gem2_arp_learn()/gem2_arp_lookup() above gem2_rx_process(). */
+void gem2_diag_get_arp_cache(u32 *count, u32 *ip, u32 *msw, u32 *lsw)
+{
+    *count = sCtx.arp_cache_count;
+    for (u32 i = 0U; i < GEM2_ARP_CACHE_SIZE; i++) {
+        ip[i] = sCtx.arp_cache_ip[i];
+        msw[i] = sCtx.arp_cache_msw[i];
+        lsw[i] = sCtx.arp_cache_lsw[i];
+    }
+}
+
 /* ── Forward declarations ──────────────────────────────────────────────── */
 static void gem2_initialize(NX_IP_DRIVER *req);
 static void gem2_enable(NX_IP_DRIVER *req);
@@ -297,6 +361,8 @@ static void gem2_rx_process(void);
 static void gem2_tx_cleanup(void);
 static UINT gem2_alloc_rx_packet(u32 slot);
 static void gem2_phy_enable_tx_delay(XEmacPs *mac);
+static void gem2_arp_learn(u32 ip, u32 msw, u32 lsw);
+static UINT gem2_arp_lookup(u32 ip, u32 *msw, u32 *lsw);
 
 /* ── KSZ9131 PHY bring-up: enable the TXC internal DLL delay ─────────────
  *
@@ -760,6 +826,73 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
     sCtx.diag_last_tx_dst_msw = (u32)dst_msw;
     sCtx.diag_last_tx_dst_lsw = (u32)dst_lsw;
     sCtx.diag_last_tx_cmd = (u32)req->nx_ip_driver_command;
+    sCtx.diag_last_req_addr_lo = (u32)((UINTPTR)req & 0xFFFFFFFFU);
+    sCtx.diag_last_req_addr_hi = (u32)(((u64)(UINTPTR)req) >> 32);
+    sCtx.diag_last_req_sizeof = (u32)sizeof(*req);
+    memcpy(sCtx.diag_last_req_bytes, (const void *)req, sizeof(sCtx.diag_last_req_bytes));
+
+    /* Root-caused on real hardware (see ORBTRACE_TEST_REPORT session 6):
+     * under TCP SYN-retry load, req->nx_ip_driver_physical_address_msw/lsw
+     * occasionally arrives holding garbage that decodes as raw bytes from
+     * the *received* packet's own TCP header (src_port:dst_port as msw,
+     * sequence number as lsw) rather than a resolved MAC. Traced this to
+     * real hardware ground truth: a live JTAG memory read of NetX's own ARP
+     * table entry for the destination showed it was genuinely correct
+     * (checked shortly after), and disassembling the compiled
+     * _nx_ip_driver_packet_send() confirmed the ARP-resolved branch copies
+     * arp_ptr's msw/lsw fields into this struct correctly (a single 8-byte
+     * ldur/str, byte-for-byte matching the struct layout) — so the bug is
+     * not in this driver's read, nor in that copy. The remaining plausible
+     * explanation is a genuine race in NetX's own vendored
+     * _nx_arp_packet_receive.c: the "create new ARP entry" branch writes
+     * nx_arp_ip_address, then nx_arp_physical_address_msw, then _lsw as
+     * three separate, TX_DISABLE-unprotected statements — unlike the
+     * sibling "update existing entry" branch a few lines above it, which
+     * *does* wrap the same kind of update in TX_DISABLE/TX_RESTORE. A
+     * concurrent reader can observe the IP address already matching (hash
+     * lookup succeeds) while the MAC fields still hold stale pool memory
+     * from that slot's previous use. This is upstream vendored-library
+     * behavior, not something to patch directly here.
+     *
+     * A first attempt at defending against this checked "msw <= 0xFFFF"
+     * (every legitimate source of this field — ARP-resolved unicast, IPv4
+     * broadcast, class D multicast, see nx_ip_driver_packet_send.c's three
+     * driver-invoking branches — only ever holds the top 16 bits of a
+     * 48-bit MAC, or the 0x0100 IANA multicast prefix, or 0xFFFF
+     * broadcast). That caught most garbage on real hardware but not all of
+     * it — confirmed on the wire: one instance (msw=0xB974) coincidentally
+     * fell inside the valid 16-bit range and still went out with a wrong
+     * destination MAC. See gem2_arp_learn()/gem2_arp_lookup() above:
+     * this driver keeps its own tiny IP-to-MAC cache, fed directly from
+     * ARP frames as *this driver* parses them (the same extraction
+     * independently verified correct via the wire-level ARP reply),
+     * entirely bypassing NetX's internal ARP table and its race. Prefer
+     * that cache for IP sends; only fall back to req's (possibly racy)
+     * fields — still gated by the msw<=0xFFFF sanity check as a last
+     * resort — when this driver has never observed the destination on the
+     * wire yet (e.g. sending through a gateway this driver hasn't ARPed
+     * for directly). ARP/RARP sends themselves are unaffected — those
+     * commands supply the destination address directly (broadcast, or the
+     * synchronously-extracted sender address for a reply), never through
+     * this same ARP-table lookup, so they were never at risk. */
+    if (ether_type == NX_ETHERNET_IP) {
+        u32 dest_ip = ((u32)eth[NX_ETHERNET_SIZE + 16] << 24) | ((u32)eth[NX_ETHERNET_SIZE + 17] << 16) |
+                      ((u32)eth[NX_ETHERNET_SIZE + 18] << 8) | (u32)eth[NX_ETHERNET_SIZE + 19];
+        u32 cached_msw, cached_lsw;
+        if (gem2_arp_lookup(dest_ip, &cached_msw, &cached_lsw) == NX_SUCCESS) {
+            dst_msw = cached_msw;
+            dst_lsw = cached_lsw;
+        } else if (dst_msw > 0xFFFFUL) {
+            /* No cache entry and req's value fails the sanity check —
+             * drop and let TCP's own retransmission timer retry later,
+             * exactly how the ring-full case above handles a transient
+             * send failure. */
+            sCtx.diag_tx_dropped_bad_dst++;
+            nx_packet_transmit_release(pkt);
+            req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
+            return;
+        }
+    }
 
     eth[0] = (u8)(dst_msw >> 8);  eth[1] = (u8)dst_msw;
     eth[2] = (u8)(dst_lsw >> 24); eth[3] = (u8)(dst_lsw >> 16);
@@ -805,6 +938,65 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
     req->nx_ip_driver_status = NX_SUCCESS;
 }
 
+/* ── Driver-local ARP cache ───────────────────────────────────────────────
+ *
+ * Root-caused on real hardware (see ORBTRACE_TEST_REPORT session 6): NetX's
+ * own vendored _nx_arp_packet_receive.c populates a brand-new ARP table
+ * entry via three separate, TX_DISABLE-unprotected statements (IP address,
+ * then physical_address_msw, then _lsw) — unlike the sibling "update an
+ * existing entry" branch a few lines above it, which does wrap the
+ * equivalent update in TX_DISABLE/TX_RESTORE. A concurrent reader (this
+ * driver's own TCP send, moments after the ARP request that resolves the
+ * peer, is a fast, realistic case) can observe the IP address already
+ * matching while the MAC fields still hold stale pool memory. Confirmed
+ * multiple ways on real hardware this session: a live JTAG memory read of
+ * the ARP table entry itself was correct (checked well after the fact), a
+ * disassembly of the compiled _nx_ip_driver_packet_send() confirmed the
+ * ARP-resolved branch copies arp_ptr's fields correctly, and yet
+ * req->nx_ip_driver_physical_address_msw/lsw was repeatedly observed
+ * holding garbage at actual send time — including values that pass a
+ * naive "msw <= 0xFFFF" sanity filter (a real MAC's msw is always in that
+ * range) purely by chance, so that filter alone isn't sufficient.
+ *
+ * This is upstream vendored-library behavior, not something to patch
+ * directly. Instead, this driver keeps its own tiny, independent
+ * IP-to-MAC cache, fed directly from ARP frames as *this driver* parses
+ * them on the way to NetX (the same extraction already independently
+ * verified correct via gem2_diag_get_arp_dump() / the wire-level ARP
+ * reply) — entirely bypassing NetX's internal ARP table and its race.
+ * gem2_packet_send() consults this cache for IP sends and only falls back
+ * to req's (possibly racy) fields if this driver has never seen the
+ * destination on the wire yet. */
+
+static void gem2_arp_learn(u32 ip, u32 msw, u32 lsw)
+{
+    for (u32 i = 0U; i < sCtx.arp_cache_count; i++) {
+        if (sCtx.arp_cache_ip[i] == ip) {
+            sCtx.arp_cache_msw[i] = msw;
+            sCtx.arp_cache_lsw[i] = lsw;
+            return;
+        }
+    }
+    u32 slot = (sCtx.arp_cache_count < GEM2_ARP_CACHE_SIZE)
+                   ? sCtx.arp_cache_count++
+                   : 0U;  /* cache full — evict the oldest (slot 0) */
+    sCtx.arp_cache_ip[slot] = ip;
+    sCtx.arp_cache_msw[slot] = msw;
+    sCtx.arp_cache_lsw[slot] = lsw;
+}
+
+static UINT gem2_arp_lookup(u32 ip, u32 *msw, u32 *lsw)
+{
+    for (u32 i = 0U; i < sCtx.arp_cache_count; i++) {
+        if (sCtx.arp_cache_ip[i] == ip) {
+            *msw = sCtx.arp_cache_msw[i];
+            *lsw = sCtx.arp_cache_lsw[i];
+            return NX_SUCCESS;
+        }
+    }
+    return NX_NOT_SUCCESSFUL;
+}
+
 /* ── RX processing (called from ISR) ──────────────────────────────────── */
 
 static void gem2_rx_process(void)
@@ -818,6 +1010,22 @@ static void gem2_rx_process(void)
 
         if (!(addr_word & XEMACPS_RXBUF_NEW_MASK)) {
             break;  /* DMA still owns this BD */
+        }
+
+        /* sCtx.rx_pkts[slot] == NULL marks a slot whose frame was already
+         * delivered to NetX on a previous call, but whose refill failed
+         * (pool exhausted — see below) and has not yet been retried
+         * successfully. The BD's NEW bit stays set by hardware in exactly
+         * this same state as "genuine unprocessed frame waiting," so NEW
+         * alone cannot tell the two apart; only re-attempt the refill here,
+         * do not re-extract/re-deliver — the frame data in this slot's
+         * buffer was already consumed and pkt already handed to NetX. */
+        if (sCtx.rx_pkts[slot] == NX_NULL) {
+            if (gem2_alloc_rx_packet(slot) != NX_SUCCESS) {
+                break;  /* still no packet available — retry this same slot next time */
+            }
+            sCtx.rx_tail = (slot + 1U) % GEM2_BD_COUNT;
+            continue;
         }
 
         u32 stat_word = XEmacPs_BdRead(bd, XEMACPS_BD_STAT_OFFSET);
@@ -848,6 +1056,27 @@ static void gem2_rx_process(void)
         pkt->nx_packet_length       = frame_len - NX_ETHERNET_SIZE;
         pkt->nx_packet_append_ptr   = pkt->nx_packet_prepend_ptr + pkt->nx_packet_length;
 
+        if (etype == NX_ETHERNET_ARP && pkt->nx_packet_length >= sizeof(sCtx.diag_arp_dump)) {
+            memcpy(sCtx.diag_arp_dump, (u8 *)pkt->nx_packet_prepend_ptr, sizeof(sCtx.diag_arp_dump));
+            sCtx.diag_arp_dump_valid = 1U;
+
+            /* Feed this driver's own ARP cache — see gem2_arp_learn()'s
+             * comment (above gem2_rx_process()) for why this bypasses a
+             * real race in NetX's own ARP table. Standard ARP layout: SHA
+             * (sender hardware address) at bytes 8-13, SPA (sender
+             * protocol address) at bytes 14-17 — identical offsets for
+             * both REQUEST and RESPONSE messages, so this learns from
+             * either. */
+            u32 sha_msw = ((u32)sCtx.diag_arp_dump[8] << 8) | (u32)sCtx.diag_arp_dump[9];
+            u32 sha_lsw = ((u32)sCtx.diag_arp_dump[10] << 24) | ((u32)sCtx.diag_arp_dump[11] << 16) |
+                          ((u32)sCtx.diag_arp_dump[12] << 8) | (u32)sCtx.diag_arp_dump[13];
+            u32 spa = ((u32)sCtx.diag_arp_dump[14] << 24) | ((u32)sCtx.diag_arp_dump[15] << 16) |
+                      ((u32)sCtx.diag_arp_dump[16] << 8) | (u32)sCtx.diag_arp_dump[17];
+            if (spa != 0U) {
+                gem2_arp_learn(spa, sha_msw, sha_lsw);
+            }
+        }
+
         /* Route to NetX */
         if (etype == NX_ETHERNET_IP || etype == NX_ETHERNET_IPV6) {
             _nx_ip_packet_deferred_receive(sCtx.ip_ptr, pkt);
@@ -859,8 +1088,37 @@ static void gem2_rx_process(void)
             nx_packet_release(pkt);
         }
 
+        /* Mark this slot's packet consumed *before* attempting refill —
+         * root-caused on real hardware: gem2_alloc_rx_packet() can fail
+         * under pool pressure (observed live: pool_available dropping from
+         * 14 to 6 during a TCP SYN-retry burst), and its previous caller
+         * silently ignored that failure while still unconditionally
+         * advancing rx_tail. That left this exact slot's BD with NEW still
+         * set (hardware's "unprocessed frame" marker, never cleared) and
+         * sCtx.rx_pkts[slot] still pointing at the packet *already handed
+         * to NetX* above. The next time software's rx_tail rotation came
+         * back around to this slot, the NEW-bit check alone couldn't
+         * distinguish "stale, already-delivered" from "genuinely new" —
+         * so the exact same NX_PACKET got extracted and handed to NetX's
+         * deferred-receive queue a *second* time, corrupting whatever
+         * internal linked-list bookkeeping (nx_packet_queue_next) NetX was
+         * using it for. That is a highly plausible root cause for
+         * seemingly-unrelated NetX-internal corruption observed under load
+         * this session (a garbage ARP table entry with bit patterns
+         * provably impossible from the correct extraction path) —
+         * confirmed only circumstantially (pool pressure was present when
+         * it appeared), not by direct instrumentation of the double-
+         * delivery itself, so treat as the leading hypothesis fixed here
+         * rather than a fully proven root cause. Setting this to NULL
+         * immediately makes "already consumed, awaiting refill" an
+         * explicit, checkable state (see the NULL check above) instead of
+         * an accident of an unchecked return value. */
+        sCtx.rx_pkts[slot] = NX_NULL;
+
         /* Refill the slot and reset BD ownership to DMA */
-        (void)gem2_alloc_rx_packet(slot);
+        if (gem2_alloc_rx_packet(slot) != NX_SUCCESS) {
+            break;  /* no packet available — retry this same slot next time, don't advance */
+        }
 
         /* Advance tail */
         sCtx.rx_tail = (slot + 1U) % GEM2_BD_COUNT;

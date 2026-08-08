@@ -1141,3 +1141,159 @@ safety net, and the new `tx_dst`/`tx_recover` diagnostics) are in
 `third_party/os_abstraction_layer/ThreadX/ThreadXGEM2Driver.c` and
 `ThreadXGEM2Driver.h`, plus the corresponding diag-print additions in
 `applications/orbtrace/firmware/a53_app/src/main.c`.
+
+## Follow-up to session 6, same day: ARP-table-corruption bug root-caused and fixed — TCP now works completely end-to-end (verified with real data exchange)
+
+Continuation of the investigation above, same session, no new day boundary
+crossed. Picked up directly at "New blocker found" above and carried it to
+a full fix, confirmed with a real `nc` connection that sent data, got
+ACKed, and tore down cleanly — the first time this bring-up has moved
+actual application data over TCP.
+
+### Root cause found: a real, unprotected race in NetX Duo's own vendored `_nx_arp_packet_receive.c`
+
+Chased the wrong-destination-MAC bug all the way to hardware ground truth,
+ruling out every layer in this driver and in NetX along the way:
+
+1. **This driver's RX delivery is correct.** Added
+   `gem2_diag_get_arp_dump()` to capture the raw 28-byte ARP payload
+   exactly as handed to `_nx_arp_packet_deferred_receive()`, independent of
+   anything NetX does afterward. It read back byte-perfect:
+   `SHA=00:e0:4c:75:87:68` (the host's real MAC), correct SPA/TPA — proving
+   the corruption is not introduced on the way in.
+2. **NetX's ARP table entry itself is correct.** Computed the live runtime
+   address of `arp_cache_memory` via `nm` on the built ELF, then read it
+   directly over JTAG (`mrd -force`) during an active stall. Manually
+   walked the `NX_ARP` struct layout (cross-checked against
+   `nx_api.h`) to locate the live entry for 192.168.1.1 and found
+   `nx_arp_physical_address_msw=0x000000E0`,
+   `lsw=0x4C758768` — exactly the host's real MAC. NetX's ARP resolution,
+   checked directly in memory, was never wrong.
+3. **The compiled driver-call code is correct.** Disassembled
+   `_nx_ip_driver_packet_send()` from the built ELF
+   (`aarch64-none-elf-objdump -d`). The ARP-resolved branch does
+   `ldur d31, [x1, #60]` / `str d31, [sp, #88]` — a single 8-byte
+   load/store copying `arp_ptr`'s adjacent `msw`+`lsw` fields (offsets 60
+   and 64) directly into `driver_request`'s matching fields, byte-for-byte
+   matching the C source. No compiler bug, no struct-layout mismatch
+   between this driver's translation unit and netxduo's (confirmed
+   `sizeof(NX_IP_DRIVER)==48` on this driver's side too, matching the
+   hand-computed layout).
+4. **Yet `req->nx_ip_driver_physical_address_msw/lsw`, read by this driver
+   at actual send time, was repeatedly wrong** — added
+   `gem2_diag_get_req_dump()` to dump the raw struct bytes NetX actually
+   handed the driver. The garbage values decoded as **raw bytes from the
+   incoming SYN packet's own TCP header** — `msw` = `src_port:dst_port`
+   packed as one word, `lsw` = the TCP sequence number — a pattern
+   consistent with uninitialized memory, not a deterministic computation
+   bug.
+5. Reading `_nx_arp_packet_receive.c` end to end located the mechanism:
+   the branch that creates a **brand-new** ARP entry (in response to the
+   host's very first ARP request for this session — an "auto-entry"
+   creation, since the IP has never been seen before) writes
+   `nx_arp_ip_address`, then `nx_arp_physical_address_msw`, then `_lsw` as
+   **three separate, unprotected statements** — no `TX_DISABLE`/
+   `TX_RESTORE` around them. The *sibling* branch a few lines above it
+   (updating an **existing** entry from a later ARP reply) *does* wrap the
+   equivalent update in `TX_DISABLE`/`TX_RESTORE`. A concurrent reader —
+   this driver's own TCP SYN-ACK send, which races in moments after the
+   ARP request that resolves the peer, is exactly this kind of reader —
+   can observe the IP address field already matching (so the hash lookup
+   in `nx_ip_driver_packet_send.c` succeeds) while the MAC fields still
+   hold whatever was in that pool slot from its previous use. This is
+   upstream vendored-library behavior (`@netxduo`, pulled in via Bazel's
+   `MODULE.bazel`) — not something to patch in place in this repo.
+
+Also noted in passing: `@netxduo`'s `nx_port.h` is pulled from
+`ports/cortex_a7/gnu/inc` (a 32-bit ARM port) even though this board is
+Cortex-**A53**/aarch64. Inspected it directly — it turned out to contain
+only architecture-generic macros (endian swap, `htonl`/`ntohl`, caller
+checking) with no actual type definitions affected by pointer width, so it
+is not implicated in this specific bug. Worth flagging for whoever
+maintains the NetX vendoring in this repo, though: using an ARM32 port
+header on an AArch64 target is fragile in general, even where it happens
+to be harmless today.
+
+### Fix: a driver-local ARP cache, bypassing NetX's racy table entirely
+
+Rather than patch the vendored library (out of scope, and future
+`@netxduo` version bumps would silently drop a local patch), this driver
+now keeps its **own** tiny (4-entry) IP-to-MAC cache, populated directly
+from ARP frames as *this driver* parses them on the way to NetX —
+reusing the exact extraction already proven correct in point 1 above,
+entirely independent of NetX's internal table and its race:
+
+- `gem2_arp_learn(ip, msw, lsw)` / `gem2_arp_lookup(ip, &msw, &lsw)` — new
+  static functions in `ThreadXGEM2Driver.c`, just above
+  `gem2_rx_process()`.
+- `gem2_rx_process()` calls `gem2_arp_learn()` whenever it sees an ARP
+  frame (request *or* reply — both carry sender hardware/protocol address
+  at the same offsets), extracting SHA/SPA directly from the
+  already-captured `diag_arp_dump` bytes.
+- `gem2_packet_send()`, for IP sends specifically (`ether_type ==
+  NX_ETHERNET_IP` — ARP/RARP sends were never at risk; they get their
+  destination address directly, not through this lookup), pulls the
+  destination IP straight out of the packet's own IP header
+  (`eth[NX_ETHERNET_SIZE+16..19]`) and prefers this driver's own cache
+  over `req`'s fields whenever there's a hit.
+- A **first attempt** at a fix (committed earlier this session but
+  superseded, not separately reverted) checked `dst_msw <= 0xFFFF` — every
+  legitimate source of this field (ARP-resolved unicast, IPv4 broadcast,
+  class D multicast) only ever produces a value in that range, since it's
+  the top 16 bits of a 48-bit MAC (or the 0x0100 IANA multicast prefix, or
+  the 0xFFFF broadcast constant). This caught *most* garbage on real
+  hardware (confirmed via a new `diag_tx_dropped_bad_dst` counter reaching
+  12 on one run) but **not all of it** — one instance
+  (`msw=0xB974,lsw=0x00000000`) coincidentally fell inside the valid
+  16-bit range and still reached the wire with a wrong destination MAC,
+  caught directly via `tcpdump`. The `0xFFFF` check is kept as a
+  **secondary, last-resort filter** for the (rare, e.g. a gateway never
+  directly ARPed) case where this driver's own cache has no entry yet.
+
+### Confirmed fully working on real hardware
+
+```sh
+sudo tcpdump -i <host-iface> -n -e host 192.168.1.50 &
+printf 'GET / \n' | nc -w 5 192.168.1.50 3401   # exit=0
+```
+Captured, in order: ARP request/reply (unchanged, already worked) → SYN →
+**SYN-ACK with the correct destination MAC** (`00:e0:4c:75:87:68`, matching
+the host) → ACK completing the handshake → the host's 7-byte payload
+(`GET / \n`) → **the board ACKing that data** → FIN/ACK/RST teardown.
+`nc` exited `0` (clean success, not the timeout/hang every previous
+attempt produced). The board's own diagnostics confirm why:
+`arp_cache_count=1 [0]=c0a80101->00e0:4c758768` (this driver's cache
+correctly learned the host) and `tx_dropped_bad_dst=0` for this run (the
+cache had a hit for every single send, so the secondary filter never even
+needed to trigger) — while the raw `req` field it *would* have trusted
+without this fix read `tx_dst=0:00000000` (genuinely zero, not just
+subtly wrong) for the same send.
+
+**This is the first time in this bring-up's history that real application
+data has been exchanged over TCP with the board**, not just a completed
+three-way handshake.
+
+### Suggested next steps
+
+1. Re-run `//tests:orbtrace_throughput_test` now that basic TCP data
+   exchange is confirmed working end-to-end — this needs the actual
+   Orbtrace PL bitstream/trace-capture hardware path exercised, which this
+   session did not touch (this session's `nc` test only reached the
+   control-port command parser in `applications/orbtrace/firmware/a53`'s
+   Rust `ffi.rs`, not the trace payload path on TCP 3402 mentioned in
+   `applications/orbtrace/firmware/README.md` as "not wired up yet").
+2. The temporary bring-up diagnostics accumulated across sessions 5 and 6
+   (`diag`, `diag2`, `diag3`, `diag4`, `arp_dump`, `req_dump`,
+   `arp_cache`, and their backing `gem2_diag_get_*()` functions) are
+   numerous at this point and add real code size/complexity. Now that
+   TX, RX, and TCP data exchange are all confirmed working, consider
+   trimming the ones that were single-purpose for a since-fixed bug
+   (e.g. `req_dump`'s raw 48-byte struct hexdump was specifically for the
+   ARP race investigation above and has little ongoing diagnostic value)
+   while keeping the general-purpose ones (`diag`, `diag2`) for ongoing
+   bring-up work.
+3. This session's `gem2_arp_learn()`/`gem2_arp_lookup()` cache is
+   deliberately minimal (4 entries, simple linear scan, evict-oldest on
+   overflow) — sufficient for this bring-up's single-peer lab setup. If
+   Orbtrace is ever expected to serve multiple simultaneous LAN clients,
+   revisit the cache size and eviction policy.

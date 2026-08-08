@@ -52,6 +52,13 @@ void gem2_diag_get_tx_extra(unsigned int *txused_count, unsigned int *last_txsr)
 void gem2_diag_get_tx_recover(unsigned int *attempts, unsigned int *txqbase_before,
                                unsigned int *txqbase_after);
 void gem2_diag_get_tx_dst(unsigned int *dst_msw, unsigned int *dst_lsw, unsigned int *cmd);
+void gem2_diag_get_arp_dump(unsigned char *out28, unsigned int *valid);
+void gem2_diag_get_req_dump(unsigned int *addr_lo, unsigned int *addr_hi, unsigned int *sizeof_req,
+                             unsigned char *out48);
+unsigned int gem2_diag_get_tx_dropped_bad_dst(void);
+/* ip/msw/lsw must each point to a 4-element array (GEM2_ARP_CACHE_SIZE in
+ * ThreadXGEM2Driver.c). */
+void gem2_diag_get_arp_cache(unsigned int *count, unsigned int *ip, unsigned int *msw, unsigned int *lsw);
 void gem2_diag_get_rx_bd_dump(unsigned int *rx_tail, unsigned int *rxqbase, unsigned int *rx_bd_base,
                                unsigned int addr_words[4], unsigned int stat_words[4]);
 void gem2_diag_get_tx_bd_dump(unsigned int *tx_head, unsigned int *tx_tail, unsigned int *tx_count,
