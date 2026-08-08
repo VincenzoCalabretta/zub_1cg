@@ -6,7 +6,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
-    Controller, ControlConnection, DapConnection, DmaRegisterIo, RegisterIo, AXI_DMA_BASE,
+    ControlConnection, Controller, DapConnection, DmaRegisterIo, RegisterIo, AXI_DMA_BASE,
     ORBTRACE_AXI_BASE,
 };
 
