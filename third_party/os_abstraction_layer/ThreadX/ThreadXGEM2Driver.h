@@ -49,11 +49,27 @@ void gem2_diag_get(unsigned int *rx_frames, unsigned int *tx_frames, unsigned in
                     unsigned int *last_driver_status);
 void gem2_diag_get_ip_dump(unsigned char *out40);
 void gem2_diag_get_tx_extra(unsigned int *txused_count, unsigned int *last_txsr);
+void gem2_diag_get_tx_recover(unsigned int *attempts, unsigned int *txqbase_before,
+                               unsigned int *txqbase_after);
+void gem2_diag_get_tx_dst(unsigned int *dst_msw, unsigned int *dst_lsw, unsigned int *cmd);
 void gem2_diag_get_rx_bd_dump(unsigned int *rx_tail, unsigned int *rxqbase, unsigned int *rx_bd_base,
                                unsigned int addr_words[4], unsigned int stat_words[4]);
 void gem2_diag_get_tx_bd_dump(unsigned int *tx_head, unsigned int *tx_tail, unsigned int *tx_count,
                                unsigned int *txqbase, unsigned int *tx_bd_base,
                                unsigned int addr_words[4], unsigned int stat_words[4]);
+
+/**
+ * @brief Poll for a wedged TX ring and recover it if stalled.
+ *
+ * Call periodically (e.g. once per second) from a non-ISR context. The DMA
+ * halts TXQ0 scanning when it walks into an already-USED descriptor and
+ * does not reliably generate a fresh interrupt to report that — see
+ * ThreadXGEM2Driver.c's XEMACPS_IXR_TXUSED_MASK comment. This detects "no
+ * TX completions since the last call, but frames are still queued" and
+ * performs the same TXQBASE resync recovery the ISR attempts, so a stall
+ * that produces no further interrupt at all still gets recovered.
+ */
+void gem2_tx_poll_recover(void);
 
 #ifdef __cplusplus
 }

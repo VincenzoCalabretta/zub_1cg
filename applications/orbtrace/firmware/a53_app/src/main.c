@@ -92,6 +92,7 @@ static void diag_thread_entry(ULONG arg)
     (void)arg;
     for (;;) {
         tx_thread_sleep(100); /* 1 s @ 100 Hz tick */
+        gem2_tx_poll_recover();
         ULONG isr  = *(volatile ULONG *)(GEM2_BASE + GEM2_ISR_OFF);
         ULONG nwsr = *(volatile ULONG *)(GEM2_BASE + GEM2_NWSR_OFF);
         unsigned int rx_frames, tx_frames, isr_calls, last_etype, last_len, tx_complete, last_tx_stat;
@@ -102,12 +103,19 @@ static void diag_thread_entry(ULONG arg)
                       &driver_cmd_count, &last_driver_cmd, &last_driver_status);
         unsigned int txused_count, last_txsr;
         gem2_diag_get_tx_extra(&txused_count, &last_txsr);
+        unsigned int tx_recover_attempts, tx_recover_txqbase_before, tx_recover_txqbase_after;
+        gem2_diag_get_tx_recover(&tx_recover_attempts, &tx_recover_txqbase_before, &tx_recover_txqbase_after);
+        unsigned int tx_dst_msw, tx_dst_lsw, tx_dst_cmd;
+        gem2_diag_get_tx_dst(&tx_dst_msw, &tx_dst_lsw, &tx_dst_cmd);
         xil_printf("diag: ISR=0x%lx NWSR=0x%lx isr_calls=%u rx_frames=%u tx_frames=%u last_etype=0x%x "
                    "last_len=%u tx_complete=%u last_tx_stat=0x%x tx_head=%u tx_tail=%u tx_count=%u "
-                   "last_isr=0x%x rxused_count=%u txused_count=%u last_txsr=0x%x drv_cmds=%u last_cmd=%u last_status=%d\r\n",
+                   "last_isr=0x%x rxused_count=%u txused_count=%u last_txsr=0x%x drv_cmds=%u last_cmd=%u last_status=%d "
+                   "tx_recover_attempts=%u tx_recover_txqbase=0x%x->0x%x tx_dst=%x:%08x tx_dst_cmd=%u\r\n",
                    isr, nwsr, isr_calls, rx_frames, tx_frames, last_etype, last_len,
                    tx_complete, last_tx_stat, tx_head, tx_tail, tx_count, last_isr, rxused_count,
-                   txused_count, last_txsr, driver_cmd_count, last_driver_cmd, (int)last_driver_status);
+                   txused_count, last_txsr, driver_cmd_count, last_driver_cmd, (int)last_driver_status,
+                   tx_recover_attempts, tx_recover_txqbase_before, tx_recover_txqbase_after,
+                   tx_dst_msw, tx_dst_lsw, tx_dst_cmd);
 
         /* Temporary bring-up diagnostic: NetX's own drop/error counters
          * (NX_IP_INFO / NX_TCP_INFO are on by default — not disabled

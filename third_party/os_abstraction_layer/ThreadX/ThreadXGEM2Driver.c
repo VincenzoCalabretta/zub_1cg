@@ -180,6 +180,12 @@ typedef struct {
     u32 diag_driver_cmd_count;
     u32 diag_last_driver_cmd;
     u32 diag_last_driver_status;
+    u32 diag_tx_recover_attempts;
+    u32 diag_tx_recover_txqbase_before;
+    u32 diag_tx_recover_txqbase_after;
+    u32 diag_last_tx_dst_msw;
+    u32 diag_last_tx_dst_lsw;
+    u32 diag_last_tx_cmd;
     u8  diag_ip_header_dump[40];
 } Gem2Ctx;
 
@@ -213,6 +219,30 @@ void gem2_diag_get_tx_extra(u32 *txused_count, u32 *last_txsr)
 {
     *txused_count = sCtx.diag_txused_count;
     *last_txsr = sCtx.diag_last_txsr;
+}
+
+/* Temporary bring-up diagnostic accessor: whether gem2_tx_poll_recover()
+ * has actually attempted a recovery, and whether the TXQBASE write itself
+ * takes visible effect (before/after read of the same register within the
+ * same recovery call) — narrows "recovery never runs" from "recovery runs
+ * but the register write doesn't stick / hardware ignores it". */
+void gem2_diag_get_tx_recover(u32 *attempts, u32 *txqbase_before, u32 *txqbase_after)
+{
+    *attempts = sCtx.diag_tx_recover_attempts;
+    *txqbase_before = sCtx.diag_tx_recover_txqbase_before;
+    *txqbase_after = sCtx.diag_tx_recover_txqbase_after;
+}
+
+/* Temporary bring-up diagnostic: the destination MAC (as msw/lsw) and the
+ * NX_IP_DRIVER command NetX supplied for the most recent gem2_packet_send()
+ * call — to check what NetX itself resolved as the destination hardware
+ * address for non-ARP sends (TCP replies), independent of anything on the
+ * wire. */
+void gem2_diag_get_tx_dst(u32 *dst_msw, u32 *dst_lsw, u32 *cmd)
+{
+    *dst_msw = sCtx.diag_last_tx_dst_msw;
+    *dst_lsw = sCtx.diag_last_tx_dst_lsw;
+    *cmd = sCtx.diag_last_tx_cmd;
 }
 
 /* Temporary bring-up diagnostic: raw RX BD ring state (all GEM2_BD_COUNT
@@ -543,6 +573,42 @@ static void gem2_initialize(NX_IP_DRIVER *req)
         return;
     }
 
+    /* 5b. Arm every TX BD to a safe "already consumed" idle state before the
+     * DMA is ever started. XEmacPs_BdRingCreate() only memset()s the ring to
+     * all-zero (see xemacps_bdring.c) — it does not set USED on any
+     * descriptor, and WRAP (a bit inside the TX STAT word, unlike RX where
+     * it lives in the ADDR word) is never set on the last slot either. RX
+     * doesn't have this problem because gem2_alloc_rx_packet() explicitly
+     * arms every RX slot (including WRAP on the last one) in the loop below
+     * before Start(); TX had no equivalent step. Root-caused on real
+     * hardware: the first send (always landing in slot 0) worked because
+     * XEmacPs_Start() points TXQBASE directly at slot 0 with real data. But
+     * once that frame completed, the DMA's internal descriptor pointer
+     * advanced into slots 1-3, which were still all-zero (USED=0, LAST=0,
+     * WRAP=0) — not a valid "nothing to do, stop cleanly" marker — so it
+     * wandered off following bogus zero-length "buffers" instead of
+     * recognizing an idle ring. tx_count then grew as gem2_packet_send()
+     * queued real frames into those slots, but the DMA's pointer had already
+     * desynced from software's view and never came back, exactly mirroring
+     * the RXUSED desync this driver already had to work around for RX (see
+     * gem2_irq_handler()'s XEMACPS_IXR_RXUSED_MASK branch) — except TX had
+     * no equivalent recovery and, worse, was never armed correctly to begin
+     * with. Fixed the idiomatic way: XEmacPs_BdRingClone() with a
+     * USED-marked template, exactly as Xilinx's own reference driver does
+     * (xemacps_example_intr_dma.c's TxBD setup) — it clones the template
+     * across every slot and automatically sets WRAP on the last one. */
+    {
+        XEmacPs_Bd bd_template;
+        XEmacPs_BdClear(&bd_template);
+        XEmacPs_BdSetStatus(&bd_template, XEMACPS_TXBUF_USED_MASK);
+        rc = XEmacPs_BdRingClone(&XEmacPs_GetTxRing(&sCtx.mac), &bd_template, XEMACPS_SEND);
+        if (rc != XST_SUCCESS) {
+            xil_printf("gem2: TX BdRingClone failed rc=%ld\r\n", rc);
+            req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
+            return;
+        }
+    }
+
     /* 6. RX BD ring */
     rc = XEmacPs_BdRingCreate(
             &XEmacPs_GetRxRing(&sCtx.mac),
@@ -690,6 +756,10 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
     ULONG dst_lsw = req->nx_ip_driver_physical_address_lsw;
     ULONG src_msw = req->nx_ip_driver_interface->nx_interface_physical_address_msw;
     ULONG src_lsw = req->nx_ip_driver_interface->nx_interface_physical_address_lsw;
+
+    sCtx.diag_last_tx_dst_msw = (u32)dst_msw;
+    sCtx.diag_last_tx_dst_lsw = (u32)dst_lsw;
+    sCtx.diag_last_tx_cmd = (u32)req->nx_ip_driver_command;
 
     eth[0] = (u8)(dst_msw >> 8);  eth[1] = (u8)dst_msw;
     eth[2] = (u8)(dst_lsw >> 24); eth[3] = (u8)(dst_lsw >> 16);
@@ -864,6 +934,91 @@ static UINT gem2_alloc_rx_packet(u32 slot)
     return NX_SUCCESS;
 }
 
+/* ── TX stall recovery (polled from main.c's diag thread) ──────────────── */
+
+/* Resync TXQBASE to software's tx_tail and re-kick, exactly mirroring the
+ * RXUSED recovery in gem2_irq_handler() below. */
+static void gem2_tx_stall_recover(void)
+{
+    sCtx.diag_tx_recover_attempts++;
+    sCtx.diag_tx_recover_txqbase_before =
+        XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXQBASE_OFFSET);
+    u32 ctrl = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET);
+    XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
+                      ctrl & ~XEMACPS_NWCTRL_TXEN_MASK);
+    UINTPTR next_bd = (UINTPTR)(sCtx.tx_bd + sCtx.tx_tail * GEM2_BD_STRIDE);
+    XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXQBASE_OFFSET,
+                      (u32)(next_bd & 0xFFFFFFFFU));
+#if defined(__aarch64__)
+    XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_MSBBUF_TXQBASE_OFFSET,
+                      (u32)((u64)next_bd >> 32));
+#endif
+    XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
+                      ctrl | XEMACPS_NWCTRL_TXEN_MASK);
+    XEmacPs_Transmit(&sCtx.mac);  /* re-kick STARTTX now TXQBASE is resynced */
+    sCtx.diag_tx_recover_txqbase_after =
+        XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXQBASE_OFFSET);
+}
+
+/* Called once a second from main.c's diag thread (a non-ISR context).
+ *
+ * Root-caused on real hardware across two failed attempts before this one:
+ * the DMA halts TXQ0 scanning the moment it walks into an already-USED
+ * descriptor (same failure class as RXUSED — see that branch below) and
+ * does *not* reliably raise a further interrupt to report the ongoing
+ * stall: confirmed via isr_calls/txused_count both going flat while
+ * tx_count sat stuck at GEM2_TX_BD_COUNT for the rest of a session. So
+ * this cannot be driven from the ISR at all — there is nothing to trigger
+ * on. Polling is the only signal left.
+ *
+ * The first version of this recovery *was* ISR-triggered (on
+ * XEMACPS_IXR_TXUSED_MASK) with a one-shot "already kicked" latch that
+ * gem2_packet_send() cleared on every new frame queued. That was actively
+ * wrong, not just ineffective: TXUSED fires on essentially every real send
+ * too (the ZynqMP TXQ1-priority-queue scan quirk documented in the
+ * XEMACPS_IXR_TXUSED_MASK branch below), so clearing the latch right
+ * before each send's own benign TXUSED meant this recovery — which toggles
+ * TXEN off — ran on almost every transmit, quite possibly aborting a
+ * legitimate in-flight DMA transfer for the frame that had just triggered
+ * it. Confirmed on real hardware to still fail identically to the
+ * no-recovery baseline (TXQBASE never moved from tx_bd_base across a full
+ * stall) — consistent with the recovery firing but being immediately
+ * undone or corrupted by racing real hardware activity, not with it simply
+ * not running.
+ *
+ * This version instead tracks whether *any* TX completion has happened
+ * between one poll tick and the next (via diag_tx_complete, a
+ * monotonically-increasing counter): if frames are queued (tx_count > 0)
+ * and zero completions occurred in the last full second, the ring is
+ * declared stalled and recovered. This is decoupled from send/interrupt
+ * timing entirely, so it can't race a legitimate in-flight transfer the
+ * way the ISR-triggered version did — a real transmission completes in
+ * well under a second. Retries every second for as long as the ring stays
+ * stuck, rather than a permanent one-shot latch that a failed first
+ * attempt could never recover from. */
+void gem2_tx_poll_recover(void)
+{
+    static u32 last_tx_complete;
+    static u32 last_seen_progress = 1U;  /* assume healthy until proven otherwise */
+
+    if (sCtx.tx_count == 0U) {
+        last_tx_complete = sCtx.diag_tx_complete;
+        last_seen_progress = 1U;
+        return;
+    }
+
+    if (sCtx.diag_tx_complete != last_tx_complete) {
+        last_tx_complete = sCtx.diag_tx_complete;
+        last_seen_progress = 1U;
+        return;
+    }
+
+    if (!last_seen_progress) {
+        gem2_tx_stall_recover();
+    }
+    last_seen_progress = 0U;
+}
+
 /* ── GEM2 IRQ handler (overrides weak no-op in board/a53/timer.c) ──────── */
 
 void gem2_irq_handler(void)
@@ -924,17 +1079,31 @@ void gem2_irq_handler(void)
          * USED|WRAP "dummy" BD parked at TXQ1 (see the ZynqMP TXQ1
          * workaround at the top of this file) — ZynqMP GEM checks TXQ1
          * before TXQ0 on *every* transmit cycle, not just once at reset, so
-         * this is expected and benign on every single send, not evidence of
-         * a genuine stall. Confirmed on real hardware the hard way: an
-         * earlier version of this handler reprogrammed the TXQ0 queue
-         * pointer and re-kicked STARTTX in response to every TXUSED, which
-         * immediately re-triggered the same TXQ1 dummy scan and spun into
-         * an interrupt storm (isr_calls/txused_count climbing into the
-         * millions per second). Just acknowledge TXSR here; do not touch
-         * the queue pointer or re-kick — gem2_tx_cleanup() (TXCOMPL) and
-         * the next gem2_packet_send() call are sufficient for the normal
-         * case, and genuine TX stalls need a distinguishable signal from
-         * TXQ0 specifically, not this shared/aggregate status bit. */
+         * most firings are expected/benign, not evidence of a genuine
+         * stall, and it also fires (at most once) when TXQ0 itself
+         * genuinely halts on a used descriptor — see gem2_tx_poll_recover()
+         * for that failure mode and its recovery.
+         *
+         * Deliberately just acknowledge TXSR here; do not attempt recovery
+         * from this interrupt. Two earlier versions of this handler tried
+         * that and both failed on real hardware for related reasons: (1)
+         * reprogramming TXQBASE and re-kicking STARTTX in response to
+         * *every* TXUSED re-triggers the same TXQ1 dummy scan and spins
+         * into an interrupt storm (isr_calls/txused_count climbing into
+         * the millions per second); (2) gating that recovery with a
+         * latch cleared on every newly-queued frame does avoid the storm,
+         * but since TXUSED also fires as a benign side effect of *every*
+         * real send, the latch gets cleared right before that send's own
+         * benign TXUSED fires again — so the recovery (which toggles TXEN
+         * off) ends up running on almost every transmit, quite possibly
+         * aborting a legitimate in-flight DMA transfer for the frame that
+         * just triggered it. Confirmed on real hardware: TXQBASE never
+         * moved off tx_bd_base across a full stall with that version
+         * either, consistent with the recovery firing but being undone or
+         * corrupted by racing real hardware activity. gem2_tx_poll_recover()
+         * (called once a second from main.c's diag thread, a non-ISR
+         * context decoupled from send/interrupt timing) is the only
+         * recovery path now — see its comment for the full history. */
         u32 txsr = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXSR_OFFSET);
         sCtx.diag_last_txsr = txsr;
         XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXSR_OFFSET, txsr);
