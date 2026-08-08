@@ -42,7 +42,8 @@ void gem2_irq_handler(void);
  */
 void gem2_diag_get(unsigned int *rx_frames, unsigned int *tx_frames, unsigned int *isr_calls,
                     unsigned int *last_etype, unsigned int *last_len,
-                    unsigned int *tx_complete, unsigned int *last_tx_stat);
+                    unsigned int *tx_complete, unsigned int *last_tx_stat,
+                    unsigned int *tx_head, unsigned int *tx_tail, unsigned int *tx_count);
 
 #ifdef __cplusplus
 }

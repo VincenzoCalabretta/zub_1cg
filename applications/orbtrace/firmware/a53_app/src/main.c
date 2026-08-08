@@ -95,10 +95,13 @@ static void diag_thread_entry(ULONG arg)
         ULONG isr  = *(volatile ULONG *)(GEM2_BASE + GEM2_ISR_OFF);
         ULONG nwsr = *(volatile ULONG *)(GEM2_BASE + GEM2_NWSR_OFF);
         unsigned int rx_frames, tx_frames, isr_calls, last_etype, last_len, tx_complete, last_tx_stat;
-        gem2_diag_get(&rx_frames, &tx_frames, &isr_calls, &last_etype, &last_len, &tx_complete, &last_tx_stat);
+        unsigned int tx_head, tx_tail, tx_count;
+        gem2_diag_get(&rx_frames, &tx_frames, &isr_calls, &last_etype, &last_len, &tx_complete, &last_tx_stat,
+                      &tx_head, &tx_tail, &tx_count);
         xil_printf("diag: ISR=0x%lx NWSR=0x%lx isr_calls=%u rx_frames=%u tx_frames=%u last_etype=0x%x "
-                   "last_len=%u tx_complete=%u last_tx_stat=0x%x\r\n",
-                   isr, nwsr, isr_calls, rx_frames, tx_frames, last_etype, last_len, tx_complete, last_tx_stat);
+                   "last_len=%u tx_complete=%u last_tx_stat=0x%x tx_head=%u tx_tail=%u tx_count=%u\r\n",
+                   isr, nwsr, isr_calls, rx_frames, tx_frames, last_etype, last_len,
+                   tx_complete, last_tx_stat, tx_head, tx_tail, tx_count);
     }
 }
 

@@ -72,6 +72,14 @@ extern void xil_printf(const char *fmt, ...);
 /* BD ring depth — must be a power of 2 for the index-wrap arithmetic */
 #define GEM2_BD_COUNT    4U
 
+/* TX ring depth. Root-caused on real hardware: with GEM2_TX_BD_COUNT
+ * temporarily forced to 1, only the ring's first descriptor ever completed
+ * — the true fault was gem2_packet_send() never building an Ethernet
+ * header (NetX hands the driver only the upper-layer payload; see that
+ * function's comment), producing undersized/malformed frames on the wire.
+ * Restored to GEM2_BD_COUNT now that framing is fixed. */
+#define GEM2_TX_BD_COUNT GEM2_BD_COUNT
+
 /* XEmacPs DMA requires 64-byte aligned BDs */
 #define GEM2_BD_ALIGN    64U
 
@@ -92,14 +100,14 @@ typedef struct {
     NX_PACKET_POOL *pool_ptr;
 
     /* TX BD ring + ZynqMP TXQ1 dummy BD */
-    u8 tx_bd[GEM2_BD_COUNT * GEM2_BD_ALIGN] __attribute__((aligned(GEM2_BD_ALIGN)));
+    u8 tx_bd[GEM2_TX_BD_COUNT * GEM2_BD_ALIGN] __attribute__((aligned(GEM2_BD_ALIGN)));
     u8 tx_q1_dummy[GEM2_BD_ALIGN]           __attribute__((aligned(GEM2_BD_ALIGN)));
 
     /* Static per-slot TX buffers for multi-buffer packet flattening */
-    u8 tx_buf[GEM2_BD_COUNT][GEM2_RX_BUFSIZE] __attribute__((aligned(GEM2_BD_ALIGN)));
+    u8 tx_buf[GEM2_TX_BD_COUNT][GEM2_RX_BUFSIZE] __attribute__((aligned(GEM2_BD_ALIGN)));
 
     /* NX_PACKET pointers for in-flight TX (released on TX complete) */
-    NX_PACKET *tx_pkts[GEM2_BD_COUNT];
+    NX_PACKET *tx_pkts[GEM2_TX_BD_COUNT];
 
     /* TX ring head (next free BD) and tail (oldest in-flight BD) */
     u32 tx_head;
@@ -132,7 +140,7 @@ static Gem2Ctx sCtx;
 
 /* Temporary bring-up diagnostic accessor — see main.c's diag_thread_entry. */
 void gem2_diag_get(u32 *rx_frames, u32 *tx_frames, u32 *isr_calls, u32 *last_etype, u32 *last_len,
-                    u32 *tx_complete, u32 *last_tx_stat)
+                    u32 *tx_complete, u32 *last_tx_stat, u32 *tx_head, u32 *tx_tail, u32 *tx_count)
 {
     *rx_frames = sCtx.diag_rx_frames;
     *tx_frames = sCtx.diag_tx_frames;
@@ -141,6 +149,9 @@ void gem2_diag_get(u32 *rx_frames, u32 *tx_frames, u32 *isr_calls, u32 *last_ety
     *last_len = sCtx.diag_last_len;
     *tx_complete = sCtx.diag_tx_complete;
     *last_tx_stat = sCtx.diag_last_tx_stat;
+    *tx_head = sCtx.tx_head;
+    *tx_tail = sCtx.tx_tail;
+    *tx_count = sCtx.tx_count;
 }
 
 /* ── Forward declarations ──────────────────────────────────────────────── */
@@ -233,7 +244,6 @@ static void gem2_phy_enable_tx_delay(XEmacPs *mac)
         xil_printf("gem2: PHY not found on MDIO bus\r\n");
         return;
     }
-
     /* The PHY chip is not reset by JTAG/PS resets — only by a full board
      * power cycle — so its register state can carry over from an earlier
      * run (bit us once this session: bypass_rxdll left set from a control
@@ -388,7 +398,7 @@ static void gem2_initialize(NX_IP_DRIVER *req)
     rc = XEmacPs_BdRingCreate(
             &XEmacPs_GetTxRing(&sCtx.mac),
             (UINTPTR)sCtx.tx_bd, (UINTPTR)sCtx.tx_bd,
-            GEM2_BD_ALIGN, GEM2_BD_COUNT);
+            GEM2_BD_ALIGN, GEM2_TX_BD_COUNT);
     if (rc != XST_SUCCESS) {
         xil_printf("gem2: TX BdRingCreate failed rc=%ld\r\n", rc);
         req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
@@ -486,12 +496,59 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
     NX_PACKET *pkt   = req->nx_ip_driver_packet;
     u32 slot = sCtx.tx_head;
 
-    if (sCtx.tx_count >= GEM2_BD_COUNT) {
+    if (sCtx.tx_count >= GEM2_TX_BD_COUNT) {
         /* Ring full — drop; caller must handle retransmit */
         nx_packet_transmit_release(pkt);
         req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
         return;
     }
+
+    /* NetX Duo's IP/ARP layers hand the driver only the upper-layer payload
+     * (see e.g. nx_arp_packet_send.c, which only prepends the ARP message
+     * itself) plus the resolved destination address in
+     * nx_ip_driver_physical_address_msw/lsw — building the 14-byte Ethernet
+     * header is the driver's job, per NetX's own reference driver
+     * (nx_ram_network_driver.c's NX_LINK_PACKET_SEND/ARP_SEND/... case).
+     * Without this, the MAC transmitted raw upper-layer bytes with no
+     * Ethernet framing at all: confirmed on real hardware via tcpdump, which
+     * showed exactly the ARP message bytes with no header, misparsed as a
+     * bogus 802.3 frame with a garbage "MAC" address built from ARP payload
+     * bytes. This was mistaken for an RGMII timing/skew problem earlier in
+     * this bring-up — see ORBTRACE_TEST_REPORT follow-up notes — but a real
+     * skew issue would not produce byte-identical "corruption" independent
+     * of PHY tap_sel, which is what a tap_sel sweep on real hardware showed
+     * once the separate TX-ring-stall bug (GEM2_TX_BD_COUNT) was fixed. */
+    u16 ether_type;
+    switch (req->nx_ip_driver_command) {
+        case NX_LINK_ARP_SEND:
+        case NX_LINK_ARP_RESPONSE_SEND:
+            ether_type = NX_ETHERNET_ARP;
+            break;
+        case NX_LINK_RARP_SEND:
+            ether_type = NX_ETHERNET_RARP;
+            break;
+        default:
+            ether_type = (pkt->nx_packet_ip_version == 4U) ? NX_ETHERNET_IP : NX_ETHERNET_IPV6;
+            break;
+    }
+
+    pkt->nx_packet_prepend_ptr -= NX_ETHERNET_SIZE;
+    pkt->nx_packet_length += NX_ETHERNET_SIZE;
+
+    u8 *eth = (u8 *)pkt->nx_packet_prepend_ptr;
+    ULONG dst_msw = req->nx_ip_driver_physical_address_msw;
+    ULONG dst_lsw = req->nx_ip_driver_physical_address_lsw;
+    ULONG src_msw = req->nx_ip_driver_interface->nx_interface_physical_address_msw;
+    ULONG src_lsw = req->nx_ip_driver_interface->nx_interface_physical_address_lsw;
+
+    eth[0] = (u8)(dst_msw >> 8);  eth[1] = (u8)dst_msw;
+    eth[2] = (u8)(dst_lsw >> 24); eth[3] = (u8)(dst_lsw >> 16);
+    eth[4] = (u8)(dst_lsw >> 8);  eth[5] = (u8)dst_lsw;
+    eth[6] = (u8)(src_msw >> 8);  eth[7] = (u8)src_msw;
+    eth[8] = (u8)(src_lsw >> 24); eth[9] = (u8)(src_lsw >> 16);
+    eth[10] = (u8)(src_lsw >> 8); eth[11] = (u8)src_lsw;
+    eth[12] = (u8)(ether_type >> 8);
+    eth[13] = (u8)ether_type;
 
     /* Flatten the packet chain into the static TX buffer for this slot.
      * This adds a copy but avoids aliasing the NX_PACKET data area while
@@ -513,13 +570,13 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
                     (total & 0x3FFFU)       |
                     XEMACPS_TXBUF_LAST_MASK |
                     /* set WRAP on last BD in ring */
-                    ((slot == GEM2_BD_COUNT - 1U) ? XEMACPS_TXBUF_WRAP_MASK : 0U));
+                    ((slot == GEM2_TX_BD_COUNT - 1U) ? XEMACPS_TXBUF_WRAP_MASK : 0U));
 
     Xil_DCacheFlushRange((UINTPTR)sCtx.tx_buf[slot], total);
     Xil_DCacheFlushRange((UINTPTR)bd, GEM2_BD_ALIGN);
 
     sCtx.tx_pkts[slot] = pkt;
-    sCtx.tx_head = (slot + 1U) % GEM2_BD_COUNT;
+    sCtx.tx_head = (slot + 1U) % GEM2_TX_BD_COUNT;
     sCtx.tx_count++;
     sCtx.diag_tx_frames++;
 
@@ -603,7 +660,7 @@ static void gem2_tx_cleanup(void)
             sCtx.tx_pkts[slot] = NX_NULL;
         }
 
-        sCtx.tx_tail = (slot + 1U) % GEM2_BD_COUNT;
+        sCtx.tx_tail = (slot + 1U) % GEM2_TX_BD_COUNT;
         sCtx.tx_count--;
     }
 }
