@@ -378,7 +378,7 @@ fn run_watch_r5(args: WatchR5Args) -> Result<bool> {
             .with_context(|| format!("resolve psu_init: {}", psinit.display()))?;
         eprintln!("[zub_ctl] launching xsct for psu_init…");
         let mut cmd = Command::new(xsct);
-        cmd.arg(script).arg(psinit_abs);
+        cmd.arg("-nodisp").arg(script).arg(psinit_abs);
         let s = run_subprocess(&mut cmd, "XSCT")?;
         if !s.success() {
             eprintln!("[zub_ctl] xsct psu_init exited with status {s:?}");
@@ -462,7 +462,7 @@ fn run_watch_a53(args: WatchA53Args) -> Result<bool> {
 
     eprintln!("[zub_ctl] launching xsct…");
     let mut cmd = Command::new(&args.xsct);
-    cmd.arg(&tmp);
+    cmd.arg("-nodisp").arg(&tmp);
     let xsct_status = run_subprocess(&mut cmd, "XSCT")?;
     if !xsct_status.success() {
         eprintln!("[zub_ctl] xsct exited with status {xsct_status:?}");

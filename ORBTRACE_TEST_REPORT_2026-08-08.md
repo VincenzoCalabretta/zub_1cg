@@ -305,3 +305,118 @@ the original report are all still untouched.
 5. Watch the **15 ps hold margin** (WHS) on future RTL changes to this
    design — it currently passes `build.tcl`'s `< 0` gate but has almost no
    room before a routing/placement change could flip it negative.
+
+## Follow-up session 2. xsct environment fixed, JTAG automation working, new bugs found
+
+Same calendar day, later session. Started from a request to implement this
+report's suggested next steps. Step 1 (bootable A53 image) turned out to
+already be done, in commits `03c53d8` and `8320264`, made between this
+report's first write-up and this session. Step 4 (JTAG/XSCT load path) was
+the actual blocker hit this session.
+
+### xsct could not launch at all; root cause and fix (machine-local, not this repo)
+
+`tooling/xsct/jtag_flash.sh` and `zub_ctl watch-a53` both call `xsct`, but on
+this machine `xsct` failed before reaching any JTAG code, in two distinct
+ways, neither visible in this repo:
+
+1. `libtinfo.so.5` was reported missing. The real problem was one layer
+   deeper: the Nix-packaged FHS environment wrapping `xsct` (a different,
+   separately-built environment from the one wrapping Vivado, which already
+   worked) never provisioned `/usr/lib` at all inside its sandbox. Once
+   `LD_LIBRARY_PATH` was pointed at Xilinx's own bundled
+   `Vitis/2023.2/lib/lnx64.o`, every other "missing" library the earlier
+   error implied (boost 1.72, python3.8, tcl8.5, xerces-c 3.2, ...) resolved
+   immediately, because all of them already ship inside the Xilinx install
+   itself; they were never a Nix packaging gap. `libtinfo.so.5` alone was
+   a genuine gap (nixpkgs' `ncurses-abi5-compat` only registers the SONAME
+   `libncursesw.so.5` in `ldconfig`'s cache, not the `libtinfo.so.5` alias
+   name a plain file search needs), fixed with one symlink placed directly
+   in `Vitis/2023.2/lib/lnx64.o/libtinfo.so.5`.
+   Fix applied to `/home/v/opt/vitis/Vitis/2023.2/bin/setupEnv.sh` (sourced
+   by `xsct` before anything else runs): exports `LD_LIBRARY_PATH` to
+   include that directory. Machine-local, not part of this repo, and will
+   need repeating on any other machine hitting the same error.
+2. Even after that fix, `xsct` invoked non-interactively (a script path, not
+   `-eval`) tried to start a dummy X server (`Xvfb`) for reasons unrelated
+   to JTAG scripting, and that attempt fails in this sandbox, causing `xsct`
+   to exit silently before running any TCL at all. Fixed properly, in this
+   repo: pass `-nodisp` to every non-interactive `xsct` invocation
+   (`tooling/xsct/jtag_flash.sh`, both call sites in `tooling/zub_ctl/src/main.rs`).
+
+With both fixed, `bazel test //tests:orbtrace_a53_app_test --config=host
+--config=onboard --test_env=XSCT=<nix-wrapped xsct>` flashes the bitstream,
+runs `psu_init`, loads the A53 ELF, and confirms the boot banner over UART,
+end to end, repeatably.
+
+### Three real bugs found and fixed on real hardware
+
+1. **RX descriptor ring never returned to the DMA engine**
+   (`ThreadXGEM2Driver.c`, `gem2_alloc_rx_packet`). `XEmacPs_BdSetAddressRx`
+   only touches the address bits of a descriptor and deliberately preserves
+   the low two bits (NEW and WRAP); it does not clear NEW as its callers
+   commonly assume. Every refilled slot kept the hardware-set NEW=1 bit
+   forever, so once each of the 4 ring slots had received one frame, none
+   were ever handed back to the DMA engine and RX stopped permanently.
+   Confirmed on hardware: before this fix RX died after exactly
+   `GEM2_BD_COUNT` frames, every time. Fixed with an explicit
+   `XEmacPs_BdClearRxNew(bd)` call after refill.
+2. **RXUSED interrupt never enabled.** The DMA engine halts RX scanning at
+   the hardware level the instant it finds a used descriptor, independent of
+   whether that condition is unmasked into an interrupt. It was not
+   unmasked, so the one case not fully covered by fix (1), the DMA's own
+   internal descriptor pointer desyncing from software's `rx_tail`, produced
+   total, permanent RX silence with no CPU-visible signal at all: no crash,
+   no further interrupts of any kind, `diag_thread` (a different thread, a
+   different interrupt source) unaffected and still printing every second,
+   looking identical to a wiring problem. Fixed by enabling
+   `XEMACPS_IXR_RXUSED_MASK` and, in the ISR, re-pointing the RX queue base
+   at the current `rx_tail` slot before re-enabling RX, forcing the DMA
+   engine to resync to a descriptor known to be free.
+3. **`nx_interface_ip_mtu_size` never set.** Left at its zero-initialized
+   default, this doesn't affect ARP (which bypasses IP-layer MTU checks) but
+   silently blocks NetX from generating outbound IP-layer traffic, looking
+   identical on the wire to the driver just not replying. Fixed by setting
+   it to 1500 in `gem2_initialize`.
+
+Each of these was confirmed independently: (1) and (2) via a run counter
+added to the ISR (`diag_rxused_count`, `diag_last_isr`) and repeated
+reflash/observe cycles; (3) via `tcpdump` on the host NIC plus a manual
+IP-header checksum verification (folds to `0xffff`, confirming the packet
+NetX receives is byte-identical to what left the host, protocol, ports, and
+TCP flags all correct) proving the RX path itself was never the problem for
+what turned out to be a send-side gap.
+
+### Open: TCP handshake still does not complete
+
+With all three fixes in place, ARP resolves reliably and repeatably (RX
+receives an unbounded number of frames without stalling, confirmed over
+multiple SYN retransmission bursts), but a TCP SYN to either port (3401,
+3240) never gets any reply: not a SYN-ACK, not an RST, and, per a driver
+command dispatch counter added this session (`diag_driver_cmd_count`,
+`diag_last_driver_cmd`), NetX's IP thread never calls back into the driver
+at all after the initial ARP reply, not even to request a fresh ARP
+resolution for the host (192.168.1.1), which NetX Duo's ARP cache would need
+before it could send a reply back (confirmed via source read of
+`nx_arp_packet_receive.c`: unsolicited ARP requests only refresh existing
+cache entries, they do not create new ones).
+
+This is squarely inside NetX Duo's internal TCP/ARP interaction now, not the
+driver. `//tests:orbtrace_throughput_test` (TCP 3401) will keep failing
+until this is resolved. Suggested next steps, in order of likely leverage:
+
+1. Trace `_nx_ip_packet_deferred_receive`'s consumer (`_nx_ip_thread_entry`
+   or whatever dequeues `nx_ip_deferred_received_packet_head`) to find where
+   a valid, checksummed SYN for a listening socket stops being processed.
+2. Check whether NetX Duo needs an explicit ARP table pre-seed
+   (`nx_arp_dynamic_entry_set` or similar) for the peer before a listening
+   socket can reply, given the "requests only refresh, never create" cache
+   behavior noted above; if so, either seed it opportunistically from
+   `_nx_arp_packet_receive`-adjacent driver code, or find the right NetX
+   Duo API to force resolution.
+3. Diagnostics left in the tree for this specific investigation:
+   `diag_driver_cmd_count`/`diag_last_driver_cmd`/`diag_last_driver_status`
+   (which driver command NetX last issued) and the raw IP-header hex dump
+   printed for the last IP-type frame received. Both were useful this
+   session and are cheap to keep; remove once the handshake completes and
+   they've stopped earning their keep.

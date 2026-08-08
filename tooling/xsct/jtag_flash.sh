@@ -65,4 +65,4 @@ con
 puts "\\nDone. Connect serial terminal at 115200 baud."
 EOF
 
-exec "$XSCT" "$TCL"
+exec "$XSCT" -nodisp "$TCL"

@@ -134,13 +134,21 @@ typedef struct {
     u32 diag_last_len;
     u32 diag_tx_complete;
     u32 diag_last_tx_stat;
+    u32 diag_last_isr;
+    u32 diag_rxused_count;
+    u32 diag_driver_cmd_count;
+    u32 diag_last_driver_cmd;
+    u32 diag_last_driver_status;
+    u8  diag_ip_header_dump[40];
 } Gem2Ctx;
 
 static Gem2Ctx sCtx;
 
 /* Temporary bring-up diagnostic accessor — see main.c's diag_thread_entry. */
 void gem2_diag_get(u32 *rx_frames, u32 *tx_frames, u32 *isr_calls, u32 *last_etype, u32 *last_len,
-                    u32 *tx_complete, u32 *last_tx_stat, u32 *tx_head, u32 *tx_tail, u32 *tx_count)
+                    u32 *tx_complete, u32 *last_tx_stat, u32 *tx_head, u32 *tx_tail, u32 *tx_count,
+                    u32 *last_isr, u32 *rxused_count, u32 *driver_cmd_count, u32 *last_driver_cmd,
+                    u32 *last_driver_status)
 {
     *rx_frames = sCtx.diag_rx_frames;
     *tx_frames = sCtx.diag_tx_frames;
@@ -152,6 +160,19 @@ void gem2_diag_get(u32 *rx_frames, u32 *tx_frames, u32 *isr_calls, u32 *last_ety
     *tx_head = sCtx.tx_head;
     *tx_tail = sCtx.tx_tail;
     *tx_count = sCtx.tx_count;
+    *driver_cmd_count = sCtx.diag_driver_cmd_count;
+    *last_driver_cmd = sCtx.diag_last_driver_cmd;
+    *last_driver_status = sCtx.diag_last_driver_status;
+    *last_isr = sCtx.diag_last_isr;
+    *rxused_count = sCtx.diag_rxused_count;
+}
+
+/* Temporary bring-up diagnostic: copies the last received IP frame's first
+ * 40 bytes (past the Ethernet header) so it can be dumped over UART and
+ * compared byte-for-byte against a host-side capture. */
+void gem2_diag_get_ip_dump(unsigned char *out40)
+{
+    memcpy(out40, sCtx.diag_ip_header_dump, sizeof(sCtx.diag_ip_header_dump));
 }
 
 /* ── Forward declarations ──────────────────────────────────────────────── */
@@ -295,6 +316,9 @@ static void gem2_phy_enable_tx_delay(XEmacPs *mac)
 
 void nx_driver_gem2(NX_IP_DRIVER *req)
 {
+    sCtx.diag_driver_cmd_count++;
+    sCtx.diag_last_driver_cmd = (u32)req->nx_ip_driver_command;
+
     switch (req->nx_ip_driver_command) {
         case NX_LINK_INITIALIZE:
             gem2_initialize(req);
@@ -333,6 +357,7 @@ void nx_driver_gem2(NX_IP_DRIVER *req)
             req->nx_ip_driver_status = NX_UNHANDLED_COMMAND;
             break;
     }
+    sCtx.diag_last_driver_status = (u32)req->nx_ip_driver_status;
 }
 
 /* ── LINK_INITIALIZE ───────────────────────────────────────────────────── */
@@ -393,6 +418,14 @@ static void gem2_initialize(NX_IP_DRIVER *req)
         (ULONG)((sMAC[0] << 8) | sMAC[1]);
     req->nx_ip_driver_interface->nx_interface_physical_address_lsw =
         (ULONG)((sMAC[2] << 24) | (sMAC[3] << 16) | (sMAC[4] << 8) | sMAC[5]);
+
+    /* Standard Ethernet IP MTU. Left unset, this field defaults to 0 from
+     * NetX's zero-initialized interface struct — ARP still works (it
+     * bypasses IP-layer fragmentation/MTU checks entirely), but every
+     * outbound IP packet (TCP SYN-ACK, ICMP, ...) silently fails NetX's
+     * own MTU check before ever reaching gem2_packet_send(), which looks
+     * identical on the wire to the driver just not replying. */
+    req->nx_ip_driver_interface->nx_interface_ip_mtu_size = 1500U;
 
     /* 5. TX BD ring */
     rc = XEmacPs_BdRingCreate(
@@ -467,9 +500,16 @@ static void gem2_enable(NX_IP_DRIVER *req)
      * gem2_initialize(). */
     gem2_phy_enable_tx_delay(&sCtx.mac);
 
-    /* Enable RX and TX complete interrupts in the MAC */
+    /* Enable RX, TX-complete, and RX-buffer-unavailable interrupts in the
+     * MAC. RXUSED must be enabled here, not just handled in the ISR: the
+     * DMA engine halts RX scanning at the hardware level the moment it
+     * finds a descriptor still marked used, regardless of whether that
+     * condition is masked into an interrupt — masking it just means the
+     * CPU is never told the DMA stopped, so gem2_irq_handler() never runs
+     * again and RX goes silently and permanently dead. */
     XEmacPs_IntEnable(&sCtx.mac,
-                      XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_TXCOMPL_MASK);
+                      XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_TXCOMPL_MASK |
+                      XEMACPS_IXR_RXUSED_MASK);
 
     req->nx_ip_driver_interface->nx_interface_link_up = NX_TRUE;
     req->nx_ip_driver_status = NX_SUCCESS;
@@ -613,6 +653,12 @@ static void gem2_rx_process(void)
         sCtx.diag_last_etype = etype;
         sCtx.diag_last_len = frame_len;
 
+        if (etype == NX_ETHERNET_IP) {
+            u32 dump_len = (frame_len - NX_ETHERNET_SIZE < sizeof(sCtx.diag_ip_header_dump))
+                           ? (frame_len - NX_ETHERNET_SIZE) : sizeof(sCtx.diag_ip_header_dump);
+            memcpy(sCtx.diag_ip_header_dump, eth + NX_ETHERNET_SIZE, dump_len);
+        }
+
         /* Adjust pointers past the Ethernet header */
         pkt->nx_packet_prepend_ptr += NX_ETHERNET_SIZE;
         pkt->nx_packet_length       = frame_len - NX_ETHERNET_SIZE;
@@ -689,6 +735,15 @@ static UINT gem2_alloc_rx_packet(u32 slot)
         XEmacPs_BdWrite(bd, XEMACPS_BD_ADDR_OFFSET, addr | XEMACPS_RXBUF_WRAP_MASK);
     }
 
+    /* XEmacPs_BdSetAddressRx() only touches the address bits (see
+     * XEMACPS_RXBUF_ADD_MASK) and deliberately preserves NEW/WRAP, so the
+     * "new" bit hardware set when it wrote the frame we just consumed is
+     * still 1 here. Without explicitly clearing it, this slot stays
+     * permanently "owned by software" from the DMA engine's point of view
+     * and never gets reused — once every slot in the ring has been used
+     * once, RX silently stalls forever. */
+    XEmacPs_BdClearRxNew(bd);
+
     Xil_DCacheFlushRange((UINTPTR)bd, GEM2_BD_ALIGN);
     Xil_DCacheFlushRange((UINTPTR)pkt->nx_packet_prepend_ptr, GEM2_RX_BUFSIZE);
 
@@ -703,12 +758,34 @@ void gem2_irq_handler(void)
     sCtx.diag_isr_calls++;
 
     u32 isr = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_ISR_OFFSET);
+    sCtx.diag_last_isr = isr;
 
     /* Clear interrupts by writing 1s to the ISR (write-to-clear) */
     XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_ISR_OFFSET, isr);
 
-    if (isr & XEMACPS_IXR_FRAMERX_MASK) {
+    if (isr & (XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_RXUSED_MASK)) {
         gem2_rx_process();
+    }
+    if (isr & XEMACPS_IXR_RXUSED_MASK) {
+        sCtx.diag_rxused_count++;
+        /* RXUSED ("Rx buffer used bit read") means the DMA engine's own
+         * internal descriptor pointer walked into a BD still marked used
+         * and halted receive scanning entirely. That pointer is private to
+         * the hardware — it is not the same thing as our rx_tail — so once
+         * it has desynced from software's view of the ring, merely freeing
+         * a descriptor (above) or toggling RXEN (which just re-reads
+         * whatever the hardware pointer already was) does not bring it
+         * back in sync, and RXUSED keeps re-firing forever. Re-pointing the
+         * RX queue base at software's current rx_tail slot forces the DMA
+         * engine to resume from a position we know is actually free. */
+        u32 ctrl = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET);
+        XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
+                          ctrl & ~XEMACPS_NWCTRL_RXEN_MASK);
+        XEmacPs_SetQueuePtr(&sCtx.mac,
+                            (UINTPTR)(sCtx.rx_bd + sCtx.rx_tail * GEM2_BD_ALIGN),
+                            0U, 0U);
+        XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
+                          ctrl | XEMACPS_NWCTRL_RXEN_MASK);
     }
     if (isr & XEMACPS_IXR_TXCOMPL_MASK) {
         gem2_tx_cleanup();

@@ -95,13 +95,26 @@ static void diag_thread_entry(ULONG arg)
         ULONG isr  = *(volatile ULONG *)(GEM2_BASE + GEM2_ISR_OFF);
         ULONG nwsr = *(volatile ULONG *)(GEM2_BASE + GEM2_NWSR_OFF);
         unsigned int rx_frames, tx_frames, isr_calls, last_etype, last_len, tx_complete, last_tx_stat;
-        unsigned int tx_head, tx_tail, tx_count;
+        unsigned int tx_head, tx_tail, tx_count, last_isr, rxused_count;
+        unsigned int driver_cmd_count, last_driver_cmd, last_driver_status;
         gem2_diag_get(&rx_frames, &tx_frames, &isr_calls, &last_etype, &last_len, &tx_complete, &last_tx_stat,
-                      &tx_head, &tx_tail, &tx_count);
+                      &tx_head, &tx_tail, &tx_count, &last_isr, &rxused_count,
+                      &driver_cmd_count, &last_driver_cmd, &last_driver_status);
         xil_printf("diag: ISR=0x%lx NWSR=0x%lx isr_calls=%u rx_frames=%u tx_frames=%u last_etype=0x%x "
-                   "last_len=%u tx_complete=%u last_tx_stat=0x%x tx_head=%u tx_tail=%u tx_count=%u\r\n",
+                   "last_len=%u tx_complete=%u last_tx_stat=0x%x tx_head=%u tx_tail=%u tx_count=%u "
+                   "last_isr=0x%x rxused_count=%u drv_cmds=%u last_cmd=%u last_status=%d\r\n",
                    isr, nwsr, isr_calls, rx_frames, tx_frames, last_etype, last_len,
-                   tx_complete, last_tx_stat, tx_head, tx_tail, tx_count);
+                   tx_complete, last_tx_stat, tx_head, tx_tail, tx_count, last_isr, rxused_count,
+                   driver_cmd_count, last_driver_cmd, (int)last_driver_status);
+        if (last_etype == 0x0800) {
+            unsigned char ip_dump[40];
+            gem2_diag_get_ip_dump(ip_dump);
+            xil_printf("diag: ip_dump=");
+            for (unsigned i = 0; i < sizeof(ip_dump); i++) {
+                xil_printf("%02x", ip_dump[i]);
+            }
+            xil_printf("\r\n");
+        }
     }
 }
 
@@ -142,8 +155,9 @@ static void control_thread_entry(ULONG arg)
 {
     (void)arg;
 
-    nx_tcp_server_socket_listen(&ip, ORBTRACE_CONTROL_PORT, &control_socket,
-                                 1U, NX_NULL);
+    UINT listen_status = nx_tcp_server_socket_listen(&ip, ORBTRACE_CONTROL_PORT, &control_socket,
+                                                      1U, NX_NULL);
+    xil_printf("orbtrace: control socket listen = %d\r\n", listen_status);
 
     for (;;) {
         if (nx_tcp_server_socket_accept(&control_socket, NX_WAIT_FOREVER) == NX_SUCCESS) {
@@ -198,7 +212,8 @@ static void dap_thread_entry(ULONG arg)
 {
     (void)arg;
 
-    nx_tcp_server_socket_listen(&ip, ORBTRACE_DAP_PORT, &dap_socket, 1U, NX_NULL);
+    UINT listen_status = nx_tcp_server_socket_listen(&ip, ORBTRACE_DAP_PORT, &dap_socket, 1U, NX_NULL);
+    xil_printf("orbtrace: dap socket listen = %d\r\n", listen_status);
 
     for (;;) {
         if (nx_tcp_server_socket_accept(&dap_socket, NX_WAIT_FOREVER) == NX_SUCCESS) {
