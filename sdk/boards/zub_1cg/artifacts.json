@@ -18,16 +18,18 @@
       "size_bytes": 2970740,
       "sha256": "bbf9c42707fe2162e9c9482e3697f27de938c9d260224d4452b0cf121906e1da",
       "source_match": "Matches the bitstream in the recorded Vivado project."
-    },
-    {
-      "path": "psu_init.tcl",
-      "role": "Vitis-generated PS clock, MIO, and DDR initialization script",
-      "size_bytes": 765529,
-      "sha256": "ee38a3b846798523c7278b0219dd20befdb868e4da40f5bba241f5772f56d2dc",
-      "generator": "Vitis 2023.2",
-      "source_match": "Regenerate from the recorded XSA and verify the resulting hash before replacing this file."
     }
   ],
-  "update_procedure": "Regenerate the bitstream and XSA in Vivado, generate psu_init.tcl in Vitis, replace both artifacts, then update sizes and SHA-256 values in this manifest in the same commit.",
+  "local_generated_artifacts": [
+    {
+      "name": "psu_init.tcl",
+      "role": "Vitis-generated PS clock, MIO, and DDR initialization script",
+      "distributed": false,
+      "expected_sha256_from_legacy_handoff": "ee38a3b846798523c7278b0219dd20befdb868e4da40f5bba241f5772f56d2dc",
+      "generator": "Vitis 2023.2",
+      "recipe": "bazel run //sdk/boards/zub_1cg:generate_psu_init"
+    }
+  ],
+  "update_procedure": "Regenerate public binary artifacts and local-only PS initialization separately. Never add generated/psu_init.tcl to Git or a public cache.",
   "last_verified": "2026-08-01"
 }

@@ -1,6 +1,6 @@
 # psu_init_only.tcl — run PSU init via xsct, then exit.
 #
-# Sources board/zub_1cg/psu_init.tcl (Vitis-generated for AES-ZUB-1CG) and
+# Sources the locally generated psu_init.tcl passed as argv[0] and
 # invokes:
 #   - psu_init                       — clocks, PLLs, MIO pin routing
 #   - psu_post_config

@@ -19,7 +19,8 @@ fi
 RUN="${RUNFILES_DIR:-$TEST_SRCDIR}/_main"
 ZUB_CTL="$RUN/tooling/zub_ctl/zub_ctl"
 BIT="$RUN/sdk/boards/zub_1cg/design_1_wrapper.bit"
-PSI="$RUN/sdk/boards/zub_1cg/psu_init.tcl"
+PSI="${ZUB1CG_PSINIT:?set ZUB1CG_PSINIT to the locally generated psu_init.tcl}"
+[[ -f "$PSI" ]] || { echo "FAIL: ZUB1CG_PSINIT does not exist: $PSI"; exit 1; }
 
 ELF="$RUN/zub_firmware"
 if [[ ! -f "$ELF" ]]; then

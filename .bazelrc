@@ -38,6 +38,7 @@ build:rpu --linkopt=-nostartfiles
 #   bazel test --config=host --config=onboard //tests:apu_blink_test
 test:onboard --spawn_strategy=local
 test:onboard --test_output=streamed
+test:onboard --test_env=ZUB1CG_PSINIT
 
 # ── Ergonomics ────────────────────────────────────────────────────────────────
 build --verbose_failures

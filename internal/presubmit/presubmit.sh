@@ -13,6 +13,18 @@ step() { echo; echo "── $* ──"; }
 ok()   { echo "  [OK] $*"; }
 fail() { echo "  [FAIL] $*"; FAIL=1; }
 
+# ── Publication policy ─────────────────────────────────────────────────────
+step "restricted generated sources"
+TRACKED_PSINIT="$(git ls-files -- '*psu_init.tcl' | while IFS= read -r path; do
+    [ ! -e "$path" ] || printf '%s\n' "$path"
+done)"
+if [ -z "$TRACKED_PSINIT" ]; then
+    ok "no generated PS-init source is tracked"
+else
+    printf '%s\n' "$TRACKED_PSINIT"
+    fail "generated psu_init.tcl must remain local and untracked"
+fi
+
 # ── Buildifier (Starlark/BUILD formatting) ─────────────────────────────────
 step "buildifier --mode=check"
 if buildifier --mode=check -r . 2>&1; then

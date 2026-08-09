@@ -43,7 +43,7 @@ zub_ctl watch-a53 \
     --xsct      /path/to/xsct \
     --elf       bazel-bin/apps/apu/hello_world/hello_world_a53.elf \
     --bitstream board/zub_1cg/design_1_wrapper.bit \
-    --psinit    board/zub_1cg/psu_init.tcl \
+    --psinit    sdk/boards/zub_1cg/generated/psu_init.tcl \
     --tty       /dev/ttyUSB1 \
     --expect    'ThreadX RGB LED'
 ```

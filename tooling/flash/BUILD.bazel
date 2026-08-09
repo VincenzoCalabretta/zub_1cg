@@ -5,7 +5,6 @@ sh_binary(
     srcs = ["//tooling/xsct:jtag_flash.sh"],
     data = [
         "//sdk/boards/zub_1cg:bitstream",
-        "//sdk/boards/zub_1cg:psu_init",
     ],
     tags = [
         "local",

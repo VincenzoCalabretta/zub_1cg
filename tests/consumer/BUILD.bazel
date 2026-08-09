@@ -42,7 +42,7 @@ filegroup(
     srcs = [
         "@zub_1cg//sdk/boards/zub_1cg:artifacts_manifest",
         "@zub_1cg//sdk/boards/zub_1cg:bitstream",
-        "@zub_1cg//sdk/boards/zub_1cg:psu_init",
+        "@zub_1cg//sdk/boards/zub_1cg:avnet_bdf",
         "@zub_1cg//tooling/openocd:all_scripts",
         "@zub_1cg//tooling/zub_ctl",
     ],

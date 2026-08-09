@@ -6,9 +6,8 @@
 #   PSINIT    — path to psu_init.tcl
 #   BITSTREAM — path to the PL bitstream (.bit)
 #
-# The PSINIT and BITSTREAM defaults point to the in-repo copies under
-# sdk/boards/zub_1cg/.  Override them if you have board-specific variants
-# (e.g. a different PL design's bitstream, such as Orbtrace's).
+# The bitstream may use the noticed in-repo binary. PSINIT must be generated
+# locally from the pinned board preset and licensed Vitis installation.
 set -euo pipefail
 
 # Resolve the workspace root: when called via `bazel run`, $BUILD_WORKSPACE_DIRECTORY
@@ -16,7 +15,7 @@ set -euo pipefail
 WORKSPACE_ROOT="${BUILD_WORKSPACE_DIRECTORY:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 XSCT="${XSCT:-/mnt/data/xilinx/Vitis/2023.2/bin/xsct}"
-PSINIT="${PSINIT:-${WORKSPACE_ROOT}/sdk/boards/zub_1cg/psu_init.tcl}"
+PSINIT="${PSINIT:-${ZUB1CG_PSINIT:-${WORKSPACE_ROOT}/sdk/boards/zub_1cg/generated/psu_init.tcl}}"
 BITSTREAM="${BITSTREAM:-${WORKSPACE_ROOT}/sdk/boards/zub_1cg/design_1_wrapper.bit}"
 ELF="${1:?Usage: jtag_flash.sh <path-to-elf>}"
 
@@ -24,6 +23,11 @@ if [[ ! -x "$XSCT" ]]; then
     echo "ERROR: xsct not found at '$XSCT'." >&2
     echo "  Install Xilinx Vitis 2023.2 and set XSCT to its xsct binary, e.g.:" >&2
     echo "    export XSCT=/path/to/Vitis/2023.2/bin/xsct" >&2
+    exit 1
+fi
+if [[ ! -f "$PSINIT" ]]; then
+    echo "ERROR: PS init not found at '$PSINIT'." >&2
+    echo "  Run: bazel run //sdk/boards/zub_1cg:generate_psu_init" >&2
     exit 1
 fi
 

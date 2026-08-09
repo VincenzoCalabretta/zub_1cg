@@ -43,13 +43,13 @@ Rust crates (host-side tools only — not shipped to device):
   Full license texts are in each crate's source package on crates.io.
 
 ────────────────────────────────────────────────────────────────────────────────
-Xilinx/AMD binary artifacts (board/zub_1cg/):
+Xilinx/AMD binary artifacts (sdk/boards/zub_1cg/):
 
-  design_1_wrapper.bit and psu_init.tcl are derived from Vivado/Vitis
-  platform generation for the Avnet AES-ZUB-1CG-ED-G board.  These files
-  are subject to the Xilinx/AMD toolchain terms of use.  They are checked
-  in as convenience artifacts; see board/zub_1cg/COMPATIBILITY.md for
-  provenance details.
+  design_1_wrapper.bit is derived from Vivado platform generation for the
+  Avnet AES-ZUB-1CG-ED-G board and remains subject to the Xilinx/AMD
+  toolchain terms.  Source-form psu_init.tcl output is not distributed;
+  licensed users regenerate it locally from the pinned Apache-2.0 Avnet BDF.
+  See sdk/boards/zub_1cg/COMPATIBILITY.md for provenance details.
 
 ────────────────────────────────────────────────────────────────────────────────
 Bazel build rules:

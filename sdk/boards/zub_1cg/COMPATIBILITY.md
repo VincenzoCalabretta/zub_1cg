@@ -1,7 +1,7 @@
 # Board artifact compatibility matrix
 
-This document defines the compatibility requirements for artifacts committed to
-`board/zub_1cg/`.  Replace any artifact only after verifying it is compatible
+This document defines the compatibility requirements for artifacts under
+`sdk/boards/zub_1cg/`. Replace any artifact only after verifying it is compatible
 with all items in this matrix.
 
 ## Committed artifacts
@@ -9,15 +9,22 @@ with all items in this matrix.
 | File | SHA-256 | Toolchain | Notes |
 |------|---------|-----------|-------|
 | `design_1_wrapper.bit` | `bbf9c42707fe2162e9c9482e3697f27de938c9d260224d4452b0cf121906e1da` | Vivado 2023.2 | Ethernet-loopback design |
-| `psu_init.tcl` | `ee38a3b846798523c7278b0219dd20befdb868e4da40f5bba241f5772f56d2dc` | Vitis 2023.2 | PS init (clocks, MIO, DDR) |
 
 `artifacts.json` is the machine-readable version of this table and is verified
 by `//sdk/boards/zub_1cg:artifact_integrity_test` on every presubmit run.
 
+## Local generated artifact
+
+`bazel run //sdk/boards/zub_1cg:generate_psu_init` reconstructs
+`generated/psu_init.tcl` with licensed Vivado/Vitis 2023.2 from the pinned
+Avnet ZUBoard BDF. It is ignored and never distributed in source releases or
+public caches. The qualified SHA-256 is
+`ee38a3b846798523c7278b0219dd20befdb868e4da40f5bba241f5772f56d2dc`.
+
 ## Firmware ↔ artifact compatibility
 
-Both artifacts must be regenerated together from the same Vivado project and
-XSA; mixing different generations is not supported.
+The bitstream and local PS initialization must describe compatible PS/PL
+interfaces; mixing different hardware handoffs is not supported.
 
 | Firmware | Requires bitstream | Requires psu_init | Notes |
 |----------|-------------------|-------------------|-------|

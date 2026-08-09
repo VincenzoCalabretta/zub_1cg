@@ -153,7 +153,8 @@ proc full_init_from_reset {} {
     # Enable and source the R5 CPU clock.  Normally this is done by the
     # Vitis-generated psu_init script, but hw_server can start without finding
     # the FTDI target; in that case psu_init is a no-op and a released R5 has
-    # no clock.  The mask/value pair below is from board/zub_1cg/psu_init.tcl:
+    # no clock. The mask/value pair below matches the qualified local PS-init
+    # generation for the pinned ZUBoard 1CG preset:
     # CLKACT=1, DIVISOR0=3, SRCSEL=IOPLL.
     set r5_clk [lindex [read_memory 0xFF5E0090 32 1] 0]
     set r5_clk [expr {($r5_clk & ~0x01003F07) | 0x01000302}]

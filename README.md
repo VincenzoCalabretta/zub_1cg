@@ -84,9 +84,9 @@ The supported SDK surface lives under `//sdk`:
 - `firmware_size_test` enforces `.text` and `.bss` budgets.
 
 Committed board artifacts have a machine-readable SHA-256 manifest. The
-artifact integrity test catches accidental mixing of a bitstream and
-`psu_init.tcl` from different hardware handoffs. Compatibility expectations
-and measured tool versions are in
+PS-init script is deliberately absent from source releases and public caches;
+licensed users reproduce it from a pinned public board definition. Compatibility
+expectations and measured tool versions are in
 [`sdk/boards/zub_1cg/COMPATIBILITY.md`](sdk/boards/zub_1cg/COMPATIBILITY.md).
 
 ### R5 startup and persistent fault capture
@@ -376,11 +376,25 @@ devShells.x86_64-linux.default = zub_1cg.lib.mkDevShell {
 Pin the same revision in Nix and Bazel so compiler discovery, board artifacts,
 rules, and headers cannot drift independently.
 
-## Regenerating board artifacts
+## Regenerating PS initialization
 
-The committed SDK bitstream and PS-init script are opaque vendor-tool outputs.
-Replace them only as a pair from one Vivado/Vitis hardware handoff, then update
-the manifest and run:
+The repository pins Avnet's Apache-2.0 ZUBoard BDF, while Vivado/Vitis remain a
+separately installed licensed prerequisite. The Nix shell supplies FHS wrappers,
+not vendor binaries. Point it at an installation containing Vivado and Vitis
+2023.2, then let Bazel generate and verify the local-only file:
+
+```sh
+export XILINX_ROOT=/opt/Xilinx
+nix develop
+bazel run //sdk/boards/zub_1cg:generate_psu_init
+export ZUB1CG_PSINIT="$PWD/sdk/boards/zub_1cg/generated/psu_init.tcl"
+```
+
+The generator asserts the board's DDR/MIO configuration and verifies the
+qualified output hash (`ee38a3b8…f56d2dc`). The ignored `generated/` directory
+must not be published or uploaded to a public build cache. Regenerate the
+separately distributed SDK bitstream from its matching Vivado project, update
+the manifest, and run:
 
 ```sh
 bazel test --config=host //sdk/boards/zub_1cg:artifact_integrity_test
@@ -389,7 +403,7 @@ bash internal/presubmit/presubmit.sh
 
 For the Orbtrace design, use its batch scripts rather than the generic board
 artifact procedure. Mixing the shared Ethernet bitstream, Orbtrace bitstream,
-or a `psu_init.tcl` from another handoff can produce a firmware image that
+or a PS-init script from another handoff can produce a firmware image that
 loads successfully but drives the wrong clocks, MIO, or address map.
 
 ## Troubleshooting

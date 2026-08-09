@@ -1,7 +1,8 @@
 # load_a53.tcl — load and run a bare-metal A53 ELF via JTAG (xsct)
 #
 # Usage (from repo root):
-#   xsct scripts/xsct/load_a53.tcl [path/to/app.elf]
+#   ZUB1CG_PSINIT=sdk/boards/zub_1cg/generated/psu_init.tcl \
+#     xsct tooling/xsct/load_a53.tcl [path/to/app.elf]
 #
 # If no ELF is given, defaults to bazel-bin/apps/apu/blink/blink.elf.
 #
@@ -13,7 +14,11 @@
 #
 # Mirrors the confirmed-working jtag_run.tcl from the Vitis workspace.
 
-set psinit   "board/zub_1cg/psu_init.tcl"
+if {![info exists ::env(ZUB1CG_PSINIT)]} {
+    puts "ERROR: set ZUB1CG_PSINIT to a locally generated psu_init.tcl"
+    exit 1
+}
+set psinit   [file normalize $::env(ZUB1CG_PSINIT)]
 set bitfile  "board/zub_1cg/design_1_wrapper.bit"
 set app      [expr {[llength $argv] > 0 \
                     ? [lindex $argv 0] \

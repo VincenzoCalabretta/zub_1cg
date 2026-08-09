@@ -116,7 +116,6 @@ firmware_elf_test(
 onboard_firmware_test(
     name = "rpu_hello_world_test",
     data = [
-        "//sdk/boards/zub_1cg:psu_init",
         "//tooling/openocd:aes_zub_cfg",
         "//tooling/openocd:all_scripts",
         "//tooling/openocd:load_r5",
@@ -141,7 +140,6 @@ sh_test(
 onboard_firmware_test(
     name = "rpu_bsp_test",
     data = [
-        "//sdk/boards/zub_1cg:psu_init",
         "//tooling/openocd:aes_zub_cfg",
         "//tooling/openocd:all_scripts",
         "//tooling/openocd:load_r5",
@@ -156,7 +154,6 @@ onboard_firmware_test(
 onboard_firmware_test(
     name = "rpu_fault_test",
     data = [
-        "//sdk/boards/zub_1cg:psu_init",
         "//tooling/openocd:aes_zub_cfg",
         "//tooling/openocd:all_scripts",
         "//tooling/openocd:load_r5",
@@ -172,7 +169,6 @@ onboard_firmware_test(
     name = "apu_hello_world_test",
     data = [
         "//sdk/boards/zub_1cg:bitstream",
-        "//sdk/boards/zub_1cg:psu_init",
         "//tooling/zub_ctl",
     ],
     firmware = "//applications/apu/hello_world:hello_world",
@@ -185,7 +181,6 @@ onboard_firmware_test(
     name = "apu_blink_test",
     data = [
         "//sdk/boards/zub_1cg:bitstream",
-        "//sdk/boards/zub_1cg:psu_init",
         "//tooling/zub_ctl",
     ],
     firmware = "//applications/apu/blink:blink",
@@ -198,7 +193,6 @@ onboard_firmware_test(
     name = "apu_eth_loopback_test",
     data = [
         "//sdk/boards/zub_1cg:bitstream",
-        "//sdk/boards/zub_1cg:psu_init",
         "//tooling/zub_ctl",
     ],
     firmware = "//applications/apu/eth_loopback:eth_loopback",
@@ -214,7 +208,6 @@ onboard_firmware_test(
     name = "orbtrace_a53_app_test",
     data = [
         "//sdk/boards/zub_1cg:bitstream",
-        "//sdk/boards/zub_1cg:psu_init",
         "//tooling/zub_ctl",
     ],
     firmware = "//applications/orbtrace/firmware/a53_app:a53_app",

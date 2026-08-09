@@ -1,7 +1,7 @@
 # psu_init_run.tcl — run Vitis-generated psu_init via OpenOCD.
 #
-# Provides xsct primitives via xsct_shim.tcl so board/zub_1cg/psu_init.tcl
-# can be sourced verbatim. Runs psu_init + psu_post_config +
+# Provides xsct primitives via xsct_shim.tcl so a locally generated
+# psu_init.tcl can be sourced verbatim. Runs psu_init + psu_post_config +
 # psu_ps_pl_isolation_removal + psu_ps_pl_reset_config.
 #
 # The DDR bringup subphase is called by psu_init and may fail if the DDR
@@ -30,8 +30,13 @@ source [file dirname [info script]]/xsct_shim.tcl
 # Load psu_init.tcl (defines procs psu_init, psu_post_config, mask_read,
 # mask_poll, psu_mask_write, poll, init_serdes, init_peripheral, plus
 # psu_pll_init_data, psu_clock_init_data, psu_mio_init_data, …).
-puts "Loading psu_init.tcl from board/zub_1cg/…"
-source [file dirname [info script]]/../../board/zub_1cg/psu_init.tcl
+if {![info exists ::env(ZUB1CG_PSINIT)] || $::env(ZUB1CG_PSINIT) eq ""} {
+    error "set ZUB1CG_PSINIT to a locally generated psu_init.tcl"
+}
+set zub_psinit [file normalize $::env(ZUB1CG_PSINIT)]
+if {![file exists $zub_psinit]} { error "ZUB1CG_PSINIT does not exist: $zub_psinit" }
+puts "Loading locally generated psu_init.tcl from $zub_psinit"
+source $zub_psinit
 puts "psu_init.tcl sourced."
 
 # The generated file's mask_poll helper accepts two arguments, while its data

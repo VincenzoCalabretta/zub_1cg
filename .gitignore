@@ -13,6 +13,7 @@ tooling/elf_check/target/
 .Xil/
 *.jou
 vivado*.log
+sdk/boards/zub_1cg/generated/
 
 # Vendor reference documents are kept in the private documentation archive.
 docs/*.pdf
