@@ -1,5 +1,6 @@
 create_bd_design zub_orbtrace
 set ps [create_bd_cell -type ip -vlnv xilinx.com:ip:zynq_ultra_ps_e:* ps]
+zub1cg_apply_ps_preset $ps
 set_property -dict [list \
     CONFIG.PSU__USE__M_AXI_GP0 {1} CONFIG.PSU__USE__M_AXI_GP1 {0} CONFIG.PSU__USE__M_AXI_GP2 {0} \
     CONFIG.PSU__USE__S_AXI_GP2 {1} CONFIG.PSU__USE__IRQ {1} CONFIG.PSU__USE__IRQ0 {1} \
@@ -10,7 +11,8 @@ set_property -dict [list \
 
 set dma [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma:* trace_dma]
 set_property -dict [list CONFIG.c_include_sg {1} CONFIG.c_include_mm2s {0} \
-    CONFIG.c_include_s2mm {1} CONFIG.c_sg_length_width {26} CONFIG.c_s2mm_burst_size {256}] $dma
+    CONFIG.c_include_s2mm {1} CONFIG.c_sg_include_stscntrl_strm {0} \
+    CONFIG.c_sg_length_width {26} CONFIG.c_s2mm_burst_size {256}] $dma
 set control_ic [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* control_ic]
 set_property CONFIG.NUM_MI {2} $control_ic
 set data_ic [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* data_ic]

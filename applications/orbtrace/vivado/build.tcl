@@ -5,9 +5,19 @@ set repo_dir [file normalize [file join $script_dir ../../..]]
 set output_dir [file join $repo_dir bazel-out orbtrace-vivado]
 file mkdir $output_dir
 
+source [file join $repo_dir sdk boards zub_1cg board_preset.tcl]
+if {![info exists ::env(AVNET_BDF_ROOT)]} {
+    error "set AVNET_BDF_ROOT to the Avnet BDF checkout root (containing zub1cg/1.2/board.xml)"
+}
+# Vivado only picks up a custom board repo if board.repoPaths is set before
+# the board catalog is first populated, which happens at create_project.
+set_param board.repoPaths [list [file normalize $::env(AVNET_BDF_ROOT)]]
+
 create_project -force zub_orbtrace $output_dir -part xczu1cg-sbva484-1-e
 set_property target_language Verilog [current_project]
 set_property simulator_language Mixed [current_project]
+
+zub1cg_select_board $::env(AVNET_BDF_ROOT)
 
 foreach source [glob [file join $repo_dir applications orbtrace rtl *.sv]] { read_verilog -sv $source }
 foreach source [glob [file join $repo_dir applications orbtrace rtl *.v]] { read_verilog $source }
