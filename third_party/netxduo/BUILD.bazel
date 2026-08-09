@@ -29,6 +29,16 @@ cc_library(
         "common/inc/*.h",
         "ports/cortex_a7/gnu/inc/*.h",
     ]),
+    # These are public defines because both features add fields to NetX
+    # packet/socket/interface structs and therefore must be identical in
+    # NetX and every driver/application that includes nx_api.h. Interface
+    # capabilities let GEM advertise checksum offload. Window scaling is
+    # required for the host's receive window to exceed 65,535 bytes on the
+    # high-throughput trace connection.
+    defines = [
+        "NX_ENABLE_INTERFACE_CAPABILITY",
+        "NX_ENABLE_TCP_WINDOW_SCALING",
+    ],
     includes = [
         "common/inc",
         "ports/cortex_a7/gnu/inc",

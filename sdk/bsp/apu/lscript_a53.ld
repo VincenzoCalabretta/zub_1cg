@@ -295,11 +295,12 @@ _SDA2_BASE_ = __sdata2_start + ((__sbss2_end - __sdata2_start) / 2 );
    __el0_stack = .;
 } > psu_ddr_0 :data
 
-/* AXI DMA descriptors must be non-cacheable on AArch64. Keep Orbtrace's
- * descriptor ring and payload buffers in a dedicated 2 MiB translation
- * block so Xil_SetTlbAttributes(..., NORM_NONCACHE) cannot affect normal
- * firmware, ThreadX, or NetX data. The separate NOLOAD segment avoids a
- * 256 MiB zero-filled hole in the JTAG-loaded image. */
+/* AXI DMA descriptors must be non-cacheable on AArch64. Keep the Orbtrace
+ * trace packet pool and all Orbtrace/GEM descriptor rings in a dedicated
+ * 2 MiB translation block so
+ * Xil_SetTlbAttributes(..., NORM_NONCACHE) cannot affect normal firmware,
+ * cached DMA payload buffers, ThreadX, or NetX data. The separate NOLOAD
+ * segment avoids a 256 MiB zero-filled hole in the JTAG-loaded image. */
 .trace_dma 0x10000000 (NOLOAD) : {
    __trace_dma_start = .;
    *(.trace_dma)

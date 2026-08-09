@@ -12,7 +12,8 @@ set_property -dict [list \
 set dma [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma:* trace_dma]
 set_property -dict [list CONFIG.c_include_sg {1} CONFIG.c_include_mm2s {0} \
     CONFIG.c_include_s2mm {1} CONFIG.c_sg_include_stscntrl_strm {0} \
-    CONFIG.c_sg_length_width {26} CONFIG.c_s2mm_burst_size {256}] $dma
+    CONFIG.c_sg_length_width {26} CONFIG.c_s2mm_burst_size {256} \
+    CONFIG.c_s_axis_s2mm_tdata_width {64} CONFIG.c_m_axi_s2mm_data_width {64}] $dma
 set control_ic [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* control_ic]
 set_property CONFIG.NUM_MI {2} $control_ic
 set data_ic [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* data_ic]

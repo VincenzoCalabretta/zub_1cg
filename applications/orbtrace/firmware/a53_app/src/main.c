@@ -20,6 +20,8 @@
 
 #include "encore/OS/ThreadX/ThreadXGEM2Driver.h"
 #include "nx_api.h"
+#include "nx_packet.h"
+#include "nx_tcp.h"
 #include "platform.h"
 #include "timer.h"
 #include "tx_api.h"
@@ -64,11 +66,14 @@ extern unsigned long orbtrace_dap_feed(const unsigned char *input, unsigned long
  * applications pick their own. 4 KiB covers one full control frame without
  * forcing a window update mid-frame. */
 #define ORBTRACE_TCP_WINDOW 4096U
+#define ORBTRACE_TRACE_MSS  8960U
+#define ORBTRACE_TRACE_TX_QUEUE 40U
 
 /* ── ThreadX / NetX Duo objects ───────────────────────────────────────── */
 
 static NX_IP          ip;
 static NX_PACKET_POOL pool;
+static NX_PACKET_POOL trace_pool;
 static NX_TCP_SOCKET  control_socket;
 static NX_TCP_SOCKET  trace_socket;
 static NX_TCP_SOCKET  dap_socket;
@@ -81,10 +86,14 @@ static ULONG control_stack[2048]; /* 8 KiB */
 static ULONG trace_stack[2048];   /* 8 KiB */
 static ULONG dap_stack[2048];     /* 8 KiB */
 
-#define POOL_PACKET_PAYLOAD 1536U
-#define POOL_PACKET_COUNT   64U
+#define POOL_PACKET_PAYLOAD 10304U
+#define POOL_PACKET_COUNT   192U
 static UCHAR pool_memory[POOL_PACKET_PAYLOAD * POOL_PACKET_COUNT]
     __attribute__((aligned(64)));
+#define TRACE_POOL_PACKET_PAYLOAD 18688U
+#define TRACE_POOL_PACKET_COUNT 96U
+static UCHAR trace_pool_memory[TRACE_POOL_PACKET_PAYLOAD * TRACE_POOL_PACKET_COUNT]
+    __attribute__((aligned(64), section(".trace_dma")));
 static UCHAR ip_stack_memory[4096] __attribute__((aligned(8)));
 static UCHAR arp_cache_memory[1024] __attribute__((aligned(4)));
 
@@ -125,11 +134,13 @@ static UCHAR trace_event_buffer[TRACE_EVENT_BUFFER_SIZE] __attribute__((aligned(
 #define TRACE_DMA_BD_ERROR_MASK 0x70000000U
 #define TRACE_DMA_LENGTH_MASK   0x03FFFFFFU
 
-/* The RTL packetizer caps a trace packet at 1024 payload bytes. Channel,
- * checksum, COBS code bytes, and delimiter keep the encoded AXI packet below
- * 1536 bytes, which also fits one Ethernet-MTU-sized NetX packet. */
+/* One 8192-byte RTL payload encodes to at most 8228 bytes, including channel,
+ * checksum, COBS code bytes, and delimiter. The AXI packer combines two
+ * complete Orbflow frames per DMA transfer so NetX can amortize one socket
+ * send over multiple MSS-sized TCP segments. Keep modest alignment slack. */
 #define TRACE_DMA_BD_COUNT      32U
-#define TRACE_DMA_BUFFER_SIZE   1536U
+#define TRACE_DMA_BUFFER_SIZE   16512U
+#define TRACE_DMA_CACHE_LINE    64U
 #define TRACE_DMA_RESET_BUDGET  1000000U
 #define TRACE_DMA_NOT_READY     0xFEU
 
@@ -150,8 +161,7 @@ typedef char trace_dma_descriptor_must_be_64_bytes[
 
 static TraceDmaDescriptor trace_descriptors[TRACE_DMA_BD_COUNT]
     __attribute__((aligned(64), section(".trace_dma")));
-static UCHAR trace_buffers[TRACE_DMA_BD_COUNT][TRACE_DMA_BUFFER_SIZE]
-    __attribute__((aligned(64), section(".trace_dma")));
+static NX_PACKET *trace_dma_packet_slots[TRACE_DMA_BD_COUNT];
 static unsigned int trace_dma_consumer;
 static volatile unsigned long trace_dma_bytes;
 static volatile unsigned int trace_dma_packets;
@@ -171,6 +181,52 @@ static inline void trace_mmio_write(unsigned long base, unsigned long offset,
 static void trace_dma_stop(void)
 {
     trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_S2MM_DMACR, 0U);
+    for (unsigned int i = 0U; i < TRACE_DMA_BD_COUNT; i++) {
+        if (trace_dma_packet_slots[i] != NX_NULL) {
+            nx_packet_release(trace_dma_packet_slots[i]);
+            trace_dma_packet_slots[i] = NX_NULL;
+        }
+    }
+}
+
+static UINT trace_dma_allocate_packet(NX_PACKET **packet_out)
+{
+    NX_PACKET *packet;
+    UINT result = nx_packet_allocate(&trace_pool, &packet, NX_TCP_PACKET, NX_WAIT_FOREVER);
+    if (result != NX_SUCCESS) {
+        return result;
+    }
+
+    /* Keep DMA payload writes on cache lines that cannot contain NetX packet
+     * metadata or the headers NetX prepends later. The packet pool is much
+     * larger than a trace frame, so this alignment padding is inexpensive. */
+    UINTPTR data = ((UINTPTR)packet->nx_packet_prepend_ptr +
+                    TRACE_DMA_CACHE_LINE - 1U) &
+                   ~((UINTPTR)TRACE_DMA_CACHE_LINE - 1U);
+    if (data + TRACE_DMA_BUFFER_SIZE > (UINTPTR)packet->nx_packet_data_end) {
+        nx_packet_release(packet);
+        return NX_SIZE_ERROR;
+    }
+    packet->nx_packet_prepend_ptr = (UCHAR *)data;
+    packet->nx_packet_append_ptr = (UCHAR *)data;
+    packet->nx_packet_length = 0U;
+    *packet_out = packet;
+    return NX_SUCCESS;
+}
+
+static void trace_dma_rearm(unsigned int slot, NX_PACKET *packet)
+{
+    TraceDmaDescriptor *bd = &trace_descriptors[slot];
+    UINTPTR buffer = (UINTPTR)packet->nx_packet_prepend_ptr;
+
+    /* trace_pool's complete packet storage is in the same non-cacheable
+     * translation block as the descriptor rings, so ownership transfers do
+     * not need payload cache maintenance. */
+    bd->buffer_lo = (unsigned int)buffer;
+    bd->buffer_hi = (unsigned int)((unsigned long)buffer >> 32);
+    bd->control = TRACE_DMA_BUFFER_SIZE;
+    bd->status = 0U;
+    trace_dma_packet_slots[slot] = packet;
 }
 
 static UINT trace_dma_initialize(void)
@@ -179,9 +235,10 @@ static UINT trace_dma_initialize(void)
 
     /* The AXI DMA reference applications require descriptor memory to be
      * non-cacheable on AArch64; their XAxiDma cache-maintenance macros are
-     * intentionally no-ops on this architecture. The linker isolates this
-     * ring and its payload buffers in their own 2 MiB translation block so
-     * changing its attributes cannot degrade ThreadX/NetX memory. */
+     * intentionally no-ops on this architecture. The linker isolates only
+     * descriptor rings and the dedicated trace packet pool in their own
+     * 2 MiB translation block. DMA therefore writes directly into complete
+     * non-cacheable NetX packet buffers without any per-byte cache scan. */
     Xil_SetTlbAttributes((UINTPTR)trace_descriptors, NORM_NONCACHE);
 
     trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_S2MM_DMACR, TRACE_DMA_CR_RESET);
@@ -194,15 +251,17 @@ static UINT trace_dma_initialize(void)
 
     for (unsigned int i = 0U; i < TRACE_DMA_BD_COUNT; i++) {
         unsigned long next = (unsigned long)&trace_descriptors[(i + 1U) % TRACE_DMA_BD_COUNT];
-        unsigned long buffer = (unsigned long)&trace_buffers[i][0];
         TraceDmaDescriptor *bd = &trace_descriptors[i];
         memset(bd, 0, sizeof(*bd));
         bd->next_lo = (unsigned int)next;
         bd->next_hi = (unsigned int)(next >> 32);
-        bd->buffer_lo = (unsigned int)buffer;
-        bd->buffer_hi = (unsigned int)(buffer >> 32);
-        bd->control = TRACE_DMA_BUFFER_SIZE;
-        Xil_DCacheInvalidateRange((INTPTR)trace_buffers[i], TRACE_DMA_BUFFER_SIZE);
+        NX_PACKET *packet;
+        UINT result = trace_dma_allocate_packet(&packet);
+        if (result != NX_SUCCESS) {
+            trace_dma_errors++;
+            return result;
+        }
+        trace_dma_rearm(i, packet);
     }
     Xil_DCacheFlushRange((INTPTR)trace_descriptors, sizeof(trace_descriptors));
 
@@ -221,48 +280,47 @@ static UINT trace_dma_initialize(void)
     return NX_SUCCESS;
 }
 
-/* Copy one completed DMA packet into NetX, then rearm the descriptor. The
- * copy is deliberate: it lets the DMA ring resume immediately while TCP
- * retains its own packet until acknowledgement/retransmission completes. */
+/* Hand one completed DMA frame to NetX without copying it. Each descriptor
+ * owns a preallocated packet while hardware writes; completion swaps in a
+ * fresh packet and rearms the descriptor before sending the old one. Each
+ * transfer contains two independently delimited Orbflow frames; NetX splits
+ * it into MSS-sized TCP segments without changing the application stream. */
 static UINT trace_dma_send_completed(void)
 {
     unsigned int slot = trace_dma_consumer;
     TraceDmaDescriptor *bd = &trace_descriptors[slot];
     Xil_DCacheInvalidateRange((INTPTR)bd, sizeof(*bd));
 
-    unsigned int status = bd->status;
-    if ((status & TRACE_DMA_BD_COMPLETE) == 0U) {
+    if ((bd->status & TRACE_DMA_BD_COMPLETE) == 0U) {
         return TRACE_DMA_NOT_READY;
     }
+
+    unsigned int status = bd->status;
     if ((status & TRACE_DMA_BD_ERROR_MASK) != 0U) {
         trace_dma_errors++;
         return NX_NOT_SUCCESSFUL;
     }
-
     unsigned int length = status & TRACE_DMA_LENGTH_MASK;
     if (length == 0U || length > TRACE_DMA_BUFFER_SIZE) {
         trace_dma_errors++;
         return NX_NOT_SUCCESSFUL;
     }
-    Xil_DCacheInvalidateRange((INTPTR)trace_buffers[slot], length);
 
-    NX_PACKET *packet;
-    UINT result = nx_packet_allocate(&pool, &packet, NX_TCP_PACKET, NX_WAIT_FOREVER);
+    NX_PACKET *packet = trace_dma_packet_slots[slot];
+    if (packet == NX_NULL) {
+        trace_dma_errors++;
+        return NX_NOT_SUCCESSFUL;
+    }
+    packet->nx_packet_append_ptr = packet->nx_packet_prepend_ptr + length;
+    packet->nx_packet_length = length;
+    packet->nx_packet_interface_capability_flag |= GEM2_PACKET_NONCACHE;
+
+    NX_PACKET *replacement;
+    UINT result = trace_dma_allocate_packet(&replacement);
     if (result != NX_SUCCESS) {
         return result;
     }
-    result = nx_packet_data_append(packet, trace_buffers[slot], length, &pool, NX_WAIT_FOREVER);
-    if (result != NX_SUCCESS) {
-        nx_packet_release(packet);
-        return result;
-    }
-
-    /* Rearm before entering the potentially-blocking TCP send. The linked
-     * ring always retains many descriptors of slack, so extending TAILDESC
-     * to this just-consumed slot is safe even when the DMA is still active. */
-    bd->control = TRACE_DMA_BUFFER_SIZE;
-    bd->status = 0U;
-    Xil_DCacheFlushRange((INTPTR)bd, sizeof(*bd));
+    trace_dma_rearm(slot, replacement);
     unsigned long descriptor = (unsigned long)bd;
     trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_TAILDESC_HI,
                      (unsigned int)(descriptor >> 32));
@@ -311,6 +369,7 @@ static void diag_thread_entry(ULONG arg)
     for (;;) {
         tx_thread_sleep(100); /* 1 s @ 100 Hz tick */
         gem2_tx_poll_recover();
+        gem2_rx_poll_recover();
         gem2_link_poll_recover();
         ULONG isr  = *(volatile ULONG *)(GEM2_BASE + GEM2_ISR_OFF);
         ULONG nwsr = *(volatile ULONG *)(GEM2_BASE + GEM2_NWSR_OFF);
@@ -320,8 +379,9 @@ static void diag_thread_entry(ULONG arg)
         gem2_diag_get(&rx_frames, &tx_frames, &isr_calls, &last_etype, &last_len, &tx_complete, &last_tx_stat,
                       &tx_head, &tx_tail, &tx_count, &last_isr, &rxused_count,
                       &driver_cmd_count, &last_driver_cmd, &last_driver_status);
-        unsigned int txused_count, last_txsr;
-        gem2_diag_get_tx_extra(&txused_count, &last_txsr);
+        unsigned int txused_count, last_txsr, tx_deferred_requests, tx_deferred_runs;
+        gem2_diag_get_tx_extra(&txused_count, &last_txsr,
+                               &tx_deferred_requests, &tx_deferred_runs);
         unsigned int tx_recover_attempts, tx_recover_txqbase_before, tx_recover_txqbase_after;
         gem2_diag_get_tx_recover(&tx_recover_attempts, &tx_recover_txqbase_before, &tx_recover_txqbase_after);
         unsigned int tx_dst_msw, tx_dst_lsw, tx_dst_cmd;
@@ -333,12 +393,14 @@ static void diag_thread_entry(ULONG arg)
                                     &tx_append, &tx_length_before, &tx_length_after);
         xil_printf("diag: ISR=0x%lx NWSR=0x%lx isr_calls=%u rx_frames=%u tx_frames=%u last_etype=0x%x "
                    "last_len=%u tx_complete=%u last_tx_stat=0x%x tx_head=%u tx_tail=%u tx_count=%u "
-                   "last_isr=0x%x rxused_count=%u txused_count=%u last_txsr=0x%x drv_cmds=%u last_cmd=%u last_status=%d "
+                   "last_isr=0x%x rxused_count=%u txused_count=%u last_txsr=0x%x tx_deferred=%u/%u "
+                   "drv_cmds=%u last_cmd=%u last_status=%d "
                    "tx_recover_attempts=%u tx_recover_txqbase=0x%x->0x%x tx_dst=%x:%08x tx_dst_cmd=%u "
                    "tx_dropped_bad_dst=%u\r\n",
                    isr, nwsr, isr_calls, rx_frames, tx_frames, last_etype, last_len,
                    tx_complete, last_tx_stat, tx_head, tx_tail, tx_count, last_isr, rxused_count,
-                   txused_count, last_txsr, driver_cmd_count, last_driver_cmd, (int)last_driver_status,
+                   txused_count, last_txsr, tx_deferred_requests, tx_deferred_runs,
+                   driver_cmd_count, last_driver_cmd, (int)last_driver_status,
                    tx_recover_attempts, tx_recover_txqbase_before, tx_recover_txqbase_after,
                    tx_dst_msw, tx_dst_lsw, tx_dst_cmd, tx_dropped_bad_dst);
         /* Temporary bring-up diagnostic: whether gem2_packet_send()'s
@@ -367,6 +429,92 @@ static void diag_thread_entry(ULONG arg)
             gem2_diag_get_link_recover(&link_recover_attempts);
             xil_printf("diag6: phy_addr=%u phy_found=%u bmsr=0x%x link_up=%u link_recover_attempts=%u\r\n",
                        phy_addr, phy_found, bmsr, link_up, link_recover_attempts);
+
+            /* Settles whether a sustained isr_calls freeze with
+             * link_recover_attempts stuck at 0 means gem2_link_poll_recover()
+             * saw trace_active=0 the whole time (trace send loop already
+             * exited — most likely via trace_dma_send_completed() detecting
+             * a real AXI DMA S2MM error/halt, see dmasr below) or whether
+             * trace_active stayed 1 but stall_ticks itself never reached the
+             * 3-tick threshold. Also reads TRACE_DMA_S2MM_DMASR directly and
+             * unconditionally (unlike trace_dma_send_completed(), which only
+             * ever reads it after an already-fatal per-descriptor error) so
+             * a halted-but-not-yet-detected AXI DMA S2MM engine is visible
+             * on every tick, not just the one that breaks the send loop. */
+            unsigned int trace_active, stall_ticks;
+            gem2_diag_get_link_poll_state(&trace_active, &stall_ticks);
+            unsigned int rx_poll_recover_attempts = gem2_diag_get_rx_poll_recover();
+            xil_printf("diag7: trace_active=%u stall_ticks=%u rx_poll_recover_attempts=%u dmasr=0x%x\r\n",
+                       trace_active, stall_ticks,
+                       rx_poll_recover_attempts,
+                       trace_mmio_read(TRACE_DMA_BASE, TRACE_DMA_S2MM_DMASR));
+        }
+        {
+            /* Snapshot the trace socket's TCP sent-queue head under NetX's
+             * own IP mutex. Wire captures show this head being retransmitted
+             * after a later cumulative ACK has covered it; these fields make
+             * the exact sequence/length value seen by NetX's ACK walker
+             * observable instead of inferring it from the wire. */
+            UINT lock_status = tx_mutex_get(&ip.nx_ip_protection, NX_NO_WAIT);
+            if (lock_status == TX_SUCCESS) {
+                NX_PACKET *head = trace_socket.nx_tcp_socket_transmit_sent_head;
+                unsigned int head_addr = (unsigned int)(ALIGN_TYPE)head;
+                unsigned int queue_next = 0U;
+                unsigned int tcp_next = 0U;
+                unsigned int prepend = 0U;
+                unsigned int ip_header = 0U;
+                unsigned int ip_header_length = 0U;
+                unsigned int packet_length = 0U;
+                unsigned int driver_done = 0U;
+                unsigned int head_sequence = 0U;
+                unsigned int head_end_sequence = 0U;
+
+                if (head != NX_NULL) {
+                    queue_next = (unsigned int)(ALIGN_TYPE)head->nx_packet_queue_next;
+                    tcp_next = (unsigned int)(ALIGN_TYPE)head->nx_packet_union_next.nx_packet_tcp_queue_next;
+                    prepend = (unsigned int)(ALIGN_TYPE)head->nx_packet_prepend_ptr;
+                    ip_header = (unsigned int)(ALIGN_TYPE)head->nx_packet_ip_header;
+                    ip_header_length = head->nx_packet_ip_header_length;
+                    packet_length = head->nx_packet_length;
+                    driver_done = (head->nx_packet_queue_next == (NX_PACKET *)NX_DRIVER_TX_DONE);
+
+                    NX_TCP_HEADER *head_tcp = driver_done
+                        ? (NX_TCP_HEADER *)head->nx_packet_prepend_ptr
+                        : (NX_TCP_HEADER *)(head->nx_packet_ip_header + head->nx_packet_ip_header_length);
+                    ULONG sequence = head_tcp->nx_tcp_sequence_number;
+                    ULONG word3 = head_tcp->nx_tcp_header_word_3;
+                    NX_CHANGE_ULONG_ENDIAN(sequence);
+                    NX_CHANGE_ULONG_ENDIAN(word3);
+                    ULONG header_length = (word3 >> NX_TCP_HEADER_SHIFT) * (ULONG)sizeof(ULONG);
+                    ULONG prefix_length = (ULONG)((ALIGN_TYPE)head_tcp -
+                                                  (ALIGN_TYPE)head->nx_packet_prepend_ptr);
+                    ULONG payload_length = 0U;
+                    if (head->nx_packet_length >= header_length + prefix_length) {
+                        payload_length = head->nx_packet_length - header_length - prefix_length;
+                    }
+                    head_sequence = sequence;
+                    head_end_sequence = sequence + payload_length;
+                }
+
+                xil_printf("diag8: state=%u mss=%u peer_mss=%u ifcap=0x%x sent_count=%u tx_seq=%u outstanding=%u timeout=%u/%u retries=%u "
+                           "head=0x%x done=%u qnext=0x%x tcp_next=0x%x prepend=0x%x ip_header=0x%x "
+                           "ip_hlen=%u length=%u head_seq=%u head_end=%u\r\n",
+                           trace_socket.nx_tcp_socket_state,
+                           trace_socket.nx_tcp_socket_connect_mss,
+                           trace_socket.nx_tcp_socket_peer_mss,
+                           ip.nx_ip_interface[0].nx_interface_capability_flag,
+                           trace_socket.nx_tcp_socket_transmit_sent_count,
+                           trace_socket.nx_tcp_socket_tx_sequence,
+                           trace_socket.nx_tcp_socket_tx_outstanding_bytes,
+                           trace_socket.nx_tcp_socket_timeout,
+                           trace_socket.nx_tcp_socket_timeout_rate,
+                           trace_socket.nx_tcp_socket_timeout_retries,
+                           head_addr, driver_done, queue_next, tcp_next, prepend, ip_header,
+                           ip_header_length, packet_length, head_sequence, head_end_sequence);
+                tx_mutex_put(&ip.nx_ip_protection);
+            } else {
+                xil_printf("diag8: ip_mutex_busy=%u\r\n", lock_status);
+            }
         }
         {
             unsigned int arp_cache_count, arp_cache_ip[4], arp_cache_msw[4], arp_cache_lsw[4];
@@ -537,13 +685,7 @@ static void trace_thread_entry(ULONG arg)
                  * comment for why this must not fire during ordinary idle
                  * periods. */
                 gem2_set_trace_active(1U);
-                /* Counts every loop iteration, success or not, so the
-                 * periodic real yield below fires on a bounded iteration
-                 * count regardless of whether the DMA is continuously idle,
-                 * continuously busy, or some mix — see the comment at the
-                 * yield site for why this must not depend on ever seeing
-                 * TRACE_DMA_NOT_READY. */
-                unsigned int poll_count = 0U;
+                unsigned int completed_since_sleep = 0U;
                 for (;;) {
                     UINT result = trace_dma_send_completed();
                     if (result == TRACE_DMA_NOT_READY) {
@@ -556,35 +698,16 @@ static void trace_thread_entry(ULONG arg)
                                    result,
                                    trace_mmio_read(TRACE_DMA_BASE, TRACE_DMA_S2MM_DMASR));
                         break;
-                    }
-                    /* This thread is the sole occupant of its ThreadX
-                     * priority level (see tx_application_define()), and
-                     * every thread here is created TX_NO_TIME_SLICE, so
-                     * tx_thread_relinquish() above is a documented no-op
-                     * whenever there's no other same-priority thread ready
-                     * — it never yields to main.c's lower-priority diag
-                     * thread. diag_thread is the *only* caller of
-                     * gem2_tx_poll_recover() (ThreadXGEM2Driver.c), the sole
-                     * recovery path for a stalled GEM2 TX ring, by that
-                     * function's own design comment ("polling is the only
-                     * signal left"). If this loop never truly blocks —
-                     * which nx_tcp_socket_send(NX_WAIT_FOREVER) only does
-                     * when the TCP window is actually full, not guaranteed
-                     * under sustained throughput with fast ACKs — diag_thread
-                     * (and anything else below priority 3) can be starved of
-                     * the CPU forever, matching the 2026-08-09 handoff's
-                     * "sustained load hangs the board" finding: isr_calls,
-                     * rx_frames, tx_frames, and diag_tx_recover_attempts all
-                     * going flat together is exactly what permanent
-                     * starvation of the one thread that reads/logs/recovers
-                     * them looks like, not necessarily a hardware-only
-                     * hang. Forcing a real, bounded-frequency sleep here
-                     * guarantees every lower-priority thread gets scheduled
-                     * at least this often no matter what this loop is doing,
-                     * so a real stall stays observable and recoverable
-                     * instead of silently permanent. Not yet re-verified on
-                     * hardware — see the handoff. */
-                    if ((++poll_count & 0xFFFFU) == 0U) {
+                    } else if (++completed_since_sleep >= 4096U) {
+                        /* This thread runs above diagnostics and a plain
+                         * relinquish cannot yield to a lower priority. Give
+                         * lower-priority recovery/telemetry work one real
+                         * tick periodically, but count completed frames—not
+                         * empty busy-poll iterations. Counting polls made the
+                         * sleep cadence CPU-speed-dependent and repeatedly
+                         * left the 32-entry DMA ring exhausted for most of a
+                         * 10 ms tick under sustained traffic. */
+                        completed_since_sleep = 0U;
                         tx_thread_sleep(1);
                     }
                 }
@@ -689,6 +812,11 @@ void tx_application_define(void *first_unused_memory)
     status = nx_packet_pool_create(&pool, "orbtrace_pool", POOL_PACKET_PAYLOAD,
                                     pool_memory, sizeof(pool_memory));
     xil_printf("orbtrace: nx_packet_pool_create = %d\r\n", status);
+    Xil_SetTlbAttributes((UINTPTR)trace_pool_memory, NORM_NONCACHE);
+    status = nx_packet_pool_create(&trace_pool, "orbtrace_trace_pool",
+                                    TRACE_POOL_PACKET_PAYLOAD,
+                                    trace_pool_memory, sizeof(trace_pool_memory));
+    xil_printf("orbtrace: trace nx_packet_pool_create = %d\r\n", status);
 
     status = nx_ip_create(&ip, "orbtrace_ip", ORBTRACE_IP_ADDRESS, ORBTRACE_NETMASK,
                            &pool, nx_driver_gem2, ip_stack_memory, sizeof(ip_stack_memory),
@@ -708,6 +836,19 @@ void tx_application_define(void *first_unused_memory)
                                    NX_IP_NORMAL, NX_FRAGMENT_OKAY, NX_IP_TIME_TO_LIVE,
                                    ORBTRACE_TCP_WINDOW, NX_NULL, NX_NULL);
     xil_printf("orbtrace: trace socket create = %d\r\n", status);
+    status = nx_tcp_socket_mss_set(&trace_socket, ORBTRACE_TRACE_MSS);
+    xil_printf("orbtrace: trace socket MSS set = %d\r\n", status);
+    /* The NetX default is 20 packets. With one 1459-byte Orbflow frame per
+     * TCP segment that capped outstanding data at exactly 29,180 bytes on
+     * hardware and forced the producer to wait for ACK processing. Forty
+     * doubles the trace flight allowance while retaining control-path slack
+     * after the fixed 64-entry RX ring is armed. */
+    status = nx_tcp_socket_transmit_configure(&trace_socket,
+                                               ORBTRACE_TRACE_TX_QUEUE,
+                                               NX_IP_PERIODIC_RATE,
+                                               NX_TCP_MAXIMUM_RETRIES,
+                                               NX_TCP_RETRY_SHIFT);
+    xil_printf("orbtrace: trace socket TX queue configure = %d\r\n", status);
     status = nx_tcp_socket_create(&ip, &dap_socket, "orbtrace_dap",
                                    NX_IP_NORMAL, NX_FRAGMENT_OKAY, NX_IP_TIME_TO_LIVE,
                                    ORBTRACE_TCP_WINDOW, NX_NULL, NX_NULL);

@@ -18,7 +18,8 @@ module orbtrace_pipeline_tb;
     logic stalled_last;
     integer output_count = 0;
     integer cycles = 0;
-    logic [7:0] expected [0:7];
+    logic overlap_seen;
+    logic [7:0] expected [0:14];
 
     always #5 clk = ~clk;
 
@@ -56,11 +57,13 @@ module orbtrace_pipeline_tb;
             stalled <= 0;
             output_count <= 0;
             cycles <= 0;
+            overlap_seen <= 0;
         end else begin
             lfsr <= {lfsr[14:0], lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10]};
             output_ready <= lfsr[0] | lfsr[3];
             cycles <= cycles + 1;
-            if (cycles > 300) $fatal(1, "pipeline timed out before packet delimiter");
+            if (cycles > 500) $fatal(1, "pipeline timed out before packet delimiter");
+            if (packet_valid && packet_ready && output_valid) overlap_seen <= 1;
             if (stalled && (output_data !== stalled_data || output_last !== stalled_last))
                 $fatal(1, "output changed while stalled");
             stalled <= output_valid && !output_ready;
@@ -69,12 +72,14 @@ module orbtrace_pipeline_tb;
             if (output_valid && output_ready) begin
                 if (output_data !== expected[output_count])
                     $fatal(1, "encoded byte %0d mismatch: %02x", output_count, output_data);
-                if (output_last !== (output_count == 7))
+                if (output_last !== (output_count == 7 || output_count == 14))
                     $fatal(1, "last flag mismatch at encoded byte %0d", output_count);
                 output_count <= output_count + 1;
-                if (output_count == 7) begin
-                    if (received_bytes !== 4 || dropped_bytes !== 0 || overrun)
+                if (output_count == 14) begin
+                    if (received_bytes !== 7 || dropped_bytes !== 0 || overrun)
                         $fatal(1, "counter mismatch received=%0d dropped=%0d", received_bytes, dropped_bytes);
+                    if (!overlap_seen)
+                        $fatal(1, "ping-pong banks never loaded and emitted concurrently");
                     $display("orbtrace randomized pipeline RTL tests passed");
                     $finish;
                 end
@@ -85,12 +90,16 @@ module orbtrace_pipeline_tb;
     initial begin
         expected[0]=8'h02; expected[1]=8'h07; expected[2]=8'h05; expected[3]=8'hff;
         expected[4]=8'h01; expected[5]=8'h02; expected[6]=8'hf7; expected[7]=8'h00;
+        expected[8]=8'h06; expected[9]=8'h07; expected[10]=8'h11; expected[11]=8'h22;
+        expected[12]=8'h33; expected[13]=8'h93; expected[14]=8'h00;
         reset_all();
         send_byte(8'h99);
         @(negedge clk); reset_n = 0;
         repeat (2) @(posedge clk);
         @(negedge clk); reset_n = 1;
         send_byte(8'h00); send_byte(8'hff); send_byte(8'h01); send_byte(8'h02);
+        repeat (6) @(posedge clk);
+        send_byte(8'h11); send_byte(8'h22); send_byte(8'h33);
     end
 endmodule
 `default_nettype wire

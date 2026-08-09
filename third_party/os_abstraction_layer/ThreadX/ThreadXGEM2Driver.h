@@ -17,6 +17,10 @@ extern "C" {
 
 #include "nx_api.h"
 
+/* Driver-private marker for a packet whose complete data area is mapped
+ * non-cacheable. nx_packet_allocate() clears this field on pool reuse. */
+#define GEM2_PACKET_NONCACHE 0x80000000UL
+
 /**
  * @brief NetX Duo driver entry point for GEM2.
  *
@@ -48,7 +52,9 @@ void gem2_diag_get(unsigned int *rx_frames, unsigned int *tx_frames, unsigned in
                     unsigned int *driver_cmd_count, unsigned int *last_driver_cmd,
                     unsigned int *last_driver_status);
 void gem2_diag_get_ip_dump(unsigned char *out40);
-void gem2_diag_get_tx_extra(unsigned int *txused_count, unsigned int *last_txsr);
+void gem2_diag_get_tx_extra(unsigned int *txused_count, unsigned int *last_txsr,
+                             unsigned int *tx_deferred_requests,
+                             unsigned int *tx_deferred_runs);
 void gem2_diag_get_tx_recover(unsigned int *attempts, unsigned int *txqbase_before,
                                unsigned int *txqbase_after);
 void gem2_diag_get_tx_dst(unsigned int *dst_msw, unsigned int *dst_lsw, unsigned int *cmd);
@@ -80,6 +86,15 @@ void gem2_diag_get_tx_bd_dump(unsigned int *tx_head, unsigned int *tx_tail, unsi
  * that produces no further interrupt at all still gets recovered.
  */
 void gem2_tx_poll_recover(void);
+
+/**
+ * @brief Recover an RX-only DMA stall while an active trace stream is still
+ * generating TX traffic. Call once per second from a thread context.
+ */
+void gem2_rx_poll_recover(void);
+
+/** @brief Number of RX-only polling recoveries attempted. */
+unsigned int gem2_diag_get_rx_poll_recover(void);
 
 /**
  * @brief Read the PHY's live link status over MDIO (BMSR bit 2), independent
@@ -130,6 +145,15 @@ void gem2_link_poll_recover(void);
  * gem2_link_poll_recover() has escalated to a full MAC/PHY reinit.
  */
 void gem2_diag_get_link_recover(unsigned int *attempts);
+
+/**
+ * @brief Temporary bring-up diagnostic: gem2_link_poll_recover()'s own
+ * gating/escalation state (sCtx.trace_active and its internal stall-tick
+ * counter), exposed directly so a sustained isr_calls freeze can be
+ * distinguished as "trace_active was already 0" vs. "trace_active stayed 1
+ * but the escalation still never fired".
+ */
+void gem2_diag_get_link_poll_state(unsigned int *trace_active, unsigned int *stall_ticks);
 
 #ifdef __cplusplus
 }

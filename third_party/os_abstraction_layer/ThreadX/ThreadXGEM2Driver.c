@@ -5,8 +5,8 @@
  *
  * Architecture
  * ────────────
- * The driver manages two DMA BD rings (TX and RX), each with GEM2_BD_COUNT
- * descriptors.  RX NX_PACKETs are pre-allocated at LINK_INITIALIZE time and
+ * The driver manages separate, deep DMA BD rings for TX and RX.  RX
+ * NX_PACKETs are pre-allocated at LINK_INITIALIZE time and
  * their data buffers are pointed to by the RX BDs.  When the MAC delivers a
  * frame (ISR), the driver hands the packet to NetX and refills the BD with a
  * new packet allocation.
@@ -44,6 +44,7 @@
 #include "xemacps.h"
 #include "xemacps_hw.h"
 #include "xil_cache.h"
+#include "xil_mmu.h"
 #include "xparameters.h"
 
 /* Temporary bring-up instrumentation (see gem2_initialize/gem2_enable). */
@@ -69,8 +70,12 @@ extern void xil_printf(const char *fmt, ...);
 
 /* ── Tunables ──────────────────────────────────────────────────────────── */
 
-/* BD ring depth — must be a power of 2 for the index-wrap arithmetic */
-#define GEM2_BD_COUNT    4U
+/* RX needs enough descriptors to absorb the host's ACK burst for a full TCP
+ * transmit window. Four descriptors are insufficient: on hardware the host
+ * ACKed eight back-to-back trace segments within microseconds, RXUSED fired,
+ * and GEM2 eventually stopped delivering every later cumulative ACK even
+ * while TX completion interrupts continued. Keep this a power of two. */
+#define GEM2_RX_BD_COUNT 64U
 
 /* TX needs substantially more elasticity than RX. Real Orbflow streaming
  * presents a burst of MTU-sized TCP packets faster than GEM completion IRQs
@@ -106,8 +111,8 @@ extern void xil_printf(const char *fmt, ...);
  * one frame on every reflash regardless of PHY tap_sel. */
 #define GEM2_BD_STRIDE   ((u32)sizeof(XEmacPs_Bd))
 
-/* Maximum receive frame size (Ethernet MTU 1500 + 14 header; no FCS) */
-#define GEM2_RX_BUFSIZE  1536U
+/* XEmacPs programs this receive-buffer size when jumbo mode is enabled. */
+#define GEM2_RX_BUFSIZE  XEMACPS_RX_BUF_SIZE_JUMBO
 
 /* Bytes of dead space the DMA engine writes before each received frame
  * (NWCFG.RXOFFS below), so the IP header lands 4-byte aligned after the
@@ -146,10 +151,6 @@ typedef struct {
     NX_IP          *ip_ptr;
     NX_PACKET_POOL *pool_ptr;
 
-    /* TX BD ring + ZynqMP TXQ1 dummy BD */
-    u8 tx_bd[GEM2_TX_BD_COUNT * GEM2_BD_ALIGN] __attribute__((aligned(GEM2_BD_ALIGN)));
-    u8 tx_q1_dummy[GEM2_BD_ALIGN]           __attribute__((aligned(GEM2_BD_ALIGN)));
-
     /* Static per-slot TX buffers for multi-buffer packet flattening */
     u8 tx_buf[GEM2_TX_BD_COUNT][GEM2_RX_BUFSIZE] __attribute__((aligned(GEM2_BD_ALIGN)));
 
@@ -161,11 +162,8 @@ typedef struct {
     u32 tx_tail;
     u32 tx_count;   /* BDs currently in flight */
 
-    /* RX BD ring */
-    u8 rx_bd[GEM2_BD_COUNT * GEM2_BD_ALIGN] __attribute__((aligned(GEM2_BD_ALIGN)));
-
     /* Pre-allocated NX_PACKETs backing the RX BDs */
-    NX_PACKET *rx_pkts[GEM2_BD_COUNT];
+    NX_PACKET *rx_pkts[GEM2_RX_BD_COUNT];
 
     /* Next RX BD to check for completion (software tail pointer) */
     u32 rx_tail;
@@ -180,9 +178,12 @@ typedef struct {
     u32 diag_last_etype;
     u32 diag_last_len;
     u32 diag_tx_complete;
+    u32 diag_tx_deferred_requests;
+    u32 diag_tx_deferred_runs;
     u32 diag_last_tx_stat;
     u32 diag_last_isr;
     u32 diag_rxused_count;
+    u32 diag_rx_poll_recover_attempts;
     u32 diag_txused_count;
     u32 diag_last_txsr;
     u32 diag_driver_cmd_count;
@@ -239,6 +240,21 @@ typedef struct {
 
 static Gem2Ctx sCtx;
 
+/* GEM descriptors are 16 bytes while an A53 data-cache line is 64 bytes.
+ * Keeping a live DMA ring cacheable therefore creates false sharing: a
+ * clean of one descriptor can write a stale cached copy of three adjacent
+ * descriptors over ownership bits the GEM has just updated.  Place only
+ * the descriptor storage in Orbtrace's linker-isolated DMA translation
+ * block and mark that entire block non-cacheable before the rings are used.
+ * The section is NOLOAD, which is safe because BdRingCreate()/memset below
+ * initialize every byte that hardware observes. */
+static u8 sTxBd[GEM2_TX_BD_COUNT * GEM2_BD_STRIDE]
+    __attribute__((aligned(GEM2_BD_ALIGN), section(".trace_dma")));
+static u8 sRxBd[GEM2_RX_BD_COUNT * GEM2_BD_STRIDE]
+    __attribute__((aligned(GEM2_BD_ALIGN), section(".trace_dma")));
+static u8 sTxQ1Dummy[GEM2_BD_ALIGN]
+    __attribute__((aligned(GEM2_BD_ALIGN), section(".trace_dma")));
+
 /* Temporary bring-up diagnostic accessor — see main.c's diag_thread_entry. */
 void gem2_diag_get(u32 *rx_frames, u32 *tx_frames, u32 *isr_calls, u32 *last_etype, u32 *last_len,
                     u32 *tx_complete, u32 *last_tx_stat, u32 *tx_head, u32 *tx_tail, u32 *tx_count,
@@ -263,10 +279,13 @@ void gem2_diag_get(u32 *rx_frames, u32 *tx_frames, u32 *isr_calls, u32 *last_ety
 }
 
 /* Temporary bring-up diagnostic accessor — see main.c's diag_thread_entry. */
-void gem2_diag_get_tx_extra(u32 *txused_count, u32 *last_txsr)
+void gem2_diag_get_tx_extra(u32 *txused_count, u32 *last_txsr,
+                            u32 *tx_deferred_requests, u32 *tx_deferred_runs)
 {
     *txused_count = sCtx.diag_txused_count;
     *last_txsr = sCtx.diag_last_txsr;
+    *tx_deferred_requests = sCtx.diag_tx_deferred_requests;
+    *tx_deferred_runs = sCtx.diag_tx_deferred_runs;
 }
 
 /* Temporary bring-up diagnostic accessor: whether gem2_tx_poll_recover()
@@ -293,17 +312,17 @@ void gem2_diag_get_tx_dst(u32 *dst_msw, u32 *dst_lsw, u32 *cmd)
     *cmd = sCtx.diag_last_tx_cmd;
 }
 
-/* Temporary bring-up diagnostic: raw RX BD ring state (all GEM2_BD_COUNT
- * descriptors' ADDR/STAT words), software's rx_tail, and the hardware's own
+/* Temporary bring-up diagnostic: the first GEM2_DIAG_BD_COUNT RX descriptor
+ * ADDR/STAT words, software's rx_tail, and the hardware's own
  * RXQBASE register — to see directly whether software and hardware agree
  * on which descriptor is "next" when RXUSED gets stuck. */
 void gem2_diag_get_rx_bd_dump(u32 *rx_tail, u32 *rxqbase, u32 *rx_bd_base, u32 addr_words[4], u32 stat_words[4])
 {
     *rx_tail = sCtx.rx_tail;
     *rxqbase = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_RXQBASE_OFFSET);
-    *rx_bd_base = (u32)(UINTPTR)sCtx.rx_bd;
-    for (u32 i = 0U; i < GEM2_BD_COUNT; i++) {
-        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + i * GEM2_BD_STRIDE);
+    *rx_bd_base = (u32)(UINTPTR)sRxBd;
+    for (u32 i = 0U; i < GEM2_DIAG_BD_COUNT; i++) {
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sRxBd + i * GEM2_BD_STRIDE);
         Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_STRIDE);
         addr_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
         stat_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_STAT_OFFSET);
@@ -319,9 +338,9 @@ void gem2_diag_get_tx_bd_dump(u32 *tx_head, u32 *tx_tail, u32 *tx_count, u32 *tx
     *tx_tail = sCtx.tx_tail;
     *tx_count = sCtx.tx_count;
     *txqbase = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXQBASE_OFFSET);
-    *tx_bd_base = (u32)(UINTPTR)sCtx.tx_bd;
+    *tx_bd_base = (u32)(UINTPTR)sTxBd;
     for (u32 i = 0U; i < GEM2_DIAG_BD_COUNT; i++) {
-        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.tx_bd + i * GEM2_BD_STRIDE);
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sTxBd + i * GEM2_BD_STRIDE);
         Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_STRIDE);
         addr_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
         stat_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_STAT_OFFSET);
@@ -408,6 +427,8 @@ static void gem2_disable(NX_IP_DRIVER *req);
 static void gem2_packet_send(NX_IP_DRIVER *req);
 static void gem2_rx_process(void);
 static void gem2_tx_cleanup(void);
+static void gem2_full_reinit(void);
+static void gem2_rx_stall_recover(void);
 static UINT gem2_alloc_rx_packet(u32 slot);
 static void gem2_phy_enable_tx_delay(XEmacPs *mac);
 static void gem2_arp_learn(u32 ip, u32 msw, u32 lsw);
@@ -569,6 +590,24 @@ void nx_driver_gem2(NX_IP_DRIVER *req)
     sCtx.diag_last_driver_cmd = (u32)req->nx_ip_driver_command;
 
     switch (req->nx_ip_driver_command) {
+        case NX_LINK_INTERFACE_ATTACH:
+            /* The ZynqMP GEM checksum generator is enabled below. Advertising
+             * these capabilities keeps NetX from redundantly scanning every
+             * outgoing payload in software. Keep RX checksum validation in
+             * NetX until the receive-status plumbing exposes the GEM result. */
+            req->nx_ip_driver_interface->nx_interface_capability_flag =
+                NX_INTERFACE_CAPABILITY_IPV4_TX_CHECKSUM |
+                NX_INTERFACE_CAPABILITY_TCP_TX_CHECKSUM |
+                NX_INTERFACE_CAPABILITY_UDP_TX_CHECKSUM;
+            req->nx_ip_driver_status = NX_SUCCESS;
+            break;
+        case NX_INTERFACE_CAPABILITY_GET:
+            *req->nx_ip_driver_return_ptr =
+                NX_INTERFACE_CAPABILITY_IPV4_TX_CHECKSUM |
+                NX_INTERFACE_CAPABILITY_TCP_TX_CHECKSUM |
+                NX_INTERFACE_CAPABILITY_UDP_TX_CHECKSUM;
+            req->nx_ip_driver_status = NX_SUCCESS;
+            break;
         case NX_LINK_INITIALIZE:
             gem2_initialize(req);
             break;
@@ -599,7 +638,16 @@ void nx_driver_gem2(NX_IP_DRIVER *req)
             req->nx_ip_driver_status      = NX_SUCCESS;
             break;
         case NX_LINK_DEFERRED_PROCESSING:
-            /* IP thread processes deferred packets; nothing extra needed here */
+            /* TX completion changes NetX-owned NX_PACKET metadata. Do that in
+             * the IP helper thread, not directly in the GEM ISR: NetX's ACK
+             * queue walker selects the TCP-header location from
+             * nx_packet_queue_next while nx_packet_transmit_release() changes
+             * that marker, prepend_ptr, length, and ip_header_length. Running
+             * both paths in the IP thread makes that ownership transition
+             * serial with ACK processing instead of exposing a torn packet
+             * state to the ACK walker. See gem2_irq_handler(). */
+            sCtx.diag_tx_deferred_runs++;
+            gem2_tx_cleanup();
             req->nx_ip_driver_status = NX_SUCCESS;
             break;
         default:
@@ -618,6 +666,11 @@ static void gem2_initialize(NX_IP_DRIVER *req)
 
     sCtx.ip_ptr   = req->nx_ip_driver_ptr;
     sCtx.pool_ptr = req->nx_ip_driver_ptr->nx_ip_default_packet_pool;
+
+    /* sTxBd/sRxBd share the dedicated 2 MiB .trace_dma translation block.
+     * Change its attributes before BdRingCreate writes or hardware reads any
+     * descriptor; see their declaration for the cache-line race this avoids. */
+    Xil_SetTlbAttributes((UINTPTR)sRxBd, NORM_NONCACHE);
 
     /* 1. Init XEmacPs driver */
     XEmacPs_Config *cfg = XEmacPs_LookupConfig(XPAR_XEMACPS_0_BASEADDR);
@@ -660,7 +713,9 @@ static void gem2_initialize(NX_IP_DRIVER *req)
     rc = XEmacPs_SetOptions(&sCtx.mac,
              XEMACPS_PROMISC_OPTION    |
              XEMACPS_FCS_INSERT_OPTION |
-             XEMACPS_FCS_STRIP_OPTION);
+             XEMACPS_FCS_STRIP_OPTION  |
+             XEMACPS_JUMBO_ENABLE_OPTION |
+             XEMACPS_TX_CHKSUM_ENABLE_OPTION);
     if (rc != XST_SUCCESS) { req->nx_ip_driver_status = NX_NOT_SUCCESSFUL; return; }
 
     /* 4. Set MAC address from NetX interface or use default */
@@ -672,18 +727,18 @@ static void gem2_initialize(NX_IP_DRIVER *req)
     req->nx_ip_driver_interface->nx_interface_physical_address_lsw =
         (ULONG)((sMAC[2] << 24) | (sMAC[3] << 16) | (sMAC[4] << 8) | sMAC[5]);
 
-    /* Standard Ethernet IP MTU. Left unset, this field defaults to 0 from
+    /* Private point-to-point jumbo Ethernet MTU. Left unset, this field defaults to 0 from
      * NetX's zero-initialized interface struct — ARP still works (it
      * bypasses IP-layer fragmentation/MTU checks entirely), but every
      * outbound IP packet (TCP SYN-ACK, ICMP, ...) silently fails NetX's
      * own MTU check before ever reaching gem2_packet_send(), which looks
      * identical on the wire to the driver just not replying. */
-    req->nx_ip_driver_interface->nx_interface_ip_mtu_size = 1500U;
+    req->nx_ip_driver_interface->nx_interface_ip_mtu_size = 9000U;
 
     /* 5. TX BD ring */
     rc = XEmacPs_BdRingCreate(
             &XEmacPs_GetTxRing(&sCtx.mac),
-            (UINTPTR)sCtx.tx_bd, (UINTPTR)sCtx.tx_bd,
+            (UINTPTR)sTxBd, (UINTPTR)sTxBd,
             GEM2_BD_ALIGN, GEM2_TX_BD_COUNT);
     if (rc != XST_SUCCESS) {
         xil_printf("gem2: TX BdRingCreate failed rc=%ld\r\n", rc);
@@ -730,8 +785,8 @@ static void gem2_initialize(NX_IP_DRIVER *req)
     /* 6. RX BD ring */
     rc = XEmacPs_BdRingCreate(
             &XEmacPs_GetRxRing(&sCtx.mac),
-            (UINTPTR)sCtx.rx_bd, (UINTPTR)sCtx.rx_bd,
-            GEM2_BD_ALIGN, GEM2_BD_COUNT);
+            (UINTPTR)sRxBd, (UINTPTR)sRxBd,
+            GEM2_BD_ALIGN, GEM2_RX_BD_COUNT);
     if (rc != XST_SUCCESS) {
         xil_printf("gem2: RX BdRingCreate failed rc=%ld\r\n", rc);
         req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
@@ -739,7 +794,7 @@ static void gem2_initialize(NX_IP_DRIVER *req)
     }
 
     /* 7. Pre-allocate RX packets and point BDs at their data areas */
-    for (i = 0U; i < GEM2_BD_COUNT; i++) {
+    for (i = 0U; i < GEM2_RX_BD_COUNT; i++) {
         if (gem2_alloc_rx_packet(i) != NX_SUCCESS) {
             xil_printf("gem2: RX packet alloc failed at slot %lu\r\n", (unsigned long)i);
             req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
@@ -752,10 +807,10 @@ static void gem2_initialize(NX_IP_DRIVER *req)
      *    priority queue 1 and falls through to our real frames on queue 0.
      *    Without this the DMA spins on whatever stale address TXQ1BASE holds
      *    after reset (typically 0x380 in OCM / exception-vector space). */
-    memset(sCtx.tx_q1_dummy, 0, GEM2_BD_ALIGN);
-    XEmacPs_BdWrite((XEmacPs_Bd *)sCtx.tx_q1_dummy, XEMACPS_BD_STAT_OFFSET,
+    memset(sTxQ1Dummy, 0, GEM2_BD_ALIGN);
+    XEmacPs_BdWrite((XEmacPs_Bd *)sTxQ1Dummy, XEMACPS_BD_STAT_OFFSET,
                     XEMACPS_TXBUF_USED_MASK | XEMACPS_TXBUF_WRAP_MASK);
-    Xil_DCacheFlushRange((UINTPTR)sCtx.tx_q1_dummy, GEM2_BD_ALIGN);
+    Xil_DCacheFlushRange((UINTPTR)sTxQ1Dummy, GEM2_BD_ALIGN);
 
     sCtx.tx_head = 0U;
     sCtx.tx_tail = 0U;
@@ -778,9 +833,9 @@ static void gem2_enable(NX_IP_DRIVER *req)
     }
 
     /* Point HW at BD rings (required for ZynqMP GEM) */
-    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sCtx.tx_q1_dummy, 1U, 1U);
-    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sCtx.tx_bd, 0U, 1U);
-    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sCtx.rx_bd, 0U, 0U);
+    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sTxQ1Dummy, 1U, 1U);
+    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sTxBd, 0U, 1U);
+    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sRxBd, 0U, 0U);
 
     XEmacPs_Start(&sCtx.mac);
 
@@ -789,21 +844,13 @@ static void gem2_enable(NX_IP_DRIVER *req)
      * gem2_initialize(). */
     gem2_phy_enable_tx_delay(&sCtx.mac);
 
-    /* Enable RX, TX-complete, RX-buffer-unavailable, and TX-buffer-used
-     * interrupts in the MAC. RXUSED/TXUSED must be enabled here, not just
-     * handled in the ISR: the DMA engine halts scanning at the hardware
-     * level the moment it finds a descriptor still marked used, regardless
-     * of whether that condition is masked into an interrupt — masking it
-     * just means the CPU is never told the DMA stopped, so
-     * gem2_irq_handler() never runs again and RX/TX goes silently and
-     * permanently dead. TXUSED (TXSR bit 0, "Tx buffer used bit read") is
-     * the TX-side mirror of RXUSED: confirmed on real hardware that TX
-     * completes exactly once after link-up and then stalls forever with
-     * tx_count growing unboundedly — the same DMA-halts-on-used-bit
-     * behavior seen on RX, just never wired up on the TX side. */
+    /* RX interrupts also provide the batching cadence for TX completion:
+     * sustained TCP traffic necessarily receives peer ACKs. Per-frame
+     * TXCOMPL/TXUSED interrupts otherwise doubled the IP-thread work. TXSR
+     * is acknowledged synchronously before each transmit kick below, and
+     * the once-per-second poll remains the fallback for a real TX stall. */
     XEmacPs_IntEnable(&sCtx.mac,
-                      XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_TXCOMPL_MASK |
-                      XEMACPS_IXR_RXUSED_MASK | XEMACPS_IXR_TXUSED_MASK);
+                      XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_RXUSED_MASK);
 
     req->nx_ip_driver_interface->nx_interface_link_up = NX_TRUE;
     req->nx_ip_driver_status = NX_SUCCESS;
@@ -827,6 +874,7 @@ static void gem2_disable(NX_IP_DRIVER *req)
 
 static void gem2_packet_send(NX_IP_DRIVER *req)
 {
+TX_INTERRUPT_SAVE_AREA
     NX_PACKET *pkt   = req->nx_ip_driver_packet;
     u32 slot = sCtx.tx_head;
 
@@ -974,16 +1022,27 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
     eth[12] = (u8)(ether_type >> 8);
     eth[13] = (u8)ether_type;
 
-    /* Flatten the packet chain into the static TX buffer for this slot.
-     * This adds a copy but avoids aliasing the NX_PACKET data area while
-     * the DMA is active and simplifies cache management. */
-    u8 *dst  = sCtx.tx_buf[slot];
-    u32 total = 0U;
-    for (NX_PACKET *frag = pkt; frag && total < GEM2_RX_BUFSIZE; frag = frag->nx_packet_next) {
-        ULONG chunk = (ULONG)(frag->nx_packet_append_ptr - frag->nx_packet_prepend_ptr);
-        if (total + chunk > GEM2_RX_BUFSIZE) { chunk = GEM2_RX_BUFSIZE - total; }
-        memcpy(dst + total, frag->nx_packet_prepend_ptr, chunk);
-        total += chunk;
+    /* NetX retains an outbound packet until the link driver reports DMA
+     * completion, and tx_pkts[] below provides that exact completion hold.
+     * A normal MTU-sized TCP/IP packet is therefore already a safe GEM DMA
+     * buffer: point the descriptor at it directly instead of copying every
+     * frame through tx_buf[]. Packet chains retain the flattening fallback
+     * because one GEM descriptor cannot describe discontiguous fragments. */
+    u8 *tx_data;
+    u32 total = (u32)pkt->nx_packet_length;
+    if (pkt->nx_packet_next == NX_NULL && total <= GEM2_RX_BUFSIZE) {
+        tx_data = (u8 *)pkt->nx_packet_prepend_ptr;
+    } else {
+        u8 *dst = sCtx.tx_buf[slot];
+        total = 0U;
+        for (NX_PACKET *frag = pkt; frag && total < GEM2_RX_BUFSIZE;
+             frag = frag->nx_packet_next) {
+            ULONG chunk = (ULONG)(frag->nx_packet_append_ptr - frag->nx_packet_prepend_ptr);
+            if (total + chunk > GEM2_RX_BUFSIZE) { chunk = GEM2_RX_BUFSIZE - total; }
+            memcpy(dst + total, frag->nx_packet_prepend_ptr, chunk);
+            total += chunk;
+        }
+        tx_data = dst;
     }
 
     /* Restore the packet to the state NetX handed it to us in. NetX Duo
@@ -1015,23 +1074,46 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
     sCtx.diag_last_tx_length_after = (u32)pkt->nx_packet_length;
 
     /* Set up TX BD */
-    XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.tx_bd + slot * GEM2_BD_STRIDE);
+    XEmacPs_Bd *bd = (XEmacPs_Bd *)(sTxBd + slot * GEM2_BD_STRIDE);
     memset(bd, 0, GEM2_BD_STRIDE);
-    XEmacPs_BdSetAddressTx(bd, (UINTPTR)(sCtx.tx_buf[slot]));
+    XEmacPs_BdSetAddressTx(bd, (UINTPTR)tx_data);
     XEmacPs_BdWrite(bd, XEMACPS_BD_STAT_OFFSET,
                     (total & 0x3FFFU)       |
                     XEMACPS_TXBUF_LAST_MASK |
                     /* set WRAP on last BD in ring */
                     ((slot == GEM2_TX_BD_COUNT - 1U) ? XEMACPS_TXBUF_WRAP_MASK : 0U));
 
-    Xil_DCacheFlushRange((UINTPTR)sCtx.tx_buf[slot], total);
+    u32 flush_length = total;
+    if (pkt->nx_packet_next == NX_NULL &&
+        (pkt->nx_packet_interface_capability_flag & GEM2_PACKET_NONCACHE) != 0U) {
+        /* The packet control block, headers, and payload all come from the
+         * dedicated non-cacheable trace pool. No clean is needed, including
+         * on retransmission; CPU header writes already reach DDR directly. */
+        flush_length = 0U;
+    }
+    if (flush_length != 0U) {
+        Xil_DCacheFlushRange((UINTPTR)tx_data, flush_length);
+    }
     Xil_DCacheFlushRange((UINTPTR)bd, GEM2_BD_STRIDE);
 
+    /* Keep publication of a new ring entry atomic with respect to interrupt
+     * delivery and ThreadX preemption. TX completion cleanup is now deferred
+     * to the IP helper thread (see NX_LINK_DEFERRED_PROCESSING), which also
+     * prevents it from racing NetX's ACK walker over NX_PACKET metadata. The
+     * critical section remains useful because recovery/diagnostic contexts
+     * also inspect this ring state. */
+    TX_DISABLE
     sCtx.tx_pkts[slot] = pkt;
     sCtx.tx_head = (slot + 1U) % GEM2_TX_BD_COUNT;
     sCtx.tx_count++;
+    TX_RESTORE
     sCtx.diag_tx_frames++;
 
+    /* TXQ1's permanent dummy descriptor raises TXUSED on every scan. Clear
+     * the accumulated TX status here instead of taking an interrupt for
+     * every frame, then kick TXQ0. */
+    u32 txsr = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXSR_OFFSET);
+    XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXSR_OFFSET, txsr);
     XEmacPs_Transmit(&sCtx.mac);  /* set STARTTX in NWCTRL */
 
     req->nx_ip_driver_status = NX_SUCCESS;
@@ -1100,9 +1182,9 @@ static UINT gem2_arp_lookup(u32 ip, u32 *msw, u32 *lsw)
 
 static void gem2_rx_process(void)
 {
-    for (u32 i = 0U; i < GEM2_BD_COUNT; i++) {
+    for (u32 i = 0U; i < GEM2_RX_BD_COUNT; i++) {
         u32 slot = sCtx.rx_tail;
-        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + slot * GEM2_BD_STRIDE);
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sRxBd + slot * GEM2_BD_STRIDE);
 
         Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_STRIDE);
         u32 addr_word = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
@@ -1123,7 +1205,7 @@ static void gem2_rx_process(void)
             if (gem2_alloc_rx_packet(slot) != NX_SUCCESS) {
                 break;  /* still no packet available — retry this same slot next time */
             }
-            sCtx.rx_tail = (slot + 1U) % GEM2_BD_COUNT;
+            sCtx.rx_tail = (slot + 1U) % GEM2_RX_BD_COUNT;
             continue;
         }
 
@@ -1220,7 +1302,7 @@ static void gem2_rx_process(void)
         }
 
         /* Advance tail */
-        sCtx.rx_tail = (slot + 1U) % GEM2_BD_COUNT;
+        sCtx.rx_tail = (slot + 1U) % GEM2_RX_BD_COUNT;
     }
 }
 
@@ -1228,9 +1310,16 @@ static void gem2_rx_process(void)
 
 static void gem2_tx_cleanup(void)
 {
+    /* Runs only from NX_LINK_DEFERRED_PROCESSING in NetX's IP helper thread.
+     * In particular, do not move nx_packet_transmit_release() back into the
+     * ISR: _nx_tcp_socket_state_ack_check() reads nx_packet_queue_next to
+     * decide whether prepend_ptr names the TCP header or the IP header, while
+     * nx_packet_transmit_release() changes all of that state. An interrupt in
+     * the middle of the ACK walk can otherwise leave a fully cumulatively
+     * ACKed packet stuck at the head of the retransmission queue. */
     while (sCtx.tx_count > 0U) {
         u32 slot = sCtx.tx_tail;
-        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.tx_bd + slot * GEM2_BD_STRIDE);
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sTxBd + slot * GEM2_BD_STRIDE);
 
         Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_STRIDE);
         u32 stat = XEmacPs_BdRead(bd, XEMACPS_BD_STAT_OFFSET);
@@ -1264,14 +1353,14 @@ static UINT gem2_alloc_rx_packet(u32 slot)
 
     sCtx.rx_pkts[slot] = pkt;
 
-    XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + slot * GEM2_BD_STRIDE);
+    XEmacPs_Bd *bd = (XEmacPs_Bd *)(sRxBd + slot * GEM2_BD_STRIDE);
 
     /* Clear stat word; set BD address with DMA-owns (bit 0 = 0) */
     XEmacPs_BdWrite(bd, XEMACPS_BD_STAT_OFFSET, 0U);
     XEmacPs_BdSetAddressRx(bd, (UINTPTR)pkt->nx_packet_prepend_ptr);
 
     /* Preserve WRAP bit on the last BD so the ring is circular */
-    if (slot == GEM2_BD_COUNT - 1U) {
+    if (slot == GEM2_RX_BD_COUNT - 1U) {
         u32 addr = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
         XEmacPs_BdWrite(bd, XEMACPS_BD_ADDR_OFFSET, addr | XEMACPS_RXBUF_WRAP_MASK);
     }
@@ -1291,6 +1380,56 @@ static UINT gem2_alloc_rx_packet(u32 slot)
     return NX_SUCCESS;
 }
 
+/* Re-point the RX DMA at software's next descriptor and re-enable scanning.
+ * This is used both for an explicit RXUSED interrupt and for the RX-only
+ * silence detector below. TX-completion interrupts can keep isr_calls moving
+ * after RX has wedged, so the older total-interrupt detector cannot see this
+ * failure mode. */
+static void gem2_rx_stall_recover(void)
+{
+    u32 ctrl = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET);
+    XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
+                      ctrl & ~XEMACPS_NWCTRL_RXEN_MASK);
+    UINTPTR next_bd = (UINTPTR)(sRxBd + sCtx.rx_tail * GEM2_BD_STRIDE);
+    XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_RXQBASE_OFFSET,
+                      (u32)(next_bd & 0xFFFFFFFFU));
+#if defined(__aarch64__)
+    XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_MSBBUF_RXQBASE_OFFSET,
+                      (u32)((u64)next_bd >> 32));
+#endif
+    XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
+                      ctrl | XEMACPS_NWCTRL_RXEN_MASK);
+}
+
+void gem2_rx_poll_recover(void)
+{
+    static u32 last_rx_frames;
+    static u32 last_tx_frames;
+
+    if (!sCtx.trace_active) {
+        last_rx_frames = sCtx.diag_rx_frames;
+        last_tx_frames = sCtx.diag_tx_frames;
+        return;
+    }
+
+    if (sCtx.diag_rx_frames == last_rx_frames &&
+        sCtx.diag_tx_frames != last_tx_frames) {
+        /* An active TCP stream cannot make sustained TX progress without
+         * peer ACKs. TX moving while RX is completely static for a full
+         * one-second poll interval means those ACKs are no longer reaching
+         * NetX, even if TX completion interrupts keep the GEM ISR active. */
+        sCtx.diag_rx_poll_recover_attempts++;
+        gem2_rx_stall_recover();
+    }
+    last_rx_frames = sCtx.diag_rx_frames;
+    last_tx_frames = sCtx.diag_tx_frames;
+}
+
+u32 gem2_diag_get_rx_poll_recover(void)
+{
+    return sCtx.diag_rx_poll_recover_attempts;
+}
+
 /* ── TX stall recovery (polled from main.c's diag thread) ──────────────── */
 
 /* Resync TXQBASE to software's tx_tail and re-kick, exactly mirroring the
@@ -1303,7 +1442,7 @@ static void gem2_tx_stall_recover(void)
     u32 ctrl = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET);
     XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
                       ctrl & ~XEMACPS_NWCTRL_TXEN_MASK);
-    UINTPTR next_bd = (UINTPTR)(sCtx.tx_bd + sCtx.tx_tail * GEM2_BD_STRIDE);
+    UINTPTR next_bd = (UINTPTR)(sTxBd + sCtx.tx_tail * GEM2_BD_STRIDE);
     XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXQBASE_OFFSET,
                       (u32)(next_bd & 0xFFFFFFFFU));
 #if defined(__aarch64__)
@@ -1352,26 +1491,57 @@ static void gem2_tx_stall_recover(void)
  * way the ISR-triggered version did — a real transmission completes in
  * well under a second. Retries every second for as long as the ring stays
  * stuck, rather than a permanent one-shot latch that a failed first
- * attempt could never recover from. */
+ * attempt could never recover from.
+ *
+ * Escalation to gem2_full_reinit(): on real hardware (2026-08-09 handoff,
+ * this session's continuation) this TXQBASE-only recovery was observed
+ * firing repeatedly (diag_tx_recover_attempts climbing) without ever
+ * restoring TX progress, while the heavier gem2_full_reinit() — which does
+ * a real XEmacPs_Stop()/XEmacPs_Start() cycle instead of just toggling TXEN
+ * — never got a chance to run: it is normally gated by sCtx.trace_active
+ * via gem2_link_poll_recover(), and the application-level trace session
+ * consistently ended (trace_active back to 0) within 1-3 seconds of the
+ * underlying TX stall, i.e. before that gate could ever see 3 consecutive
+ * stalled ticks. A merely-toggled TXEN bit resyncing TXQBASE is a much
+ * lighter reset than a full stop/start and evidently isn't always
+ * sufficient to clear whatever internal DMA state a used-descriptor halt
+ * leaves behind. Escalating here means this recovery no longer depends on
+ * a capture happening to still be active — a genuinely wedged TX ring is
+ * always worth fully recovering, since GEM2 TX also carries this driver's
+ * own connection teardown (FIN/RST) traffic: while wedged, not even that
+ * can reach the peer, which is consistent with the host-side ARP entry
+ * going FAILED (total silence) rather than a clean disconnect being
+ * observed after this kind of stall. */
+#define GEM2_TX_STALL_ESCALATE_THRESHOLD 3U
+
 void gem2_tx_poll_recover(void)
 {
     static u32 last_tx_complete;
     static u32 last_seen_progress = 1U;  /* assume healthy until proven otherwise */
+    static u32 consecutive_stall_recoveries;
 
     if (sCtx.tx_count == 0U) {
         last_tx_complete = sCtx.diag_tx_complete;
         last_seen_progress = 1U;
+        consecutive_stall_recoveries = 0U;
         return;
     }
 
     if (sCtx.diag_tx_complete != last_tx_complete) {
         last_tx_complete = sCtx.diag_tx_complete;
         last_seen_progress = 1U;
+        consecutive_stall_recoveries = 0U;
         return;
     }
 
     if (!last_seen_progress) {
-        gem2_tx_stall_recover();
+        consecutive_stall_recoveries++;
+        if (consecutive_stall_recoveries >= GEM2_TX_STALL_ESCALATE_THRESHOLD) {
+            gem2_full_reinit();
+            consecutive_stall_recoveries = 0U;
+        } else {
+            gem2_tx_stall_recover();
+        }
     }
     last_seen_progress = 0U;
 }
@@ -1431,15 +1601,15 @@ static void gem2_full_reinit(void)
         XEmacPs_BdRingClone(&XEmacPs_GetTxRing(&sCtx.mac), &bd_template, XEMACPS_SEND);
     }
 
-    for (u32 i = 0U; i < GEM2_BD_COUNT; i++) {
+    for (u32 i = 0U; i < GEM2_RX_BD_COUNT; i++) {
         if (sCtx.rx_pkts[i] == NX_NULL) {
             gem2_alloc_rx_packet(i);  /* best-effort retry of a previously-failed refill */
             continue;
         }
-        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + i * GEM2_BD_STRIDE);
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sRxBd + i * GEM2_BD_STRIDE);
         XEmacPs_BdWrite(bd, XEMACPS_BD_STAT_OFFSET, 0U);
         XEmacPs_BdSetAddressRx(bd, (UINTPTR)sCtx.rx_pkts[i]->nx_packet_prepend_ptr);
-        if (i == GEM2_BD_COUNT - 1U) {
+        if (i == GEM2_RX_BD_COUNT - 1U) {
             u32 addr = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
             XEmacPs_BdWrite(bd, XEMACPS_BD_ADDR_OFFSET, addr | XEMACPS_RXBUF_WRAP_MASK);
         }
@@ -1448,14 +1618,13 @@ static void gem2_full_reinit(void)
     }
     sCtx.rx_tail = 0U;
 
-    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sCtx.tx_q1_dummy, 1U, 1U);
-    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sCtx.tx_bd, 0U, 1U);
-    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sCtx.rx_bd, 0U, 0U);
+    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sTxQ1Dummy, 1U, 1U);
+    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sTxBd, 0U, 1U);
+    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sRxBd, 0U, 0U);
     XEmacPs_Start(&sCtx.mac);
     gem2_phy_enable_tx_delay(&sCtx.mac);
     XEmacPs_IntEnable(&sCtx.mac,
-                      XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_TXCOMPL_MASK |
-                      XEMACPS_IXR_RXUSED_MASK | XEMACPS_IXR_TXUSED_MASK);
+                      XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_RXUSED_MASK);
 }
 
 /* Number of consecutive stagnant polls (called once a second — see
@@ -1464,34 +1633,48 @@ static void gem2_full_reinit(void)
  * are routine on any lightly-loaded link. */
 #define GEM2_LINK_STALL_TICKS_THRESHOLD 3U
 
+static u32 sGem2LinkPollLastIsrCalls;
+static u32 sGem2LinkPollStallTicks;
+
 void gem2_link_poll_recover(void)
 {
-    static u32 last_isr_calls;
-    static u32 stall_ticks;
-
     if (!sCtx.trace_active) {
-        last_isr_calls = sCtx.diag_isr_calls;
-        stall_ticks = 0U;
+        sGem2LinkPollLastIsrCalls = sCtx.diag_isr_calls;
+        sGem2LinkPollStallTicks = 0U;
         return;
     }
 
-    if (sCtx.diag_isr_calls != last_isr_calls) {
-        last_isr_calls = sCtx.diag_isr_calls;
-        stall_ticks = 0U;
+    if (sCtx.diag_isr_calls != sGem2LinkPollLastIsrCalls) {
+        sGem2LinkPollLastIsrCalls = sCtx.diag_isr_calls;
+        sGem2LinkPollStallTicks = 0U;
         return;
     }
 
-    stall_ticks++;
-    if (stall_ticks >= GEM2_LINK_STALL_TICKS_THRESHOLD) {
+    sGem2LinkPollStallTicks++;
+    if (sGem2LinkPollStallTicks >= GEM2_LINK_STALL_TICKS_THRESHOLD) {
         sCtx.diag_link_recover_attempts++;
         gem2_full_reinit();
-        stall_ticks = 0U;
+        sGem2LinkPollStallTicks = 0U;
     }
 }
 
 void gem2_diag_get_link_recover(u32 *attempts)
 {
     *attempts = sCtx.diag_link_recover_attempts;
+}
+
+/* Exposes gem2_link_poll_recover()'s own view of its gating/escalation state
+ * directly, rather than inferring it from link_recover_attempts alone —
+ * added to settle whether a real, sustained isr_calls freeze with
+ * link_recover_attempts stuck at 0 (observed on hardware, 2026-08-09) means
+ * trace_active was actually 0 the whole time (the trace send loop already
+ * exited, e.g. via a AXI DMA S2MM error trace_dma_send_completed() detected)
+ * or whether trace_active stayed 1 and stall_ticks itself never reached the
+ * threshold for some other reason. */
+void gem2_diag_get_link_poll_state(u32 *trace_active, u32 *stall_ticks)
+{
+    *trace_active = sCtx.trace_active;
+    *stall_ticks = sGem2LinkPollStallTicks;
 }
 
 /* ── GEM2 IRQ handler (overrides weak no-op in board/a53/timer.c) ──────── */
@@ -1509,6 +1692,12 @@ void gem2_irq_handler(void)
 
     if (isr & (XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_RXUSED_MASK)) {
         gem2_rx_process();
+        /* Run completion cleanup once per received batch (normally a batch
+         * of cumulative TCP ACKs), not once per transmitted Ethernet frame.
+         * The cleanup still executes in NetX's IP helper thread, serialized
+         * with the ACK queue walker. */
+        sCtx.diag_tx_deferred_requests++;
+        _nx_ip_driver_deferred_processing(sCtx.ip_ptr);
     }
     if (isr & XEMACPS_IXR_RXUSED_MASK) {
         sCtx.diag_rxused_count++;
@@ -1531,21 +1720,19 @@ void gem2_irq_handler(void)
          * hardware via a raw RXQBASE dump during a stall, which never moved
          * off its post-Start() value. Write the same two registers that
          * function would have written, directly, bypassing the guard. */
-        u32 ctrl = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET);
-        XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
-                          ctrl & ~XEMACPS_NWCTRL_RXEN_MASK);
-        UINTPTR next_bd = (UINTPTR)(sCtx.rx_bd + sCtx.rx_tail * GEM2_BD_STRIDE);
-        XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_RXQBASE_OFFSET,
-                          (u32)(next_bd & 0xFFFFFFFFU));
-#if defined(__aarch64__)
-        XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_MSBBUF_RXQBASE_OFFSET,
-                          (u32)((u64)next_bd >> 32));
-#endif
-        XEmacPs_WriteReg(sCtx.mac.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET,
-                          ctrl | XEMACPS_NWCTRL_RXEN_MASK);
+        gem2_rx_stall_recover();
     }
-    if (isr & XEMACPS_IXR_TXCOMPL_MASK) {
-        gem2_tx_cleanup();
+    if ((isr & XEMACPS_IXR_TXCOMPL_MASK) &&
+        !(isr & (XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_RXUSED_MASK))) {
+        /* NetX explicitly provides this notification for moving transmit
+         * completion work out of an ISR. Besides shortening the ISR, it is
+         * required for packet-state consistency here: gem2_tx_cleanup()
+         * calls nx_packet_transmit_release(), whose TCP ownership/header
+         * mutations must be serialized with NetX's ACK queue walker in the
+         * IP helper thread. Events may coalesce safely because cleanup drains
+         * every completed descriptor each time it runs. */
+        sCtx.diag_tx_deferred_requests++;
+        _nx_ip_driver_deferred_processing(sCtx.ip_ptr);
     }
     if (isr & XEMACPS_IXR_TXUSED_MASK) {
         sCtx.diag_txused_count++;

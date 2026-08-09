@@ -9,7 +9,8 @@ module orbtrace_pl (
     output wire [1:0] s_axi_bresp, output wire s_axi_bvalid, input wire s_axi_bready,
     input wire [15:0] s_axi_araddr, input wire s_axi_arvalid, output wire s_axi_arready,
     output wire [31:0] s_axi_rdata, output wire [1:0] s_axi_rresp, output wire s_axi_rvalid, input wire s_axi_rready,
-    output wire [7:0] m_axis_tdata, output wire m_axis_tvalid, output wire m_axis_tlast, input wire m_axis_tready,
+    output wire [63:0] m_axis_tdata, output wire [7:0] m_axis_tkeep,
+    output wire m_axis_tvalid, output wire m_axis_tlast, input wire m_axis_tready,
     input wire dma_complete, input wire dma_fault, input wire debug_complete, output wire irq
 );
     wire [7:0] trace_byte, cdc_data, nrz_data, manchester_data;
@@ -38,6 +39,8 @@ module orbtrace_pl (
     wire dap_command_valid, dap_command_last, dap_command_ready;
     wire dap_response_valid, dap_response_last, dap_response_ready;
     wire dap_force_wait, dap_force_fault, dap_force_parity_error, dap_complete;
+    wire [7:0] core_axis_tdata;
+    wire core_axis_tvalid, core_axis_tlast, core_axis_tready;
     wire [63:0] dap_transfer_count;
     wire [31:0] dap_abort_count;
     function [63:0] gray_to_binary;
@@ -109,9 +112,15 @@ module orbtrace_pl (
     orbtrace_core core(.clk(aclk),.reset_n(aresetn),.source_select(source_select),.trace_format(trace_format),.reset_sync(reset_pulse),
         .vex_data(vex_data),.vex_valid(vex_valid),.vex_ready(vex_ready),
         .coresight_data(selected_capture_data),.coresight_valid(selected_capture_valid),.coresight_ready(selected_capture_ready),
-        .test_data(test_data),.test_valid(test_valid),.test_ready(test_ready),.m_axis_tdata(m_axis_tdata),.m_axis_tvalid(m_axis_tvalid),
-        .m_axis_tlast(m_axis_tlast),.m_axis_tready(m_axis_tready),.overrun(core_overrun),
+        .test_data(test_data),.test_valid(test_valid),.test_ready(test_ready),.m_axis_tdata(core_axis_tdata),.m_axis_tvalid(core_axis_tvalid),
+        .m_axis_tlast(core_axis_tlast),.m_axis_tready(core_axis_tready),.overrun(core_overrun),
         .received_bytes(core_received),.dropped_bytes(core_dropped),.sync_loss(tpiu_sync_loss));
+    // Preserve each Orbflow delimiter in the byte stream, but combine two
+    // frames into one DMA transfer to amortize NetX's per-send cost.
+    orbtrace_axis_packer #(.FRAMES_PER_TRANSFER(2)) stream_packer(.clk(aclk),.reset_n(aresetn),
+        .input_data(core_axis_tdata),.input_valid(core_axis_tvalid),.input_last(core_axis_tlast),
+        .input_ready(core_axis_tready),.output_data(m_axis_tdata),.output_keep(m_axis_tkeep),
+        .output_valid(m_axis_tvalid),.output_last(m_axis_tlast),.output_ready(m_axis_tready));
     orbtrace_dap_engine dap_engine(.clk(aclk),.reset_n(aresetn),
         .command_data(dap_command_data),.command_valid(dap_command_valid),.command_last(dap_command_last),
         .command_ready(dap_command_ready),.response_data(dap_response_data),.response_valid(dap_response_valid),
