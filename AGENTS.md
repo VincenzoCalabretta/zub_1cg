@@ -153,7 +153,7 @@ Orbtrace application. Flashing them and then starting an Orbtrace trace
 capture will correctly fail DMA init (`trace DMA initialization failed`)
 because there's no real AXI DMA at that PL address in that image. The
 corrected Orbtrace bitstream (matching the hash recorded in
-`ORBTRACE_400MBPS_HANDOFF_2026-08-09.md`) has only ever existed as a
+`documentation/ORBTRACE_400MBPS_HANDOFF_2026-08-09.md`) has only ever existed as a
 same-session Bazel-cache artifact (`bazel-out/orbtrace-vivado/zub_orbtrace.bit`,
 produced by a manual/local Vivado build) — it has never been committed to
 this repo, and a Bazel cache can be garbage-collected at any time. Before
@@ -181,7 +181,7 @@ whether that fix is present in the working tree.
 This section is the practical howto for actually driving the board on this
 machine to test the Orbtrace A53 firmware — build, flash, talk to it over
 Ethernet, and read diagnostics. It complements (doesn't replace) the
-`ORBTRACE_400MBPS_HANDOFF_2026-08-09.md` series of documents, which track
+`documentation/ORBTRACE_400MBPS_HANDOFF_2026-08-09.md` series of documents, which track
 the actual bug investigation and current findings; this section is the
 tooling reference so the next session doesn't have to re-derive it.
 
@@ -270,7 +270,7 @@ find ~/.cache/bazel -iname "zub_orbtrace.bit" 2>/dev/null
 ```
 
 If nothing is found, it needs a fresh Vivado build (see
-`ORBTRACE_400MBPS_HANDOFF_2026-08-09.md`'s "Fresh Vivado build" continuation
+`documentation/ORBTRACE_400MBPS_HANDOFF_2026-08-09.md`'s "Fresh Vivado build" continuation
 for the exact `build.tcl` invocation and expected timing/WNS — this takes
 real synthesis+implementation wall-clock time, not seconds). The board-level
 `psu_init.tcl` (DDR/PS config, shared across applications, *not*

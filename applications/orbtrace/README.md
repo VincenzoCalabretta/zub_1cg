@@ -20,5 +20,9 @@ backpressure. The PL engine implements deterministic Info, Connect, Transfer,
 TransferAbort/WriteABORT, SWJ-Pins, and JTAG-Sequence behavior including
 injectable WAIT, FAULT, and parity-error responses.
 
+The complete physical-board throughput result, root-cause history, artifact
+hashes, and reproduction procedure are recorded in the
+[400 Mbit/s technical report](../../documentation/ORBTRACE_400MBPS_TECHNICAL_REPORT_2026-08-09.md).
+
 V1 is internal-only. It deliberately has no external trace connector, target
 power, DFU, USB emulation, or serial-port compatibility layer.

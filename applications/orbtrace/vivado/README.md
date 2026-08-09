@@ -11,4 +11,7 @@ and `orbtrace_ddr4_capture.sv`; framing and loss behavior remain explicit RTL.
 
 The script rejects negative setup slack. CDC and utilization reports are
 always emitted, but board release also requires review of those reports and the
-60-second hardware throughput target described in `orbtrace/TESTING.md`.
+60-second hardware throughput acceptance described in [`../TESTING.md`](../TESTING.md).
+The generated bitstream remains a build output rather than a source-release
+artifact; the hardware-tested output hash is recorded in the
+[final technical report](../../../documentation/ORBTRACE_400MBPS_TECHNICAL_REPORT_2026-08-09.md).

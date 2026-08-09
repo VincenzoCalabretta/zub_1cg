@@ -19,23 +19,20 @@ are tied to the ZUBoard 1CG rather than presented as a generic ZynqMP HAL.
 | Board execution | Six deployable A53/R5 integration tests passed on physical hardware on 2026-08-07 |
 | R5 postmortem capture | Undefined-instruction injection survives reset with a CRC-checked exception record and host decoder |
 | Orbtrace host model | Rust protocol/model tests pass; control, DAP, capture, replay, and statistics paths are covered |
-| Orbtrace programmable logic | Vivado 2023.2 synthesis and implementation completed with positive setup/hold slack in the recorded 2026-08-08 build |
-| 400 Mbit/s Orbflow goal | Encoded as an automated acceptance threshold, but **not yet demonstrated end-to-end on hardware** |
+| Orbtrace programmable logic | Final Vivado 2023.2 image meets timing with WNS +2.394 ns and WHS +0.012 ns |
+| 400 Mbit/s Orbflow goal | **Hardware-proven:** 3,000,000,000 bytes captured in 37.431 s at 641,059,166 bit/s with unchanged loss/fault counters |
 
-The last distinction matters: `tests/orbtrace_throughput_test.sh` rejects
-payload rates below 400,000,000 bit/s and any increase in loss counters, but
-the current board bring-up has not completed that acceptance run. The CV-facing
-description should call this a target or prototype capability until a captured
-hardware run proves it. See
-[`ORBTRACE_TEST_REPORT_2026-08-08.md`](ORBTRACE_TEST_REPORT_2026-08-08.md) and
-[`ON_TARGET_TEST_REPORT_2026-08-07.md`](ON_TARGET_TEST_REPORT_2026-08-07.md)
-for dated evidence and open issues.
+`tests/orbtrace_throughput_test.sh` rejects payload rates below 400,000,000
+bit/s and any increase in loss counters. The physical-board acceptance run
+passed on 2026-08-09 after the host Ethernet adapter was moved from a USB 2.0
+path to USB 3.0. See the
+[final technical report](documentation/ORBTRACE_400MBPS_TECHNICAL_REPORT_2026-08-09.md)
+for the complete evidence chain and [`documentation/`](documentation/) for the
+chronological bring-up reports.
 
-The repository-wide presubmit currently reaches and passes all 18 Bazel tests
-and both firmware builds, but its formatting gates report pre-existing
-`buildifier`/`rustfmt` differences. Run the presubmit before publishing and
-clear those formatting findings rather than treating a test-only pass as a
-fully green release.
+Run `nix develop --command internal/presubmit/presubmit.sh` before publishing.
+It checks restricted generated sources, Starlark and Rust formatting, host
+tests, and transition-aware A53/R5 firmware builds.
 
 ## Hardware and execution domains
 
@@ -139,7 +136,8 @@ deterministic WAIT, FAULT, and parity-error injection.
 
 The 400 Mbit/s test captures three billion payload bytes over 60 seconds and
 requires `dropped_bytes`, `sync_loss`, and `dma_faults` to remain unchanged.
-That is the acceptance contract, not a current benchmark result.
+The recorded hardware run passed at 641,059,166 bit/s; the test remains the
+release acceptance contract rather than a one-time benchmark script.
 
 ## Repository layout
 
@@ -163,6 +161,7 @@ That is the acceptance contract, not a current benchmark result.
 │   ├── openocd/ and xsct/    # board load/debug scripts
 │   └── flash/                # boot-image helpers
 ├── tests/                    # host/static and physical-board integration tests
+├── documentation/            # dated engineering and hardware-validation reports
 ├── third_party/              # Bazel integration for RTOS and vendor libraries
 └── internal/                 # presubmit, lab diagnostics and private-doc tooling
 ```
@@ -430,9 +429,10 @@ tooling but cannot redistribute Xilinx's proprietary installation.
 
 Verify the host address is in `192.168.1.0/24`, use TCP 3401 rather than ICMP
 ping as the health probe, confirm the A53 service and matching PL bitstream are
-loaded, and consult the latest follow-up section in the Orbtrace test report.
-The Ethernet/GEM2 bring-up has had descriptor-ring and NetX Duo integration
-issues; a TCP preflight failure is not a throughput measurement.
+loaded, and consult the
+[final technical report](documentation/ORBTRACE_400MBPS_TECHNICAL_REPORT_2026-08-09.md).
+An ARP neighbor entry in `FAILED` state requires a target reflash before a
+throughput run; a TCP preflight failure is not itself a throughput measurement.
 
 ## License and third-party code
 

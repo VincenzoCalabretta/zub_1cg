@@ -7,8 +7,9 @@ Host address: `192.168.1.1`
 
 ## Current status
 
-The 400 Mbit/s real-time trace claim is **not yet proven**, but the entire
-target trace path has now carried real data:
+The 400 Mbit/s real-time trace claim is **hardware-proven**. The checked-in
+acceptance test logged 3 GB in 37.431 seconds at 641,059,166 bit/s with zero
+reported loss. The entire target trace path carried the accepted data:
 
 ```text
 PL test source -> Orbflow encoder -> AXI Stream -> AXI DMA -> DDR
@@ -17,6 +18,10 @@ PL test source -> Orbflow encoder -> AXI Stream -> AXI DMA -> DDR
 
 Important unit correction: the documented claim is **400 Mbit/s = 50 MB/s**,
 not 400 MB/s. A 3 GB capture in 60 seconds is the intended acceptance test.
+
+The sections below retain the chronological investigation history. Their
+intermediate blockers and recommendations are superseded by the final
+SuperSpeed acceptance result at the end of this document.
 
 ## What is proven
 
@@ -735,3 +740,363 @@ end state.
 The interrupted diagnostic processes started during this work were stopped. A
 pre-existing unrelated tcpdump process remains running and was intentionally
 left untouched.
+
+## Continuation (follow-up session): a real TX-ring race fixed and hardware-verified; the stuck-retransmission-queue bug pinned down precisely on the wire; one recovery escalation added but not sufficient
+
+This session's objective was to run and benchmark the full-speed trace
+benchmark on real hardware. That objective was **not reached** — every
+sustained-load attempt still hit the same total-freeze pattern this handoff
+has documented for several sessions running. Real progress was made,
+however: one previously-unknown, hardware-confirmed bug was fixed, and the
+"stuck-retransmission-queue" lead from two continuations ago is now backed
+by clean, unambiguous wire evidence rather than a single incident.
+
+Hardware was reachable this session (`192.168.1.50` responded on TCP
+3401/3402 from the start; the board was in the freshly-reflashed, healthy
+state the prior session left it in). `XILINX_ROOT=~/opt/vitis` plus this
+repo's Nix devShell provided `xsct`/`picocom`/`tcpdump`; `/dev/ttyUSB1` was
+the JTAG+UART combo's serial interface. The previously-recorded Orbtrace
+bitstream (sha256 `30bed13e...`, WNS +2.319 ns) and
+`sdk/boards/zub_1cg/generated/psu_init.tcl` were both still valid and needed
+no rebuild.
+
+### Bug found and fixed: unguarded TX-ring bookkeeping race between `gem2_packet_send()` (thread context) and `gem2_tx_cleanup()` (ISR context)
+
+`gem2_tx_cleanup()` and `gem2_rx_process()` only ever run inside
+`gem2_irq_handler()`, a real GIC ISR (confirmed via call-site grep — nothing
+outside `gem2_irq_handler()` calls either). `gem2_packet_send()` only runs
+from NetX's own IP-thread call path. `sCtx.tx_head`/`tx_count`/`tx_pkts[]`
+were written on both sides with **no interrupt masking anywhere** in the
+driver — grepping for `TX_DISABLE`/`Xil_ExceptionDisable`/`CRITICAL` in
+`ThreadXGEM2Driver.c` before this session turned up nothing near the TX ring,
+even though the identical `TX_DISABLE`-guarding pattern is already applied
+one section away, for an analogous NetX-internal race (see the comment above
+`gem2_arp_learn()`). The dangerous case is `gem2_packet_send()`'s
+`sCtx.tx_count++` racing a concurrent ISR-driven `sCtx.tx_count--` in
+`gem2_tx_cleanup()`: both are non-atomic read-modify-write on the same word,
+and only the thread side can be preempted mid-sequence (an ISR is never
+itself preempted by the thread it interrupted). A lost update here silently
+desyncs `tx_count` from the ring's true occupancy; given enough time under
+sustained load this can let `tx_head` wrap onto a slot
+`gem2_tx_cleanup()` hasn't actually finished with yet, overwriting
+`sCtx.tx_pkts[slot]` before `nx_packet_transmit_release()` was ever called on
+the packet already parked there — losing that packet's NX_PACKET reference
+from this driver entirely, so it can never be marked `NX_DRIVER_TX_DONE`.
+This class of bug specifically requires sustained throughput to manifest
+(short bursts rarely hit the race window), matching this handoff's own
+observation that every failure has needed sustained load to reproduce.
+
+Fix: `gem2_packet_send()`'s `sCtx.tx_pkts[slot] = pkt; sCtx.tx_head = ...;
+sCtx.tx_count++;` is now wrapped in `TX_DISABLE`/`TX_RESTORE`
+(`ThreadXGEM2Driver.c`, Cortex-A53 ThreadX port — confirmed available via
+`tx_port.h`). `gem2_tx_cleanup()`'s own side needs no matching guard (an ISR
+can't be preempted by the thread it interrupted), documented inline for the
+next reader. Verified: `bazel build`/`bazel test` clean for
+`//applications/orbtrace/...` and `//sdk/boards/zub_1cg/...` (the
+pre-existing, unrelated `sdk/bsp/rpu` cross-compiler failure is untouched, as
+in every prior continuation). Hardware-verified as **not harmful**: reflashed
+and ran multiple sustained-load captures — `tx_dropped_bad_dst=0`,
+`diag5`'s prepend/length pair showed zero drift throughout, consistent with
+every prior session's confirmation of the earlier header-mutation fix. This
+fix is real and worth keeping, but on its own it did **not** resolve the
+total-freeze pattern — see below.
+
+### The freeze, precisely: `gem2_link_poll_recover()`'s escalation gate was working correctly all along — the real problem is upstream
+
+Two new diagnostic fields were added (`gem2_diag_get_link_poll_state()` in
+`ThreadXGEM2Driver.{c,h}`, printed as a new `diag7:` line from `main.c`):
+live `sCtx.trace_active` and the escalation detector's own `stall_ticks`
+counter, plus an unconditional `TRACE_DMA_S2MM_DMASR` read on every diag
+tick (previously only read from the fatal-error branch of
+`trace_dma_send_completed()`, which a stalled-but-not-erroring ring never
+reaches).
+
+This settled the open question from the prior continuation ("does
+`link_recover_attempts` stay at 0 because `trace_active` is 0, or because
+`stall_ticks` never reaches threshold despite `trace_active` staying 1?").
+Hardware answer, reproduced twice: **`trace_active` reliably drops back to 0
+within 1-3 seconds of a real stall** — `stall_ticks` was observed reaching 1
+before the very next tick already showed `trace_active=0`. This means
+`trace_thread_entry()`'s send loop (`main.c`) is actually exiting quickly
+after a stall starts, not spinning forever inside it as previously assumed.
+`gem2_link_poll_recover()`'s trace-active gating is doing exactly what it
+was designed to do; the previously-"unproven, possibly harmful"
+`gem2_full_reinit()` escalation it guards essentially never got a chance to
+run in any hardware session to date, this one included — its risk profile
+is therefore still unvalidated, not disproven.
+
+The `dmasr` readings captured this session (`0x10009`, `0x1100A`, `0x11009`)
+decode against the standard AXI DMA S2MM register layout as Halted + SGIncld
++ IOC_Irq + IRQThresholdSts — i.e. "the ring completed its last queued
+descriptor and correctly halted waiting for more," not a fatal
+SGSlvErr/SGDecErr/DMASlvErr/DMADecErr condition. This is normal, expected
+behavior for a ring that legitimately ran out of software-provided
+descriptors — it does **not** point to an AXI DMA S2MM hardware fault, in
+contrast to what was suspected two continuations ago as "the next place to
+look." The trace DMA ring is not obviously the root cause.
+
+### A second recovery escalation was added, hardware-tested, and is not sufficient by itself
+
+`gem2_tx_poll_recover()` (called once a second, unconditionally, not gated by
+`trace_active`) was already firing repeatedly on real hardware without
+restoring TX progress (`diag_tx_recover_attempts` climbing every session).
+It only ever called `gem2_tx_stall_recover()`, a TXQBASE resync plus a TXEN
+toggle — much lighter than `gem2_full_reinit()`'s real
+`XEmacPs_Stop()`/`XEmacPs_Start()` cycle, and evidently not always sufficient
+to clear whatever state a used-descriptor halt leaves behind. Since
+`trace_active` now demonstrably drops to 0 almost immediately after a real
+stall (see above), `gem2_full_reinit()` was structurally unreachable via the
+`trace_active`-gated path for this specific failure sequence.
+
+Fix: `gem2_tx_poll_recover()` now escalates to `gem2_full_reinit()` after
+`GEM2_TX_STALL_ESCALATE_THRESHOLD` (3) consecutive failed
+`gem2_tx_stall_recover()` attempts, independent of `trace_active` — a
+genuinely wedged TX ring is always worth fully recovering, since GEM2 TX
+also carries this driver's own connection teardown (FIN/RST) traffic; while
+wedged, not even that can reach the peer, which is consistent with the
+host-side ARP entry going `FAILED` (total silence) rather than a clean
+disconnect being observed after a stall. `gem2_full_reinit()` needed a
+forward declaration added (`ThreadXGEM2Driver.c`) since it was previously
+only referenced after its own definition. Builds and existing tests pass.
+
+Hardware-tested: the freeze still reproduced with this escalation in place.
+One inconclusive, not-yet-explained observation from that run: `isr_calls`
+was seen dropping from 227 to 9 mid-session in the UART log before climbing
+again. Given this driver's `xil_printf()` calls from multiple threads are
+not mutex-protected around the shared UART (already independently confirmed
+this session: plain `grep` misidentified `uart_capture.log` as a binary file
+because of stray corrupted bytes, and several distinct diagnostic lines were
+seen interleaved/torn mid-word across threads), the leading explanation is
+UART line corruption misparsing a torn digit sequence as `9`, not a genuine
+counter reset — but a real reset (e.g. an unhandled data abort inside
+`gem2_full_reinit()` touching a wedged bus) was not ruled out either. Whoever
+picks this up next should either add a UART output mutex first (it would
+remove an entire class of "did I actually read that right" ambiguity that
+has recurred across multiple sessions of this handoff) or cross-check
+suspicious readings against a lower-noise channel (e.g. a JTAG memory peek)
+before trusting them.
+
+### The actual root cause, confirmed on the wire: NetX's own stuck-retransmission-queue bug, not a GEM2/PHY/DMA hardware fault
+
+A concurrent `tcpdump host 192.168.1.50` (kept running the whole session,
+per this handoff's established practice) captured a complete, clean freeze
+this time, with no ambiguity:
+
+```
+13:22:37.043668  board -> host  seq 71241:72252 ... 77218:78585 (clean burst)
+13:22:37.044708  host  -> board ack 78585                        (host has it all)
+13:22:38.039664  board -> host  seq 72252:73284  <-- retransmit, already ACKed
+13:22:38.039763  host  -> board ack 78585                        (host re-confirms)
+13:22:39.039674  board -> host  seq 72252:73284  <-- same segment again
+13:22:39.039770  host  -> board ack 78585
+13:22:40.039674  board -> host  seq 72252:73284  <-- again
+   ... repeats every ~1.000s, unboundedly, no exponential backoff ...
+```
+
+This is the identical signature to the "stuck entry in NetX's own TCP
+retransmission queue" lead recorded two continuations ago, now captured
+cleanly end-to-end rather than as a single incident: the board keeps
+retransmitting one specific already-fully-ACKed segment
+(`72252:73284`, superseded by `ack=78585`) on a **flat, non-backing-off**
+one-second cadence, seemingly forever. A flat retry interval is itself
+notable — NetX's real RTO logic doubles `nx_tcp_socket_timeout` on each
+retry (`socket_ptr->nx_tcp_socket_timeout_rate <<
+(timeout_retries * timeout_shift)`), so a constant 1.000s cadence forever
+is itself inconsistent with `timeout_retries` actually advancing, and is a
+concrete detail worth chasing alongside the stuck-queue-entry question
+itself.
+
+Per `nx_tcp_socket_retransmit.c` (vendored NetX Duo,
+`_nx_tcp_socket_retransmit()`), only a packet already marked
+`NX_DRIVER_TX_DONE` (i.e. already released once by this driver via
+`nx_packet_transmit_release()`) is eligible for this resend path at all —
+so this is not simply "the driver never released it" (that would make it
+ineligible for retransmission in the first place, not cause a repeat
+resend). The bug is downstream of release: `_nx_tcp_socket_state_ack_check.c`
+is supposed to walk `socket_ptr->nx_tcp_socket_transmit_sent_head` and
+dequeue/free every packet whose `ending_packet_sequence` is covered by an
+incoming cumulative ACK, but for this specific packet it evidently never
+does, despite `ack=78585` being received and correctly re-acknowledged by
+the host on every single retry. This looks like genuine vendored NetX Duo
+behavior, not something in this driver directly — consistent with the
+existing precedent in this codebase (the ARP-table race documented above
+`gem2_arp_learn()`) of routing around a confirmed-vendored bug with a
+driver-local workaround rather than patching `third_party/netxduo` in
+place, once the mechanism is fully understood.
+
+### Recommended next steps
+
+- Root-cause exactly why `_nx_tcp_socket_state_ack_check.c` fails to dequeue
+  a packet whose transmitted sequence range is provably, repeatedly,
+  cumulatively ACKed. The vendored source is available locally in the Bazel
+  cache under `external/+netxduo_extension+netxduo/common/src/` (not
+  checked into this repo — `third_party/netxduo` here is a Bazel extension
+  wrapper, not a vendored copy) and was read this session:
+  `nx_tcp_socket_send_internal.c`, `nx_packet_transmit_release.c`,
+  `nx_tcp_socket_retransmit.c`, `nx_tcp_socket_state_ack_check.c`. The
+  `NX_DRIVER_TX_DONE` packet-ownership contract between driver and TCP stack
+  is now well understood; what's still missing is why the ACK-side dequeue
+  loop treats this one queue entry as never-covered. Also chase why the
+  retry cadence is a flat 1.000s rather than exponentially backing off —
+  that's a second, more tractable symptom of the same underlying bug and may
+  be the faster route in (e.g. instrumenting `nx_tcp_socket_timeout_retries`
+  directly).
+- Add a UART output mutex (`tx_mutex_get`/`put` or equivalent around every
+  `xil_printf()` call site, or a single wrapper function) before trusting
+  any more borderline diagnostic readings — this session hit real,
+  demonstrated corruption (binary-file misdetection, torn mid-word lines)
+  that cost time to work around and directly caused the ambiguity around the
+  `isr_calls=9` reading above.
+- Once the stuck-retransmission-queue bug is fixed, re-attempt the same
+  sustained-load capture sequence (`orbtrace configure ... test swo-nrz
+  2000000` / `start` / `capture ... 2000000000` with tcpdump running
+  concurrently) — every prior throughput number in this document, including
+  this session's, remains not representative.
+- Step 6 (RTL rate ceiling, the proposed ping-pong Orbflow/COBS encoder) is
+  unchanged from the prior continuation's analysis — still not implemented,
+  still blocked behind getting a clean sustained capture first.
+
+### Repository state at end of session
+
+Uncommitted in the working tree (no commit was made — not requested this
+session): `applications/orbtrace/firmware/a53_app/src/main.c` (new `diag7:`
+line), `third_party/os_abstraction_layer/ThreadX/ThreadXGEM2Driver.c` (TX-ring
+race fix, TX-stall escalation, new diagnostic getter),
+`third_party/os_abstraction_layer/ThreadX/ThreadXGEM2Driver.h` (new getter
+declaration). `bazel build`/`bazel test` verified clean for the affected
+packages (same exclusions as every prior continuation:
+`sdk/bsp/rpu`'s pre-existing cross-compiler failure, missing
+`third_party/{threadx,filex,netxduo}` vendored sources).
+
+The board was reflashed one final time after the last hardware test and
+confirmed responsive via `orbtrace stats` before this session ended, matching
+every prior continuation's end state. The tcpdump and UART-logging processes
+started this session were left running in the background (harmless,
+read-only); this session's captures are in its own scratchpad
+(`capture.pcap`, `uart_capture{,2,3}.log`, `orbflow{,2,3}.bin`), separate from
+the pre-existing unrelated tcpdump process noted at the top of this section,
+which was again left untouched.
+
+## Continuation (same date): sustained freeze fixed; 3 GB logging succeeds; host USB 2.0 is the measured 400 Mbit/s acceptance blocker
+
+This continuation followed the stuck-retransmission-queue evidence through
+the actual ownership race and then removed the remaining throughput ceilings.
+The target now completes sustained multi-gigabyte captures without freezing.
+The full acceptance volume was logged to a real host file:
+
+```text
+captured 3000000000 bytes in 67.045s
+rx_bytes=3091415042 dropped_bytes=0 sync_loss=0 fifo_high_water=0 dma_faults=0
+file bytes=3000000000
+```
+
+That is 44.75 MB/s (358.0 Mbit/s). It proves the former sustained-load freeze
+is fixed and the entire logging path is stable, but misses the intended
+3 GB/60 s acceptance limit by 7.045 seconds.
+
+### Freeze fix and data-path work now hardware-verified
+
+- GEM TX completion cleanup is deferred from the hardware ISR to NetX's IP
+  helper thread via `NX_LINK_DEFERRED_PROCESSING`. This serializes
+  `nx_packet_transmit_release()` with NetX's TCP ACK queue walker instead of
+  allowing the ISR to mutate `NX_PACKET` ownership/header fields while the
+  ACK walker reads them. Together with the TX-ring critical section from the
+  previous continuation, this removes the race which stranded the stale
+  retransmission entry. A 3 GB/67 s real-file run completed with no freeze.
+- The Orbflow encoder is now ping-pong buffered and uses an 8192-byte payload.
+- AXI DMA descriptors and the dedicated NetX trace packet pool are isolated in
+  non-cacheable `.trace_dma` memory. Completed DMA buffers are passed to NetX
+  without copying.
+- The PL byte stream is packed to 64-bit AXI Stream beats, and both the AXI
+  DMA stream and memory interfaces are configured for 64 bits. XSim covers
+  full/partial beats and backpressure.
+- The trace socket negotiates an 8960-byte MSS with TCP window scaling and a
+  40-packet transmit queue. GEM advertises IPv4/TCP/UDP TX checksum offload.
+- The current packer combines two complete Orbflow frames per DMA transfer;
+  the application byte stream and its individual COBS delimiters are
+  unchanged. This only moved the measured ceiling from about 44.4 to
+  44.9 MB/s, ruling out per-socket-send overhead as the primary limiter.
+
+The current built image is timing-clean (WNS +2.394 ns, WHS +0.012 ns), with
+bitstream sha256
+`3b6c16f2b1a3e6be8929d8d6df8b26e771385fc1a3b06fcdfd371d444d2424bf`
+and A53 ELF sha256
+`a8a80c4bbaded48572d208a5408245fde68b528d5b428da00246507b74c7440c`.
+
+### Current blocker is outside the board: RTL8153 enumerated at USB 2.0
+
+The host link is the Realtek RTL8153 adapter (`r8152`, MAC
+`00:e0:4c:75:87:68`) on `enp0s20f0u4`. Although this is a gigabit Ethernet
+adapter and the Ethernet link is at 1 Gbit/s, its upstream USB device is
+currently enumerated as high-speed, not SuperSpeed:
+
+```text
+/sys/class/net/enp0s20f0u4/device/../speed = 480
+/sys/class/net/enp0s20f0u4/device/../version = 2.10
+product = USB 10/100/1000 LAN
+driver = r8152
+```
+
+The interface had zero RX errors and zero RX drops after more than 3.7 GB,
+and every substantially different target-side implementation (1450/4096/
+8192-byte payloads, cacheable/non-cacheable DMA, copy/zero-copy, 8/64-bit
+AXI, single/two-frame sends) converged on 42-45 MB/s. The invariant ceiling
+and the USB enumeration make the host's USB 2.0 transport the remaining
+measured bottleneck, not the PL, DDR, A53, GEM, PHY, or TCP data path.
+
+### Exact next step and acceptance rerun
+
+Physically move the same adapter to a USB 3.x-capable port/cable. The existing
+NetworkManager profile is bound to its MAC and should survive interface
+renumbering. Before rerunning, locate the interface by MAC and require its
+USB parent `speed` to report `5000` or higher rather than `480`, then bring up
+`zub_1cg-board` if necessary. Reflash is not required merely for USB
+re-enumeration; the board was left running the timing-clean image above.
+
+Run the checked-in acceptance test after the host path is SuperSpeed:
+
+```bash
+nix develop -c bazel test --config=host //tests:orbtrace_throughput_test \
+  --test_output=streamed
+```
+
+Acceptance remains: exactly 3,000,000,000 bytes in no more than 60 seconds
+(at least 400,000,000 bit/s), with `dropped_bytes`, `sync_loss`, and
+`dma_faults` unchanged. The temporary 3 GB file from this continuation was
+removed after its size and device counters were recorded. The two pre-existing
+root-owned tcpdump processes remain untouched.
+
+## Final acceptance: 400 Mbit/s objective achieved on USB 3.0 host path
+
+The RTL8153 was physically moved to another host port and re-enumerated as
+USB 3.00 SuperSpeed. Its stable MAC-bound NetworkManager profile restored the
+board network configuration without manual repair:
+
+```text
+interface=enp0s13f0u1
+MAC=00:e0:4c:75:87:68
+USB speed=5000
+USB version=3.00
+host address=192.168.1.1/24
+MTU=9000
+```
+
+A 100 MB preflight completed in 1.245 seconds (about 642 Mbit/s) with all
+device error counters unchanged. The authoritative checked-in acceptance test
+then passed:
+
+```text
+$ nix develop -c bazel test --config=host \
+    //tests:orbtrace_throughput_test --test_output=streamed
+
+captured 3000000000 bytes in 37.431s
+orbtrace throughput: 641059166 bit/s, zero reported loss
+//tests:orbtrace_throughput_test PASSED in 37.5s
+```
+
+This exceeds the 400,000,000 bit/s requirement by about 60.3% and completes
+the 3 GB capture 22.6 seconds inside the 60-second limit. The result uses a
+real file sink created by the Bazel test, not `/dev/null`, and validates the
+full PL-to-host logging path plus unchanged `dropped_bytes`, `sync_loss`, and
+`dma_faults` counters. The prior 358 Mbit/s result was therefore a host USB
+2.0 transport limit, not a target implementation limit.
