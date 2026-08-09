@@ -56,6 +56,9 @@ void gem2_diag_get_arp_dump(unsigned char *out28, unsigned int *valid);
 void gem2_diag_get_req_dump(unsigned int *addr_lo, unsigned int *addr_hi, unsigned int *sizeof_req,
                              unsigned char *out48);
 unsigned int gem2_diag_get_tx_dropped_bad_dst(void);
+void gem2_diag_get_tx_pkt_state(unsigned int *retransmit_count, unsigned int *prepend_before,
+                                 unsigned int *prepend_after, unsigned int *append,
+                                 unsigned int *length_before, unsigned int *length_after);
 /* ip/msw/lsw must each point to a 4-element array (GEM2_ARP_CACHE_SIZE in
  * ThreadXGEM2Driver.c). */
 void gem2_diag_get_arp_cache(unsigned int *count, unsigned int *ip, unsigned int *msw, unsigned int *lsw);
@@ -77,6 +80,56 @@ void gem2_diag_get_tx_bd_dump(unsigned int *tx_head, unsigned int *tx_tail, unsi
  * that produces no further interrupt at all still gets recovered.
  */
 void gem2_tx_poll_recover(void);
+
+/**
+ * @brief Read the PHY's live link status over MDIO (BMSR bit 2), independent
+ * of any GEM2/NetX state — see gem2_link_poll_recover() for why this reads
+ * the PHY directly rather than trusting NWSR or a cached flag.
+ *
+ * *phy_found reports whether gem2_phy_enable_tx_delay() ever located the PHY
+ * on the MDIO bus (it always should have, by LINK_ENABLE time); if it is 0
+ * the other outputs are meaningless. *link_up is bit 2 of the freshly-read
+ * BMSR (1 = link established).
+ */
+void gem2_diag_get_phy_link(unsigned int *phy_addr, unsigned int *phy_found,
+                             unsigned int *bmsr, unsigned int *link_up);
+
+/**
+ * @brief Tell the driver whether an application-level consumer currently
+ * expects GEM2 interrupt activity (e.g. an active Orbtrace capture with a
+ * connected TCP client). Call with 1 when starting, 0 when stopping.
+ *
+ * gem2_link_poll_recover()'s total-freeze detection only fires while this is
+ * set, so idle periods with no client connected (where isr_calls legitimately
+ * never advances) cannot trigger a spurious full MAC/PHY reinit.
+ */
+void gem2_set_trace_active(unsigned int active);
+
+/**
+ * @brief Poll for a total GEM2 interrupt freeze (isr_calls not advancing at
+ * all, not just tx_count backlog) and recover with a full MAC/PHY reinit if
+ * it persists.
+ *
+ * gem2_tx_poll_recover() only detects a stall when tx_count > 0 — it never
+ * fires if nothing is queued for TX, which is exactly the state observed
+ * during the 2026-08-09 handoff's sustained-load freeze (tx_count==0,
+ * isr_calls frozen, eventually not even ARP-responsive). This is a second,
+ * independent detector gated by gem2_set_trace_active() rather than ring
+ * occupancy: after several consecutive seconds of zero ISR activity while
+ * active, it escalates past the lighter TXQBASE-only resync in
+ * gem2_tx_stall_recover() to a full XEmacPs_Stop()/reconfigure/Start() cycle
+ * plus a forced PHY autonegotiation restart, on the theory that whatever
+ * state the hardware reached, the existing narrower recovery paths were
+ * insufficient to escape it. Call periodically (e.g. once per second) from
+ * a non-ISR context, same as gem2_tx_poll_recover().
+ */
+void gem2_link_poll_recover(void);
+
+/**
+ * @brief Temporary bring-up diagnostic: how many times
+ * gem2_link_poll_recover() has escalated to a full MAC/PHY reinit.
+ */
+void gem2_diag_get_link_recover(unsigned int *attempts);
 
 #ifdef __cplusplus
 }

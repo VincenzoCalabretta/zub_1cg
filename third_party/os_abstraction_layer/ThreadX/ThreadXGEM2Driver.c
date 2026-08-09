@@ -72,13 +72,16 @@ extern void xil_printf(const char *fmt, ...);
 /* BD ring depth — must be a power of 2 for the index-wrap arithmetic */
 #define GEM2_BD_COUNT    4U
 
-/* TX ring depth. Root-caused on real hardware: with GEM2_TX_BD_COUNT
- * temporarily forced to 1, only the ring's first descriptor ever completed
- * — the true fault was gem2_packet_send() never building an Ethernet
- * header (NetX hands the driver only the upper-layer payload; see that
- * function's comment), producing undersized/malformed frames on the wire.
- * Restored to GEM2_BD_COUNT now that framing is fixed. */
-#define GEM2_TX_BD_COUNT GEM2_BD_COUNT
+/* TX needs substantially more elasticity than RX. Real Orbflow streaming
+ * presents a burst of MTU-sized TCP packets faster than GEM completion IRQs
+ * can retire a four-entry ring; on hardware that filled the old ring after
+ * four trace packets and forced NetX into its retransmission path. Keep this
+ * a power of two for the index-wrap arithmetic below. */
+#define GEM2_TX_BD_COUNT 64U
+
+/* The UART bring-up diagnostic API intentionally exposes only four slots.
+ * Do not let increasing the real TX ring overrun its callers' fixed arrays. */
+#define GEM2_DIAG_BD_COUNT 4U
 
 /* XEmacPs DMA requires the BD *ring base* to be 64-byte aligned on aarch64
  * (XEMACPS_DMABD_MINIMUM_ALIGNMENT) — this only constrains the starting
@@ -200,6 +203,33 @@ typedef struct {
     u32 diag_arp_dump_valid;
     u32 diag_tx_dropped_bad_dst;
 
+    /* Retransmit/prepend-restore diagnostics — see the header-restore
+     * comment in gem2_packet_send(). Records the previous call's NX_PACKET
+     * pointer plus its prepend/append pointers and length exactly as
+     * gem2_packet_send() found them, so a same-pointer call on the next
+     * invocation (NetX retransmitting a still-queued TCP packet) can be
+     * detected and its pre/post state compared on UART. */
+    NX_PACKET *diag_last_tx_pkt;
+    u32 diag_tx_retransmit_count;
+    u32 diag_last_tx_prepend_before;
+    u32 diag_last_tx_prepend_after;
+    u32 diag_last_tx_append;
+    u32 diag_last_tx_length_before;
+    u32 diag_last_tx_length_after;
+
+    /* PHY address found by gem2_phy_enable_tx_delay(), so
+     * gem2_diag_get_phy_link() can read live BMSR without re-scanning the
+     * MDIO bus every call. See gem2_link_poll_recover(). */
+    u32 phy_addr;
+    u32 phy_found;
+
+    /* Set by main.c via gem2_set_trace_active() while a trace client is
+     * connected — gates gem2_link_poll_recover()'s total-freeze detection so
+     * ordinary idle periods (no client, isr_calls legitimately static)
+     * cannot trigger a spurious full reinit. */
+    u32 trace_active;
+    u32 diag_link_recover_attempts;
+
     /* Driver-local ARP cache — see gem2_arp_learn()/gem2_arp_lookup(). */
     u32 arp_cache_ip[GEM2_ARP_CACHE_SIZE];
     u32 arp_cache_msw[GEM2_ARP_CACHE_SIZE];
@@ -290,7 +320,7 @@ void gem2_diag_get_tx_bd_dump(u32 *tx_head, u32 *tx_tail, u32 *tx_count, u32 *tx
     *tx_count = sCtx.tx_count;
     *txqbase = XEmacPs_ReadReg(sCtx.mac.Config.BaseAddress, XEMACPS_TXQBASE_OFFSET);
     *tx_bd_base = (u32)(UINTPTR)sCtx.tx_bd;
-    for (u32 i = 0U; i < GEM2_TX_BD_COUNT; i++) {
+    for (u32 i = 0U; i < GEM2_DIAG_BD_COUNT; i++) {
         XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.tx_bd + i * GEM2_BD_STRIDE);
         Xil_DCacheInvalidateRange((UINTPTR)bd, GEM2_BD_STRIDE);
         addr_words[i] = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
@@ -320,6 +350,25 @@ void gem2_diag_get_arp_dump(unsigned char *out28, unsigned int *valid)
 {
     memcpy(out28, sCtx.diag_arp_dump, sizeof(sCtx.diag_arp_dump));
     *valid = sCtx.diag_arp_dump_valid;
+}
+
+/* Temporary bring-up diagnostic accessor: whether the most recent
+ * gem2_packet_send() call reused the same NX_PACKET pointer as the call
+ * before it (a retransmission still holding the driver's previous mutation
+ * of prepend_ptr/length, if that mutation was not restored), plus the
+ * prepend/append pointers and length captured on entry and the prepend
+ * pointer restored on exit. See the header-restore comment in
+ * gem2_packet_send() for why these must match across calls on the same
+ * packet. */
+void gem2_diag_get_tx_pkt_state(u32 *retransmit_count, u32 *prepend_before, u32 *prepend_after,
+                                 u32 *append, u32 *length_before, u32 *length_after)
+{
+    *retransmit_count = sCtx.diag_tx_retransmit_count;
+    *prepend_before = sCtx.diag_last_tx_prepend_before;
+    *prepend_after = sCtx.diag_last_tx_prepend_after;
+    *append = sCtx.diag_last_tx_append;
+    *length_before = sCtx.diag_last_tx_length_before;
+    *length_after = sCtx.diag_last_tx_length_after;
 }
 
 /* Temporary bring-up diagnostic accessor — see the comment where
@@ -458,8 +507,11 @@ static void gem2_phy_enable_tx_delay(XEmacPs *mac)
     u32 phy_addr;
     if (gem2_phy_find(mac, &phy_addr) != XST_SUCCESS) {
         xil_printf("gem2: PHY not found on MDIO bus\r\n");
+        sCtx.phy_found = 0U;
         return;
     }
+    sCtx.phy_addr = phy_addr;
+    sCtx.phy_found = 1U;
     /* The PHY chip is not reset by JTAG/PS resets — only by a full board
      * power cycle — so its register state can carry over from an earlier
      * run (bit us once this session: bypass_rxdll left set from a control
@@ -814,6 +866,19 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
             break;
     }
 
+    /* Retransmit/prepend-restore diagnostics — see the header-restore
+     * comment below. If NetX hands us the same NX_PACKET pointer twice
+     * (a TCP retransmission of a still-queued segment), that means the
+     * *previous* call's prepend_ptr/length mutation was still in effect
+     * on entry to this call unless it was undone before returning. */
+    if (pkt == sCtx.diag_last_tx_pkt) {
+        sCtx.diag_tx_retransmit_count++;
+    }
+    sCtx.diag_last_tx_pkt = pkt;
+    sCtx.diag_last_tx_prepend_before = (u32)(UINTPTR)pkt->nx_packet_prepend_ptr;
+    sCtx.diag_last_tx_append = (u32)(UINTPTR)pkt->nx_packet_append_ptr;
+    sCtx.diag_last_tx_length_before = (u32)pkt->nx_packet_length;
+
     pkt->nx_packet_prepend_ptr -= NX_ETHERNET_SIZE;
     pkt->nx_packet_length += NX_ETHERNET_SIZE;
 
@@ -888,6 +953,12 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
              * exactly how the ring-full case above handles a transient
              * send failure. */
             sCtx.diag_tx_dropped_bad_dst++;
+            /* This comment's own "retry later" plan means NetX will hand
+             * this exact pointer back to us again — restore the header
+             * mutation from earlier in this call first, for the same
+             * reason as the restore in the normal-send path below. */
+            pkt->nx_packet_prepend_ptr += NX_ETHERNET_SIZE;
+            pkt->nx_packet_length -= NX_ETHERNET_SIZE;
             nx_packet_transmit_release(pkt);
             req->nx_ip_driver_status = NX_NOT_SUCCESSFUL;
             return;
@@ -914,6 +985,34 @@ static void gem2_packet_send(NX_IP_DRIVER *req)
         memcpy(dst + total, frag->nx_packet_prepend_ptr, chunk);
         total += chunk;
     }
+
+    /* Restore the packet to the state NetX handed it to us in. NetX Duo
+     * keeps a sent TCP packet on the socket's transmit-sent queue for
+     * retransmission and can hand this exact NX_PACKET pointer back to
+     * gem2_packet_send() again later — nx_packet_transmit_release() only
+     * runs from gem2_tx_cleanup() on DMA completion (see the ISR path
+     * below), which is a separate, asynchronous event from any retransmit
+     * NetX's TCP timer decides to fire, so this function cannot assume the
+     * packet has been reset via nx_packet_allocate() before it sees the
+     * same pointer twice. Leaving nx_packet_prepend_ptr decremented and
+     * nx_packet_length grown here (as this function used to do,
+     * unconditionally, until this restore was added) meant a retransmit of
+     * the same packet re-entered this function with prepend_ptr already
+     * short by NX_ETHERNET_SIZE bytes, so the second decrement above moved
+     * it a further 14 bytes short of the true frame start and the flatten
+     * loop below computed `total` from the resulting (also-too-large)
+     * append_ptr - prepend_ptr difference — reading past the packet's real
+     * header room into whatever precedes it in pool memory. This is the
+     * leading hypothesis in the 2026-08-09 handoff for the observed
+     * TCP-port/sequence-number corruption exactly one RTO after the last
+     * good segment; gem2_diag_get_tx_pkt_state() below exposes
+     * diag_tx_retransmit_count plus the before/after prepend_ptr and
+     * length pairs so the next hardware run can confirm this fix actually
+     * eliminates the corruption rather than just plausibly explaining it. */
+    pkt->nx_packet_prepend_ptr += NX_ETHERNET_SIZE;
+    pkt->nx_packet_length -= NX_ETHERNET_SIZE;
+    sCtx.diag_last_tx_prepend_after = (u32)(UINTPTR)pkt->nx_packet_prepend_ptr;
+    sCtx.diag_last_tx_length_after = (u32)pkt->nx_packet_length;
 
     /* Set up TX BD */
     XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.tx_bd + slot * GEM2_BD_STRIDE);
@@ -1275,6 +1374,124 @@ void gem2_tx_poll_recover(void)
         gem2_tx_stall_recover();
     }
     last_seen_progress = 0U;
+}
+
+/* ── PHY link status (bring-up diagnostic) ──────────────────────────────── */
+
+void gem2_diag_get_phy_link(u32 *phy_addr, u32 *phy_found, u32 *bmsr, u32 *link_up)
+{
+    *phy_addr = sCtx.phy_addr;
+    *phy_found = sCtx.phy_found;
+    *bmsr = 0U;
+    *link_up = 0U;
+    if (sCtx.phy_found) {
+        u16 bmsr16 = 0U;
+        XEmacPs_PhyRead(&sCtx.mac, sCtx.phy_addr, 1U /* BMSR */, &bmsr16);
+        *bmsr = bmsr16;
+        *link_up = (bmsr16 & (1U << 2)) ? 1U : 0U;
+    }
+}
+
+/* ── Total GEM2 interrupt freeze detection and full MAC/PHY recovery ────── */
+
+void gem2_set_trace_active(u32 active)
+{
+    sCtx.trace_active = active;
+}
+
+/* Full reinit: stop the MAC, release any TX packets the ring will otherwise
+ * never complete, re-arm both BD rings exactly as gem2_initialize()/
+ * gem2_enable() do at cold start, restart the MAC, and force a PHY
+ * autonegotiation restart (gem2_phy_enable_tx_delay() does this as a side
+ * effect of re-applying the TX/RX DLL taps) — a strictly more thorough
+ * recovery than gem2_tx_stall_recover()'s TXQBASE-only resync, for use once
+ * that lighter recovery has had repeated chances and isr_calls still is not
+ * moving at all (see gem2_link_poll_recover()). XEmacPs_SetQueuePtr() is
+ * safe to call here, unlike from the RXUSED ISR path above: it no-ops once
+ * XEmacPs_Start() has run and never stopped, but XEmacPs_Stop() just below
+ * clears that started state first. */
+static void gem2_full_reinit(void)
+{
+    XEmacPs_IntDisable(&sCtx.mac, 0x7FFFFFFFU);
+    XEmacPs_Stop(&sCtx.mac);
+
+    for (u32 i = 0U; i < GEM2_TX_BD_COUNT; i++) {
+        if (sCtx.tx_pkts[i]) {
+            nx_packet_transmit_release(sCtx.tx_pkts[i]);
+            sCtx.tx_pkts[i] = NX_NULL;
+        }
+    }
+    sCtx.tx_head = 0U;
+    sCtx.tx_tail = 0U;
+    sCtx.tx_count = 0U;
+    {
+        XEmacPs_Bd bd_template;
+        XEmacPs_BdClear(&bd_template);
+        XEmacPs_BdSetStatus(&bd_template, XEMACPS_TXBUF_USED_MASK);
+        XEmacPs_BdRingClone(&XEmacPs_GetTxRing(&sCtx.mac), &bd_template, XEMACPS_SEND);
+    }
+
+    for (u32 i = 0U; i < GEM2_BD_COUNT; i++) {
+        if (sCtx.rx_pkts[i] == NX_NULL) {
+            gem2_alloc_rx_packet(i);  /* best-effort retry of a previously-failed refill */
+            continue;
+        }
+        XEmacPs_Bd *bd = (XEmacPs_Bd *)(sCtx.rx_bd + i * GEM2_BD_STRIDE);
+        XEmacPs_BdWrite(bd, XEMACPS_BD_STAT_OFFSET, 0U);
+        XEmacPs_BdSetAddressRx(bd, (UINTPTR)sCtx.rx_pkts[i]->nx_packet_prepend_ptr);
+        if (i == GEM2_BD_COUNT - 1U) {
+            u32 addr = XEmacPs_BdRead(bd, XEMACPS_BD_ADDR_OFFSET);
+            XEmacPs_BdWrite(bd, XEMACPS_BD_ADDR_OFFSET, addr | XEMACPS_RXBUF_WRAP_MASK);
+        }
+        XEmacPs_BdClearRxNew(bd);
+        Xil_DCacheFlushRange((UINTPTR)bd, GEM2_BD_STRIDE);
+    }
+    sCtx.rx_tail = 0U;
+
+    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sCtx.tx_q1_dummy, 1U, 1U);
+    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sCtx.tx_bd, 0U, 1U);
+    XEmacPs_SetQueuePtr(&sCtx.mac, (UINTPTR)sCtx.rx_bd, 0U, 0U);
+    XEmacPs_Start(&sCtx.mac);
+    gem2_phy_enable_tx_delay(&sCtx.mac);
+    XEmacPs_IntEnable(&sCtx.mac,
+                      XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_TXCOMPL_MASK |
+                      XEMACPS_IXR_RXUSED_MASK | XEMACPS_IXR_TXUSED_MASK);
+}
+
+/* Number of consecutive stagnant polls (called once a second — see
+ * gem2_tx_poll_recover()'s call site) before escalating to a full reinit.
+ * A few seconds of slack avoids reacting to the same single-frame gaps that
+ * are routine on any lightly-loaded link. */
+#define GEM2_LINK_STALL_TICKS_THRESHOLD 3U
+
+void gem2_link_poll_recover(void)
+{
+    static u32 last_isr_calls;
+    static u32 stall_ticks;
+
+    if (!sCtx.trace_active) {
+        last_isr_calls = sCtx.diag_isr_calls;
+        stall_ticks = 0U;
+        return;
+    }
+
+    if (sCtx.diag_isr_calls != last_isr_calls) {
+        last_isr_calls = sCtx.diag_isr_calls;
+        stall_ticks = 0U;
+        return;
+    }
+
+    stall_ticks++;
+    if (stall_ticks >= GEM2_LINK_STALL_TICKS_THRESHOLD) {
+        sCtx.diag_link_recover_attempts++;
+        gem2_full_reinit();
+        stall_ticks = 0U;
+    }
+}
+
+void gem2_diag_get_link_recover(u32 *attempts)
+{
+    *attempts = sCtx.diag_link_recover_attempts;
 }
 
 /* ── GEM2 IRQ handler (overrides weak no-op in board/a53/timer.c) ──────── */

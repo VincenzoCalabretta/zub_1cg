@@ -9,7 +9,15 @@ Two libraries are exposed from one archive:
     :threadx_a53  — for A53 applications (aarch64-none-elf, ports/cortex_a53/gnu)
                     Board provides _tx_initialize_low_level and the vector
                     table, so we exclude the port's own low-level init and
-                    stack-build assembly.
+                    stack-build assembly. Built with TX_ENABLE_EVENT_TRACE
+                    (see the 2026-08-09 Orbtrace handoff) so applications can
+                    call tx_trace_enable() for scheduler/ISR-level visibility
+                    into hangs that the application's own counters can't
+                    explain — this define must apply to every tx_*.c/txe_*.c
+                    file in the library, not just tx_trace_*.c, since the
+                    instrumentation hooks are inlined throughout the core via
+                    TX_TRACE_IN_LINE_INSERT, so it is set library-wide via
+                    `defines` rather than only on the trace sources.
 
     :threadx_r5   — for R5 applications (arm-none-eabi Cortex-R5F,
                     ports/cortex_r5/gnu). Only tx_initialize_low_level.S is
@@ -29,7 +37,6 @@ cc_library(
         ],
         exclude = [
             "common/src/tx_misra.c",
-            "common/src/tx_trace_*.c",
             "ports/cortex_a53/gnu/src/tx_initialize_low_level.S",
             "ports/cortex_a53/gnu/src/tx_thread_stack_build.S",
         ],
@@ -38,6 +45,18 @@ cc_library(
         "common/inc/*.h",
         "ports/cortex_a53/gnu/inc/*.h",
     ]),
+    # This port's tx_port.h defaults TX_TRACE_TIME_SOURCE to
+    # _tx_thread_smp_time_get(), which only exists in ThreadX's SMP build —
+    # this is the single-core port, so that default fails to link/compile.
+    # Override with the standard tick counter accessor instead. Must be a
+    # public `define` (not `copts`), not just for this library's own
+    # compilation: NetX Duo's own trace source (nx_trace_event_insert.c, in
+    # the netxduo library that depends on this one) includes the same
+    # tx_port.h and hits the identical undefined symbol otherwise.
+    defines = [
+        "TX_ENABLE_EVENT_TRACE",
+        "TX_TRACE_TIME_SOURCE=_tx_time_get()",
+    ],
     includes = [
         "common/inc",
         "ports/cortex_a53/gnu/inc",

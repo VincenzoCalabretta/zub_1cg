@@ -2,8 +2,9 @@
  *
  * Orbtrace A53 control service — ThreadX + NetX Duo (GEM2) entry point.
  *
- * Brings up the network stack on GEM2, then runs two TCP server threads:
+ * Brings up the network stack on GEM2, then runs three TCP server threads:
  *   - port 3401 (control): device info / start / stop / status commands
+ *   - port 3402 (trace): Orbflow payloads completed by AXI DMA S2MM
  *   - port 3240 (DAP): CMSIS-DAP passthrough to the PL mailbox
  *
  * Both threads pump raw socket bytes through the Rust protocol/register
@@ -12,8 +13,9 @@
  * only the network transport and ThreadX plumbing; framing, CoreSight
  * register programming, and the CMSIS-DAP mailbox protocol live in Rust.
  *
- * Trace payload delivery on TCP 3402 (Orbflow / AXI DMA ring) is not wired
- * up yet — see applications/orbtrace/firmware/README.md.
+ * The trace thread owns a native AXI DMA scatter/gather ring in DDR. It
+ * invalidates each completed payload, copies the Orbflow packet into a NetX
+ * TCP packet, and immediately rearms the descriptor before sending.
  */
 
 #include "encore/OS/ThreadX/ThreadXGEM2Driver.h"
@@ -21,6 +23,13 @@
 #include "platform.h"
 #include "timer.h"
 #include "tx_api.h"
+/* tx_port.h typedefs LONG/ULONG as 32-bit ThreadX ABI types. xil_types.h
+ * checks for macros rather than typedefs before declaring conflicting LP64
+ * versions, so suppress those duplicate declarations here. */
+#define LONG LONG
+#define ULONG ULONG
+#include "xil_cache.h"
+#include "xil_mmu.h"
 
 extern void xil_printf(const char *fmt, ...);
 
@@ -38,6 +47,7 @@ extern unsigned long orbtrace_dap_feed(const unsigned char *input, unsigned long
 #define ORBTRACE_IP_ADDRESS  IP_ADDRESS(192, 168, 1, 50)
 #define ORBTRACE_NETMASK     IP_ADDRESS(255, 255, 255, 0)
 #define ORBTRACE_CONTROL_PORT 3401U /* orbtrace_firmware_common::CONTROL_PORT */
+#define ORBTRACE_TRACE_PORT   3402U /* orbtrace_firmware_common::TRACE_PORT */
 #define ORBTRACE_DAP_PORT     3240U /* orbtrace_firmware_common::DAP_PORT */
 
 /* Bounds each CMSIS-DAP mailbox poll inside a single dap_exchange byte —
@@ -60,20 +70,215 @@ extern unsigned long orbtrace_dap_feed(const unsigned char *input, unsigned long
 static NX_IP          ip;
 static NX_PACKET_POOL pool;
 static NX_TCP_SOCKET  control_socket;
+static NX_TCP_SOCKET  trace_socket;
 static NX_TCP_SOCKET  dap_socket;
 
 static TX_THREAD control_thread;
+static TX_THREAD trace_thread;
 static TX_THREAD dap_thread;
 
 static ULONG control_stack[2048]; /* 8 KiB */
+static ULONG trace_stack[2048];   /* 8 KiB */
 static ULONG dap_stack[2048];     /* 8 KiB */
 
 #define POOL_PACKET_PAYLOAD 1536U
-#define POOL_PACKET_COUNT   16U
+#define POOL_PACKET_COUNT   64U
 static UCHAR pool_memory[POOL_PACKET_PAYLOAD * POOL_PACKET_COUNT]
     __attribute__((aligned(64)));
 static UCHAR ip_stack_memory[4096] __attribute__((aligned(8)));
 static UCHAR arp_cache_memory[1024] __attribute__((aligned(4)));
+
+/* ThreadX event trace buffer — see tx_application_define()'s
+ * tx_trace_enable() call. Gives scheduler/ISR-level visibility (thread
+ * switches, interrupt entry/exit, NetX/ThreadX object events) beyond what
+ * this file's own diag counters can show, for chasing the 2026-08-09
+ * handoff's GEM2 total-freeze bug: diag_thread's own steady 1 Hz ticking
+ * during that freeze already proves ThreadX's tick-timer interrupt kept
+ * firing, but this can confirm whether *any* interrupt (not just the
+ * timer) is still reaching the CPU around the moment GEM2's own isr_calls
+ * stops, which narrows "GEM2-specific interrupt line went silent" from
+ * "something broader masked interrupts generally". 16 KiB is a rough,
+ * uncalibrated size — enough for a few thousand events, generous for a
+ * bring-up capture window rather than sized against a specific event rate. */
+#define TRACE_EVENT_BUFFER_SIZE 16384U
+static UCHAR trace_event_buffer[TRACE_EVENT_BUFFER_SIZE] __attribute__((aligned(4)));
+
+/* ── Orbflow AXI DMA S2MM ring ──────────────────────────────────────── */
+
+#define ORBTRACE_AXI_BASE       0xA0000000UL
+#define ORBTRACE_REG_DMA_LO     0x18UL
+#define ORBTRACE_REG_DMA_HI     0x1CUL
+#define ORBTRACE_REG_DMA_COUNT  0x20UL
+
+#define TRACE_DMA_BASE          0xA0010000UL
+#define TRACE_DMA_S2MM_DMACR    0x30UL
+#define TRACE_DMA_S2MM_DMASR    0x34UL
+#define TRACE_DMA_CURDESC_LO    0x38UL
+#define TRACE_DMA_CURDESC_HI    0x3CUL
+#define TRACE_DMA_TAILDESC_LO   0x40UL
+#define TRACE_DMA_TAILDESC_HI   0x44UL
+#define TRACE_DMA_CR_RUN        (1U << 0)
+#define TRACE_DMA_CR_RESET      (1U << 2)
+#define TRACE_DMA_SR_HALTED     (1U << 0)
+#define TRACE_DMA_SR_ERROR_MASK 0x00000770U
+#define TRACE_DMA_BD_COMPLETE   (1U << 31)
+#define TRACE_DMA_BD_ERROR_MASK 0x70000000U
+#define TRACE_DMA_LENGTH_MASK   0x03FFFFFFU
+
+/* The RTL packetizer caps a trace packet at 1024 payload bytes. Channel,
+ * checksum, COBS code bytes, and delimiter keep the encoded AXI packet below
+ * 1536 bytes, which also fits one Ethernet-MTU-sized NetX packet. */
+#define TRACE_DMA_BD_COUNT      32U
+#define TRACE_DMA_BUFFER_SIZE   1536U
+#define TRACE_DMA_RESET_BUDGET  1000000U
+#define TRACE_DMA_NOT_READY     0xFEU
+
+typedef struct __attribute__((aligned(64))) {
+    unsigned int next_lo;
+    unsigned int next_hi;
+    unsigned int buffer_lo;
+    unsigned int buffer_hi;
+    unsigned int reserved[2];
+    unsigned int control;
+    unsigned int status;
+    unsigned int application[5];
+    unsigned int padding[3];
+} TraceDmaDescriptor;
+
+typedef char trace_dma_descriptor_must_be_64_bytes[
+    sizeof(TraceDmaDescriptor) == 64U ? 1 : -1];
+
+static TraceDmaDescriptor trace_descriptors[TRACE_DMA_BD_COUNT]
+    __attribute__((aligned(64), section(".trace_dma")));
+static UCHAR trace_buffers[TRACE_DMA_BD_COUNT][TRACE_DMA_BUFFER_SIZE]
+    __attribute__((aligned(64), section(".trace_dma")));
+static unsigned int trace_dma_consumer;
+static volatile unsigned long trace_dma_bytes;
+static volatile unsigned int trace_dma_packets;
+static volatile unsigned int trace_dma_errors;
+
+static inline unsigned int trace_mmio_read(unsigned long base, unsigned long offset)
+{
+    return *(volatile unsigned int *)(base + offset);
+}
+
+static inline void trace_mmio_write(unsigned long base, unsigned long offset,
+                                    unsigned int value)
+{
+    *(volatile unsigned int *)(base + offset) = value;
+}
+
+static void trace_dma_stop(void)
+{
+    trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_S2MM_DMACR, 0U);
+}
+
+static UINT trace_dma_initialize(void)
+{
+    unsigned int remaining = TRACE_DMA_RESET_BUDGET;
+
+    /* The AXI DMA reference applications require descriptor memory to be
+     * non-cacheable on AArch64; their XAxiDma cache-maintenance macros are
+     * intentionally no-ops on this architecture. The linker isolates this
+     * ring and its payload buffers in their own 2 MiB translation block so
+     * changing its attributes cannot degrade ThreadX/NetX memory. */
+    Xil_SetTlbAttributes((UINTPTR)trace_descriptors, NORM_NONCACHE);
+
+    trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_S2MM_DMACR, TRACE_DMA_CR_RESET);
+    while ((trace_mmio_read(TRACE_DMA_BASE, TRACE_DMA_S2MM_DMACR) & TRACE_DMA_CR_RESET) != 0U) {
+        if (remaining-- == 0U) {
+            trace_dma_errors++;
+            return NX_NOT_SUCCESSFUL;
+        }
+    }
+
+    for (unsigned int i = 0U; i < TRACE_DMA_BD_COUNT; i++) {
+        unsigned long next = (unsigned long)&trace_descriptors[(i + 1U) % TRACE_DMA_BD_COUNT];
+        unsigned long buffer = (unsigned long)&trace_buffers[i][0];
+        TraceDmaDescriptor *bd = &trace_descriptors[i];
+        memset(bd, 0, sizeof(*bd));
+        bd->next_lo = (unsigned int)next;
+        bd->next_hi = (unsigned int)(next >> 32);
+        bd->buffer_lo = (unsigned int)buffer;
+        bd->buffer_hi = (unsigned int)(buffer >> 32);
+        bd->control = TRACE_DMA_BUFFER_SIZE;
+        Xil_DCacheInvalidateRange((INTPTR)trace_buffers[i], TRACE_DMA_BUFFER_SIZE);
+    }
+    Xil_DCacheFlushRange((INTPTR)trace_descriptors, sizeof(trace_descriptors));
+
+    unsigned long first = (unsigned long)&trace_descriptors[0];
+    unsigned long last = (unsigned long)&trace_descriptors[TRACE_DMA_BD_COUNT - 1U];
+    trace_mmio_write(ORBTRACE_AXI_BASE, ORBTRACE_REG_DMA_LO, (unsigned int)first);
+    trace_mmio_write(ORBTRACE_AXI_BASE, ORBTRACE_REG_DMA_HI, (unsigned int)(first >> 32));
+    trace_mmio_write(ORBTRACE_AXI_BASE, ORBTRACE_REG_DMA_COUNT, TRACE_DMA_BD_COUNT);
+    trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_CURDESC_LO, (unsigned int)first);
+    trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_CURDESC_HI, (unsigned int)(first >> 32));
+    trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_S2MM_DMACR, TRACE_DMA_CR_RUN);
+    trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_TAILDESC_HI, (unsigned int)(last >> 32));
+    trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_TAILDESC_LO, (unsigned int)last);
+
+    trace_dma_consumer = 0U;
+    return NX_SUCCESS;
+}
+
+/* Copy one completed DMA packet into NetX, then rearm the descriptor. The
+ * copy is deliberate: it lets the DMA ring resume immediately while TCP
+ * retains its own packet until acknowledgement/retransmission completes. */
+static UINT trace_dma_send_completed(void)
+{
+    unsigned int slot = trace_dma_consumer;
+    TraceDmaDescriptor *bd = &trace_descriptors[slot];
+    Xil_DCacheInvalidateRange((INTPTR)bd, sizeof(*bd));
+
+    unsigned int status = bd->status;
+    if ((status & TRACE_DMA_BD_COMPLETE) == 0U) {
+        return TRACE_DMA_NOT_READY;
+    }
+    if ((status & TRACE_DMA_BD_ERROR_MASK) != 0U) {
+        trace_dma_errors++;
+        return NX_NOT_SUCCESSFUL;
+    }
+
+    unsigned int length = status & TRACE_DMA_LENGTH_MASK;
+    if (length == 0U || length > TRACE_DMA_BUFFER_SIZE) {
+        trace_dma_errors++;
+        return NX_NOT_SUCCESSFUL;
+    }
+    Xil_DCacheInvalidateRange((INTPTR)trace_buffers[slot], length);
+
+    NX_PACKET *packet;
+    UINT result = nx_packet_allocate(&pool, &packet, NX_TCP_PACKET, NX_WAIT_FOREVER);
+    if (result != NX_SUCCESS) {
+        return result;
+    }
+    result = nx_packet_data_append(packet, trace_buffers[slot], length, &pool, NX_WAIT_FOREVER);
+    if (result != NX_SUCCESS) {
+        nx_packet_release(packet);
+        return result;
+    }
+
+    /* Rearm before entering the potentially-blocking TCP send. The linked
+     * ring always retains many descriptors of slack, so extending TAILDESC
+     * to this just-consumed slot is safe even when the DMA is still active. */
+    bd->control = TRACE_DMA_BUFFER_SIZE;
+    bd->status = 0U;
+    Xil_DCacheFlushRange((INTPTR)bd, sizeof(*bd));
+    unsigned long descriptor = (unsigned long)bd;
+    trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_TAILDESC_HI,
+                     (unsigned int)(descriptor >> 32));
+    trace_mmio_write(TRACE_DMA_BASE, TRACE_DMA_TAILDESC_LO,
+                     (unsigned int)descriptor);
+    trace_dma_consumer = (slot + 1U) % TRACE_DMA_BD_COUNT;
+
+    result = nx_tcp_socket_send(&trace_socket, packet, NX_WAIT_FOREVER);
+    if (result != NX_SUCCESS) {
+        nx_packet_release(packet);
+        return result;
+    }
+    trace_dma_bytes += length;
+    trace_dma_packets++;
+    return NX_SUCCESS;
+}
 
 /* ── Temporary bring-up diagnostic: raw GEM2 register poll ───────────────
  * Reads ISR/NWSR directly, bypassing the interrupt chain entirely, so a
@@ -106,6 +311,7 @@ static void diag_thread_entry(ULONG arg)
     for (;;) {
         tx_thread_sleep(100); /* 1 s @ 100 Hz tick */
         gem2_tx_poll_recover();
+        gem2_link_poll_recover();
         ULONG isr  = *(volatile ULONG *)(GEM2_BASE + GEM2_ISR_OFF);
         ULONG nwsr = *(volatile ULONG *)(GEM2_BASE + GEM2_NWSR_OFF);
         unsigned int rx_frames, tx_frames, isr_calls, last_etype, last_len, tx_complete, last_tx_stat;
@@ -121,6 +327,10 @@ static void diag_thread_entry(ULONG arg)
         unsigned int tx_dst_msw, tx_dst_lsw, tx_dst_cmd;
         gem2_diag_get_tx_dst(&tx_dst_msw, &tx_dst_lsw, &tx_dst_cmd);
         unsigned int tx_dropped_bad_dst = gem2_diag_get_tx_dropped_bad_dst();
+        unsigned int tx_retransmit_count, tx_prepend_before, tx_prepend_after, tx_append;
+        unsigned int tx_length_before, tx_length_after;
+        gem2_diag_get_tx_pkt_state(&tx_retransmit_count, &tx_prepend_before, &tx_prepend_after,
+                                    &tx_append, &tx_length_before, &tx_length_after);
         xil_printf("diag: ISR=0x%lx NWSR=0x%lx isr_calls=%u rx_frames=%u tx_frames=%u last_etype=0x%x "
                    "last_len=%u tx_complete=%u last_tx_stat=0x%x tx_head=%u tx_tail=%u tx_count=%u "
                    "last_isr=0x%x rxused_count=%u txused_count=%u last_txsr=0x%x drv_cmds=%u last_cmd=%u last_status=%d "
@@ -131,6 +341,33 @@ static void diag_thread_entry(ULONG arg)
                    txused_count, last_txsr, driver_cmd_count, last_driver_cmd, (int)last_driver_status,
                    tx_recover_attempts, tx_recover_txqbase_before, tx_recover_txqbase_after,
                    tx_dst_msw, tx_dst_lsw, tx_dst_cmd, tx_dropped_bad_dst);
+        /* Temporary bring-up diagnostic: whether gem2_packet_send()'s
+         * NX_ETHERNET_SIZE prepend/length mutation is actually being
+         * undone before the next call sees the same NX_PACKET pointer
+         * again (a NetX TCP retransmission of a still-queued segment). If
+         * tx_retransmit_count ever advances while prepend_before !=
+         * prepend_after from the *previous* line's own print, the restore
+         * added below "Set up TX BD" in gem2_packet_send() isn't taking
+         * effect and the header-mutation hypothesis in the 2026-08-09
+         * handoff needs another look. */
+        xil_printf("diag5: tx_retransmit_count=%u tx_prepend=0x%x->0x%x tx_append=0x%x "
+                   "tx_length=%u->%u\r\n",
+                   tx_retransmit_count, tx_prepend_before, tx_prepend_after, tx_append,
+                   tx_length_before, tx_length_after);
+        {
+            /* Total-freeze diagnostics: live PHY link status (independent
+             * of any GEM2/NetX state — see gem2_link_poll_recover()) plus
+             * how many times that detector has escalated to a full
+             * MAC/PHY reinit. If link_up ever reads 0 during a freeze, the
+             * PHY itself dropped the link and the fault is upstream of the
+             * MAC (RGMII/PHY/cable); if it stays 1 throughout, the MAC or
+             * its DMA is wedged with the physical link still up. */
+            unsigned int phy_addr, phy_found, bmsr, link_up, link_recover_attempts;
+            gem2_diag_get_phy_link(&phy_addr, &phy_found, &bmsr, &link_up);
+            gem2_diag_get_link_recover(&link_recover_attempts);
+            xil_printf("diag6: phy_addr=%u phy_found=%u bmsr=0x%x link_up=%u link_recover_attempts=%u\r\n",
+                       phy_addr, phy_found, bmsr, link_up, link_recover_attempts);
+        }
         {
             unsigned int arp_cache_count, arp_cache_ip[4], arp_cache_msw[4], arp_cache_lsw[4];
             gem2_diag_get_arp_cache(&arp_cache_count, arp_cache_ip, arp_cache_msw, arp_cache_lsw);
@@ -281,6 +518,90 @@ static void control_thread_entry(ULONG arg)
     }
 }
 
+static void trace_thread_entry(ULONG arg)
+{
+    (void)arg;
+
+    UINT listen_status = nx_tcp_server_socket_listen(&ip, ORBTRACE_TRACE_PORT, &trace_socket,
+                                                      1U, NX_NULL);
+    xil_printf("orbtrace: trace socket listen = %d\r\n", listen_status);
+
+    for (;;) {
+        if (nx_tcp_server_socket_accept(&trace_socket, NX_WAIT_FOREVER) == NX_SUCCESS) {
+            xil_printf("orbtrace: trace client connected\r\n");
+            if (trace_dma_initialize() == NX_SUCCESS) {
+                /* Tell gem2_link_poll_recover() (ThreadXGEM2Driver.c) that
+                 * GEM2 interrupt activity is now expected, so its
+                 * total-freeze detector is armed only while a capture is
+                 * actually running — see gem2_set_trace_active()'s doc
+                 * comment for why this must not fire during ordinary idle
+                 * periods. */
+                gem2_set_trace_active(1U);
+                /* Counts every loop iteration, success or not, so the
+                 * periodic real yield below fires on a bounded iteration
+                 * count regardless of whether the DMA is continuously idle,
+                 * continuously busy, or some mix — see the comment at the
+                 * yield site for why this must not depend on ever seeing
+                 * TRACE_DMA_NOT_READY. */
+                unsigned int poll_count = 0U;
+                for (;;) {
+                    UINT result = trace_dma_send_completed();
+                    if (result == TRACE_DMA_NOT_READY) {
+                        /* Yield only to threads of the same priority. This
+                         * remains a sub-tick poll and does not insert the
+                         * 10 ms gap that tx_thread_sleep(1) would. */
+                        tx_thread_relinquish();
+                    } else if (result != NX_SUCCESS) {
+                        xil_printf("orbtrace: trace stream stopped status=%d dmasr=0x%x\r\n",
+                                   result,
+                                   trace_mmio_read(TRACE_DMA_BASE, TRACE_DMA_S2MM_DMASR));
+                        break;
+                    }
+                    /* This thread is the sole occupant of its ThreadX
+                     * priority level (see tx_application_define()), and
+                     * every thread here is created TX_NO_TIME_SLICE, so
+                     * tx_thread_relinquish() above is a documented no-op
+                     * whenever there's no other same-priority thread ready
+                     * — it never yields to main.c's lower-priority diag
+                     * thread. diag_thread is the *only* caller of
+                     * gem2_tx_poll_recover() (ThreadXGEM2Driver.c), the sole
+                     * recovery path for a stalled GEM2 TX ring, by that
+                     * function's own design comment ("polling is the only
+                     * signal left"). If this loop never truly blocks —
+                     * which nx_tcp_socket_send(NX_WAIT_FOREVER) only does
+                     * when the TCP window is actually full, not guaranteed
+                     * under sustained throughput with fast ACKs — diag_thread
+                     * (and anything else below priority 3) can be starved of
+                     * the CPU forever, matching the 2026-08-09 handoff's
+                     * "sustained load hangs the board" finding: isr_calls,
+                     * rx_frames, tx_frames, and diag_tx_recover_attempts all
+                     * going flat together is exactly what permanent
+                     * starvation of the one thread that reads/logs/recovers
+                     * them looks like, not necessarily a hardware-only
+                     * hang. Forcing a real, bounded-frequency sleep here
+                     * guarantees every lower-priority thread gets scheduled
+                     * at least this often no matter what this loop is doing,
+                     * so a real stall stays observable and recoverable
+                     * instead of silently permanent. Not yet re-verified on
+                     * hardware — see the handoff. */
+                    if ((++poll_count & 0xFFFFU) == 0U) {
+                        tx_thread_sleep(1);
+                    }
+                }
+                gem2_set_trace_active(0U);
+            } else {
+                xil_printf("orbtrace: trace DMA initialization failed\r\n");
+            }
+            trace_dma_stop();
+            xil_printf("orbtrace: trace client disconnected bytes=%lu packets=%u errors=%u\r\n",
+                       trace_dma_bytes, trace_dma_packets, trace_dma_errors);
+            nx_tcp_socket_disconnect(&trace_socket, NX_NO_WAIT);
+        }
+        nx_tcp_server_socket_unaccept(&trace_socket);
+        nx_tcp_server_socket_relisten(&ip, ORBTRACE_TRACE_PORT, &trace_socket);
+    }
+}
+
 static void serve_dap(NX_PACKET *packet)
 {
     for (NX_PACKET *frag = packet; frag != NX_NULL; frag = frag->nx_packet_next) {
@@ -347,6 +668,24 @@ void tx_application_define(void *first_unused_memory)
     UINT status;
     (void)first_unused_memory;
 
+    /* Registry entries: enough to name every ThreadX/NetX object this
+     * application creates below (1 pool, 1 IP, 3 TCP sockets, 4 threads) —
+     * see trace_event_buffer's comment.
+     *
+     * TEMPORARILY DISABLED for a controlled A/B test: a hardware run
+     * immediately after first enabling this call froze the entire system
+     * (not just GEM2 — diag_thread's own 1 Hz ticking also stopped) within
+     * seconds of the first real client TCP connection, which is a new and
+     * more severe failure than anything seen without tracing enabled. Not
+     * yet proven that this call is the cause rather than coincidence — see
+     * the 2026-08-09 handoff. Re-enable only after confirming the freeze
+     * still reproduces identically with this line removed. */
+    (void)trace_event_buffer;
+#if 0
+    status = tx_trace_enable(trace_event_buffer, sizeof(trace_event_buffer), 16U);
+    xil_printf("orbtrace: tx_trace_enable = %d\r\n", status);
+#endif
+
     status = nx_packet_pool_create(&pool, "orbtrace_pool", POOL_PACKET_PAYLOAD,
                                     pool_memory, sizeof(pool_memory));
     xil_printf("orbtrace: nx_packet_pool_create = %d\r\n", status);
@@ -365,6 +704,10 @@ void tx_application_define(void *first_unused_memory)
                                    NX_IP_NORMAL, NX_FRAGMENT_OKAY, NX_IP_TIME_TO_LIVE,
                                    ORBTRACE_TCP_WINDOW, NX_NULL, NX_NULL);
     xil_printf("orbtrace: control socket create = %d\r\n", status);
+    status = nx_tcp_socket_create(&ip, &trace_socket, "orbtrace_trace",
+                                   NX_IP_NORMAL, NX_FRAGMENT_OKAY, NX_IP_TIME_TO_LIVE,
+                                   ORBTRACE_TCP_WINDOW, NX_NULL, NX_NULL);
+    xil_printf("orbtrace: trace socket create = %d\r\n", status);
     status = nx_tcp_socket_create(&ip, &dap_socket, "orbtrace_dap",
                                    NX_IP_NORMAL, NX_FRAGMENT_OKAY, NX_IP_TIME_TO_LIVE,
                                    ORBTRACE_TCP_WINDOW, NX_NULL, NX_NULL);
@@ -378,6 +721,10 @@ void tx_application_define(void *first_unused_memory)
                                control_stack, sizeof(control_stack), 2, 2,
                                TX_NO_TIME_SLICE, TX_AUTO_START);
     xil_printf("orbtrace: control thread create = %d\r\n", status);
+    status = tx_thread_create(&trace_thread, "orbtrace_trace", trace_thread_entry, 0,
+                               trace_stack, sizeof(trace_stack), 3, 3,
+                               TX_NO_TIME_SLICE, TX_AUTO_START);
+    xil_printf("orbtrace: trace thread create = %d\r\n", status);
     status = tx_thread_create(&dap_thread, "orbtrace_dap", dap_thread_entry, 0,
                                dap_stack, sizeof(dap_stack), 2, 2,
                                TX_NO_TIME_SLICE, TX_AUTO_START);

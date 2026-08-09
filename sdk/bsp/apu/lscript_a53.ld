@@ -22,6 +22,7 @@ PHDRS
 {
     text PT_LOAD FLAGS(5); /* PF_R | PF_X */
     data PT_LOAD FLAGS(6); /* PF_R | PF_W */
+    trace_dma PT_LOAD FLAGS(6); /* isolated non-cacheable AXI DMA storage */
 }
 
 SECTIONS
@@ -294,7 +295,22 @@ _SDA2_BASE_ = __sdata2_start + ((__sbss2_end - __sdata2_start) / 2 );
    __el0_stack = .;
 } > psu_ddr_0 :data
 
+/* AXI DMA descriptors must be non-cacheable on AArch64. Keep Orbtrace's
+ * descriptor ring and payload buffers in a dedicated 2 MiB translation
+ * block so Xil_SetTlbAttributes(..., NORM_NONCACHE) cannot affect normal
+ * firmware, ThreadX, or NetX data. The separate NOLOAD segment avoids a
+ * 256 MiB zero-filled hole in the JTAG-loaded image. */
+.trace_dma 0x10000000 (NOLOAD) : {
+   __trace_dma_start = .;
+   *(.trace_dma)
+   *(.trace_dma.*)
+   __trace_dma_end = .;
+} > psu_ddr_0 :trace_dma
+
 _end = .;
+
+ASSERT(__trace_dma_end <= 0x10200000,
+       "AXI DMA storage exceeds its isolated 2 MiB translation block")
 
 ASSERT((_vector_table & 0x7ff) == 0,
        "A53 vector table must be 2 KiB aligned")
