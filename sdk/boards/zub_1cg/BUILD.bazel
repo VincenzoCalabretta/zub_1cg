@@ -15,7 +15,10 @@ load(":publication_guard.bzl", "reject_restricted_sources")
 
 package(default_visibility = ["//visibility:public"])
 
-reject_restricted_sources(glob(["psu_init.tcl"], allow_empty = True))
+reject_restricted_sources(glob(
+    ["psu_init.tcl"],
+    allow_empty = True,
+))
 
 filegroup(
     name = "bitstream",
@@ -46,10 +49,10 @@ sh_binary(
     name = "generate_psu_init",
     srcs = ["generate_psu_init.sh"],
     data = [
-        ":avnet_bdf",
         "board_preset.tcl",
         "create_ps_handoff.tcl",
         "export_psu_init.tcl",
+        ":avnet_bdf",
     ],
     tags = [
         "local",

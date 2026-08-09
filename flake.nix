@@ -34,8 +34,8 @@
       # Vivado/Vitis tree.  The wrapper contains no AMD software and resolves
       # the installation through XILINX_ROOT only when it is executed.
       xilinxRuntimePkgs = pkgs: with pkgs; [
-        bashInteractive coreutils findutils gawk gnugrep gnused gzip which
-        util-linux procps file git gnumake perl python3 libgcc stdenv.cc.cc zlib
+        bashInteractive binutils coreutils findutils gawk gnugrep gnused gzip which
+        util-linux procps file git gnumake perl python3 glibc.dev libgcc stdenv.cc.cc zlib
         openssl libxcrypt libxcrypt-legacy ncurses ncurses5 readline libxml2 expat
         fontconfig freetype glib gtk3 pango cairo gdk-pixbuf at-spi2-atk dbus
         nss nspr cups alsa-lib libdrm mesa libGL libsecret
@@ -54,7 +54,10 @@
           export XILINX_VITIS="$XILINX_ROOT/Vitis/2023.2"
           export XILINX_VIVADO="$XILINX_ROOT/Vivado/2023.2"
           export LD_LIBRARY_PATH="${pkgs.ncurses5}/lib:${pkgs.libxcrypt-legacy}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          executable="$XILINX_ROOT/${if tool == "vivado" then "Vivado" else "Vitis"}/2023.2/bin/${tool}"
+          # XSim invokes GCC directly and expects the FHS C runtime startup
+          # objects in its conventional library search path.
+          export LIBRARY_PATH="/usr/lib64''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+          executable="$XILINX_ROOT/${if tool == "xsct" then "Vitis" else "Vivado"}/2023.2/bin/${tool}"
           if [[ ! -x "$executable" ]]; then
             echo "missing licensed AMD tool: $executable" >&2
             exit 2
@@ -74,6 +77,9 @@
           armGcc = pkgs.gcc-arm-embedded;
           aarch64Gcc = pkgs.pkgsCross.aarch64-embedded.buildPackages.gcc;
           vivado = mkXilinxTool pkgs "vivado";
+          xvlog = mkXilinxTool pkgs "xvlog";
+          xelab = mkXilinxTool pkgs "xelab";
+          xsim = mkXilinxTool pkgs "xsim";
           xsct = mkXilinxTool pkgs "xsct";
         in pkgs.mkShell {
           name = "zub_1cg-sdk";
@@ -101,6 +107,9 @@
             pkgs.which
             pkgs.jq
             vivado
+            xvlog
+            xelab
+            xsim
             xsct
           ] ++ extraPackages;
           shellHook = ''
@@ -109,6 +118,9 @@
             export BOOTGEN="${bootgen}/bin/bootgen"
             export OPENOCD="${pkgs.openocd}/bin/openocd"
             export VIVADO="${vivado}/bin/vivado"
+            export XVLOG="${xvlog}/bin/xvlog"
+            export XELAB="${xelab}/bin/xelab"
+            export XSIM="${xsim}/bin/xsim"
             export XSCT="${xsct}/bin/xsct"
             export PKG_CONFIG_PATH="${pkgs.systemdMinimal.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
             ${extraShellHook}
@@ -121,6 +133,9 @@
         pkgs = import nixpkgs { inherit system; };
         bootgen = mkBootgen pkgs;
         vivado = mkXilinxTool pkgs "vivado";
+        xvlog = mkXilinxTool pkgs "xvlog";
+        xelab = mkXilinxTool pkgs "xelab";
+        xsim = mkXilinxTool pkgs "xsim";
         xsct = mkXilinxTool pkgs "xsct";
         toolBundle = pkgs.symlinkJoin {
           name = "zub_1cg-tools";
@@ -133,7 +148,7 @@
         };
       in {
         packages = {
-          inherit bootgen vivado xsct;
+          inherit bootgen vivado xelab xsim xsct xvlog;
           tooling = toolBundle;
           default = toolBundle;
         };

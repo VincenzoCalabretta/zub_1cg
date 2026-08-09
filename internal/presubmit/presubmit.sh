@@ -15,8 +15,8 @@ fail() { echo "  [FAIL] $*"; FAIL=1; }
 
 # ── Publication policy ─────────────────────────────────────────────────────
 step "restricted generated sources"
-TRACKED_PSINIT="$(git ls-files -- '*psu_init.tcl' | while IFS= read -r path; do
-    [ ! -e "$path" ] || printf '%s\n' "$path"
+TRACKED_PSINIT="$(git ls-files | while IFS= read -r path; do
+    [ "${path##*/}" != "psu_init.tcl" ] || [ ! -e "$path" ] || printf '%s\n' "$path"
 done)"
 if [ -z "$TRACKED_PSINIT" ]; then
     ok "no generated PS-init source is tracked"

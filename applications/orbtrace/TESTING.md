@@ -8,9 +8,16 @@ bazel test --config=host //applications/orbtrace/model:register_schema_test
 bazel test --config=host //applications/orbtrace/firmware/common:firmware_common_test
 bazel test --config=host //applications/orbtrace/firmware/vexriscv:trace_workload_test
 bazel test //applications/orbtrace/firmware/a53:control_firmware_test
-XILINX_VIVADO=/opt/Xilinx/Vivado/2023.2 \
-  bazel test //applications/orbtrace/rtl:rtl_unit_test --test_env=XILINX_VIVADO
+XILINX_ROOT=/opt/Xilinx \
+  bazel test //applications/orbtrace/rtl:rtl_unit_test \
+    --test_env=XVLOG --test_env=XELAB --test_env=XSIM \
+    --test_env=XILINX_ROOT
 ```
+
+In the Nix development shell, `XVLOG`, `XELAB`, and `XSIM` point to FHS
+wrappers around the separately installed Vivado tree. On a conventional Linux
+host, leave those variables unset and set `XILINX_VIVADO` to the Vivado 2023.2
+installation directory instead.
 
 The model tests are byte-exact. The XSim suite covers 1/2/4-bit DDR wire order,
 NRZ, Manchester, and CMSIS-DAP Info/read/WAIT/FAULT/abort paths. An RTL release
