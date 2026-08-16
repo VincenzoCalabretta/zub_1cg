@@ -1,0 +1,9 @@
+"""Bare-metal Cortex-M3 firmware: deterministic ITM/TPIU stimulus for Orbtrace."""
+
+load("//sdk/rules:defs.bzl", "m3_firmware")
+
+m3_firmware(
+    name = "m3_app",
+    srcs = ["src/main.c"],
+    visibility = ["//visibility:public"],
+)

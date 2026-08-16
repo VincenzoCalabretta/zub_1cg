@@ -125,7 +125,10 @@ independently testable layers:
 - `firmware/common/`: allocation-free framing and DMA-ring logic;
 - `firmware/a53/` and `firmware/a53_app/`: Rust protocol state machine behind
   a C FFI, ThreadX/NetX Duo TCP services, and the GEM2 Ethernet path;
-- `firmware/vexriscv/`: the RV32IMAC trace workload model; and
+- `firmware/m3/` and `firmware/m3_app/`: the PL-hosted Cortex-M3's deterministic
+  ITM/TPIU trace workload — a host-testable Rust reference model plus the
+  bare-metal C firmware that actually drives the M3's real CoreSight
+  registers; and
 - `vivado/`: batch-mode project creation, timing/methodology gates, bitstream,
   XSA, and PS-init export.
 
@@ -287,7 +290,7 @@ bazel test --config=host \
   //applications/orbtrace/model:register_schema_test \
   //applications/orbtrace/firmware/common:firmware_common_test \
   //applications/orbtrace/firmware/a53:control_firmware_test \
-  //applications/orbtrace/firmware/vexriscv:trace_workload_test
+  //applications/orbtrace/firmware/m3:trace_workload_test
 ```
 
 The recorded Vivado build is driven in batch mode from

@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     ControlConnection, Controller, DapConnection, DmaRegisterIo, RegisterIo, AXI_DMA_BASE,
-    ORBTRACE_AXI_BASE,
+    M3_BRAM_BASE, ORBTRACE_AXI_BASE,
 };
 
 struct Mmio;
@@ -22,6 +22,48 @@ impl RegisterIo for Mmio {
     fn write(&mut self, offset: usize, value: u32) {
         // SAFETY: see `read`.
         unsafe { core::ptr::write_volatile((ORBTRACE_AXI_BASE + offset) as *mut u32, value) }
+    }
+
+    fn write_m3_bram(&mut self, offset: usize, data: &[u8]) {
+        // Word-wise stores: the BRAM's native width is 32 bits
+        // (create_bd.tcl's m3_mem, Write_Width_A=32), and JTAG-DAP writes to
+        // this same window (byte- and word-granular alike, per load_m3.tcl's
+        // history) do not reliably land -- narrow AXI writes are the prime
+        // suspect. Bias every full word toward a single 32-bit AXI write
+        // rather than the four byte-writes a naive byte-copy would emit.
+        let mut chunks = data.chunks_exact(4);
+        let mut address = M3_BRAM_BASE + offset;
+        for chunk in &mut chunks {
+            let word = u32::from_le_bytes(chunk.try_into().unwrap());
+            // SAFETY: M3_BRAM_BASE is the fixed Vivado PL AXI4 BRAM window
+            // for the M3's own code/data; the caller (Controller::command)
+            // has already bounds-checked offset+data.len() <= M3_BRAM_SIZE,
+            // and the A53 MMU maps the whole PL AXI GP aperture (which this
+            // falls within) as device memory via the vendor BSP page tables.
+            unsafe { core::ptr::write_volatile(address as *mut u32, word) };
+            address += 4;
+        }
+        for (index, &byte) in chunks.remainder().iter().enumerate() {
+            // SAFETY: see above; a trailing partial word is rare (only the
+            // image's final chunk can be non-multiple-of-4) and still
+            // within the same bounds-checked window.
+            unsafe { core::ptr::write_volatile((address + index) as *mut u8, byte) };
+        }
+    }
+
+    fn read_m3_bram(&self, offset: usize, out: &mut [u8]) {
+        let mut chunks = out.chunks_exact_mut(4);
+        let mut address = M3_BRAM_BASE + offset;
+        for chunk in &mut chunks {
+            // SAFETY: see `write_m3_bram`.
+            let word = unsafe { core::ptr::read_volatile(address as *const u32) };
+            chunk.copy_from_slice(&word.to_le_bytes());
+            address += 4;
+        }
+        for (index, byte) in chunks.into_remainder().iter_mut().enumerate() {
+            // SAFETY: see `write_m3_bram`.
+            *byte = unsafe { core::ptr::read_volatile((address + index) as *const u8) };
+        }
     }
 }
 

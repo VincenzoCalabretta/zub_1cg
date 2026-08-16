@@ -105,6 +105,12 @@ arm_gcc_ext = use_extension(
 )
 use_repo(arm_gcc_ext, "arm_gcc_config")
 
+arm_gcc_m3_ext = use_extension(
+    "//sdk/toolchains/arm_none_eabi_m3:env_ext.bzl",
+    "arm_gcc_config_m3_ext",
+)
+use_repo(arm_gcc_m3_ext, "arm_gcc_config_m3")
+
 aarch64_gcc_ext = use_extension(
     "//sdk/toolchains/aarch64_none_elf:env_ext.bzl",
     "aarch64_gcc_config_ext",
@@ -113,6 +119,7 @@ use_repo(aarch64_gcc_ext, "aarch64_gcc_config")
 
 register_toolchains(
     "//sdk/toolchains/arm_none_eabi:arm_none_eabi_toolchain",
+    "//sdk/toolchains/arm_none_eabi_m3:arm_none_eabi_m3_toolchain",
     "//sdk/toolchains/aarch64_none_elf:aarch64_none_elf_toolchain",
 )
 

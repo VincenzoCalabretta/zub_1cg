@@ -202,6 +202,24 @@
         "recordedRepoMappingEntries": []
       }
     },
+    "//sdk/toolchains/arm_none_eabi_m3:env_ext.bzl%arm_gcc_config_m3_ext": {
+      "general": {
+        "bzlTransitiveDigest": "I2zcsXhbj268wNaEOTUq8zckJ9yrN9oBgD0TQMXgLl8=",
+        "usagesDigest": "glx67U5KWGvFH2jkwxGeQiRN/G2o+OGCcbqPXoV2Qh4=",
+        "recordedFileInputs": {},
+        "recordedDirentsInputs": {},
+        "envVariables": {
+          "ARM_GCC_BIN": "/nix/store/hh1c9dlv7bwj1z1cx4y3m4kbw5w1wf2w-gcc-arm-embedded-15.2.rel1/bin"
+        },
+        "generatedRepoSpecs": {
+          "arm_gcc_config_m3": {
+            "repoRuleId": "@@//sdk/toolchains/arm_none_eabi_m3:env_ext.bzl%_arm_gcc_config_m3_rule",
+            "attributes": {}
+          }
+        },
+        "recordedRepoMappingEntries": []
+      }
+    },
     "//third_party:extensions.bzl%filex_extension": {
       "general": {
         "bzlTransitiveDigest": "XYqiTIR+Dr0tmV+NTPH2BLSVXaD8tDaxEbXlQOwDBLw=",

@@ -2,6 +2,22 @@
 
 package(default_visibility = ["//visibility:public"])
 
+# Stock @platforms//cpu:armv7 doesn't distinguish the R-profile (ARM-state)
+# and M-profile (Thumb-2-only) cores that both live under arm_none_eabi
+# toolchains here, so rpu_r5_0 and pl_m3 would otherwise be ambiguous
+# toolchain-resolution targets. This constraint disambiguates them.
+constraint_setting(name = "arm_profile")
+
+constraint_value(
+    name = "cortex_r5",
+    constraint_setting = ":arm_profile",
+)
+
+constraint_value(
+    name = "cortex_m3",
+    constraint_setting = ":arm_profile",
+)
+
 # Host — runs Bazel, tests, and drives JTAG.
 platform(
     name = "host",
@@ -26,5 +42,17 @@ platform(
     constraint_values = [
         "@platforms//os:none",
         "@platforms//cpu:armv7",
+        ":cortex_r5",
+    ],
+)
+
+# PL-hosted Cortex-M3 (Arm DesignStart FPGA edition) — Orbtrace's on-chip
+# CoreSight trace source / SW-DP debug target, bare-metal.
+platform(
+    name = "pl_m3",
+    constraint_values = [
+        "@platforms//os:none",
+        "@platforms//cpu:armv7",
+        ":cortex_m3",
     ],
 )

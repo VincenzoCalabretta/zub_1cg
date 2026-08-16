@@ -46,7 +46,7 @@ RUST_SRCS=(
     applications/orbtrace/model/src/main.rs
     applications/orbtrace/firmware/common/src/lib.rs
     applications/orbtrace/firmware/a53/src/lib.rs
-    applications/orbtrace/firmware/vexriscv/src/lib.rs
+    applications/orbtrace/firmware/m3/src/lib.rs
 )
 if rustfmt --edition 2021 --check "${RUST_SRCS[@]}" 2>&1; then
     ok "all Rust source files are formatted"
@@ -72,7 +72,7 @@ if bazel test --config=host \
     //applications/orbtrace/model:register_schema_test \
     //applications/orbtrace/firmware/common:firmware_common_test \
     //applications/orbtrace/firmware/a53:control_firmware_test \
-    //applications/orbtrace/firmware/vexriscv:trace_workload_test; then
+    //applications/orbtrace/firmware/m3:trace_workload_test; then
     ok "all host tests pass"
 else
     fail "host tests failed"
@@ -91,6 +91,13 @@ if bazel build //applications/rpu/...; then
     ok "RPU build succeeded"
 else
     fail "RPU build failed"
+fi
+
+step "bazel build (transition-aware M3 firmware)"
+if bazel build //applications/orbtrace/firmware/m3_app; then
+    ok "M3 build succeeded"
+else
+    fail "M3 build failed"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────

@@ -43,26 +43,41 @@
         libxfixes libxi libxinerama libxrandr libxrender libxscrnsaver libxtst
         libxcb libxshmfence libxkbcommon
       ];
-      mkXilinxTool = pkgs: tool: pkgs.buildFHSEnv {
+      mkXilinxTool = pkgs: {
+        tool,
+        version ? "2023.2",
+        xsctRoot ? "Vitis",
+      }: pkgs.buildFHSEnv {
+        # Keep the command name stable inside a development shell.  Nix still
+        # keeps different tool versions separate through their derivations.
         name = tool;
         targetPkgs = _: xilinxRuntimePkgs pkgs;
         runScript = pkgs.writeShellScript "run-${tool}" ''
           set -euo pipefail
-          : "''${XILINX_ROOT:?set XILINX_ROOT to the root containing Vivado/2023.2 and Vitis/2023.2}"
+          : "''${XILINX_ROOT:?set XILINX_ROOT to the root containing Vivado/${version} and ${xsctRoot}/${version}}"
           unset GTK_PATH GDK_PIXBUF_MODULE_FILE GI_TYPELIB_PATH XDG_CONFIG_DIRS XDG_DATA_DIRS
           export GDK_BACKEND=x11
-          export XILINX_VITIS="$XILINX_ROOT/Vitis/2023.2"
-          export XILINX_VIVADO="$XILINX_ROOT/Vivado/2023.2"
+          export XILINX_VIVADO="$XILINX_ROOT/Vivado/${version}"
+          ${if xsctRoot == "Vitis" then ''export XILINX_VITIS="$XILINX_ROOT/Vitis/${version}"'' else ''export XILINX_SDK="$XILINX_ROOT/SDK/${version}"''}
           export LD_LIBRARY_PATH="${pkgs.ncurses5}/lib:${pkgs.libxcrypt-legacy}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # XSim invokes GCC directly and expects the FHS C runtime startup
           # objects in its conventional library search path.
           export LIBRARY_PATH="/usr/lib64''${LIBRARY_PATH:+:$LIBRARY_PATH}"
-          executable="$XILINX_ROOT/${if tool == "xsct" then "Vitis" else "Vivado"}/2023.2/bin/${tool}"
+          executable="$XILINX_ROOT/${if tool == "xsct" then xsctRoot else "Vivado"}/${version}/bin/${tool}"
           if [[ ! -x "$executable" ]]; then
             echo "missing licensed AMD tool: $executable" >&2
             exit 2
           fi
           exec "$executable" ${if tool == "xsct" then "-nodisp" else ""} "$@"
+        '';
+      };
+      # Use this for the vendor installer itself on NixOS, where its hardcoded
+      # /bin/bash and /bin/rm paths do not exist outside an FHS environment.
+      mkXilinxInstaller = pkgs: pkgs.buildFHSEnv {
+        name = "xilinx-installer";
+        targetPkgs = _: xilinxRuntimePkgs pkgs;
+        runScript = pkgs.writeShellScript "run-xilinx-installer" ''
+          exec /bin/bash "$@"
         '';
       };
 
@@ -71,16 +86,23 @@
         pkgs ? import nixpkgs { inherit system; },
         extraPackages ? [ ],
         extraShellHook ? "",
+        xilinxVersion ? "2023.2",
+        xilinxXsctRoot ? "Vitis",
       }:
         let
           bootgen = mkBootgen pkgs;
           armGcc = pkgs.gcc-arm-embedded;
           aarch64Gcc = pkgs.pkgsCross.aarch64-embedded.buildPackages.gcc;
-          vivado = mkXilinxTool pkgs "vivado";
-          xvlog = mkXilinxTool pkgs "xvlog";
-          xelab = mkXilinxTool pkgs "xelab";
-          xsim = mkXilinxTool pkgs "xsim";
-          xsct = mkXilinxTool pkgs "xsct";
+          mkTool = tool: mkXilinxTool pkgs {
+            inherit tool;
+            version = xilinxVersion;
+            xsctRoot = xilinxXsctRoot;
+          };
+          vivado = mkTool "vivado";
+          xvlog = mkTool "xvlog";
+          xelab = mkTool "xelab";
+          xsim = mkTool "xsim";
+          xsct = mkTool "xsct";
         in pkgs.mkShell {
           name = "zub_1cg-sdk";
           packages = [
@@ -132,11 +154,23 @@
       let
         pkgs = import nixpkgs { inherit system; };
         bootgen = mkBootgen pkgs;
-        vivado = mkXilinxTool pkgs "vivado";
-        xvlog = mkXilinxTool pkgs "xvlog";
-        xelab = mkXilinxTool pkgs "xelab";
-        xsim = mkXilinxTool pkgs "xsim";
-        xsct = mkXilinxTool pkgs "xsct";
+        mkTool = tool: mkXilinxTool pkgs { inherit tool; };
+        vivado = mkTool "vivado";
+        xvlog = mkTool "xvlog";
+        xelab = mkTool "xelab";
+        xsim = mkTool "xsim";
+        xsct = mkTool "xsct";
+        xilinxInstaller = mkXilinxInstaller pkgs;
+        mk2019Tool = tool: mkXilinxTool pkgs {
+          inherit tool;
+          version = "2019.1";
+          xsctRoot = "SDK";
+        };
+        vivado2019 = mk2019Tool "vivado";
+        xvlog2019 = mk2019Tool "xvlog";
+        xelab2019 = mk2019Tool "xelab";
+        xsim2019 = mk2019Tool "xsim";
+        xsct2019 = mk2019Tool "xsct";
         toolBundle = pkgs.symlinkJoin {
           name = "zub_1cg-tools";
           paths = [
@@ -148,10 +182,21 @@
         };
       in {
         packages = {
-          inherit bootgen vivado xelab xsim xsct xvlog;
+          inherit bootgen vivado xelab xsim xsct xvlog xilinxInstaller;
+          vivado_2019 = vivado2019;
+          xvlog_2019 = xvlog2019;
+          xelab_2019 = xelab2019;
+          xsim_2019 = xsim2019;
+          xsct_2019 = xsct2019;
+          xilinx_installer = xilinxInstaller;
           tooling = toolBundle;
           default = toolBundle;
         };
         devShells.default = mkDevShell { inherit system pkgs; };
+        devShells.vivado_2019 = mkDevShell {
+          inherit system pkgs;
+          xilinxVersion = "2019.1";
+          xilinxXsctRoot = "SDK";
+        };
       });
 }

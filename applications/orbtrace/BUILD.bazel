@@ -5,7 +5,8 @@ filegroup(
     srcs = [
         "//applications/orbtrace/firmware/a53:control_firmware",
         "//applications/orbtrace/firmware/common:firmware_common",
-        "//applications/orbtrace/firmware/vexriscv:trace_workload",
+        "//applications/orbtrace/firmware/m3:trace_workload",
+        "//applications/orbtrace/firmware/m3_app",
         "//applications/orbtrace/model:orbtrace_model",
         "//applications/orbtrace/rtl",
     ],
@@ -17,7 +18,7 @@ test_suite(
     tests = [
         "//applications/orbtrace/firmware/a53:control_firmware_test",
         "//applications/orbtrace/firmware/common:firmware_common_test",
-        "//applications/orbtrace/firmware/vexriscv:trace_workload_test",
+        "//applications/orbtrace/firmware/m3:trace_workload_test",
         "//applications/orbtrace/model:orbtrace_model_test",
         "//applications/orbtrace/model:register_schema_test",
     ],

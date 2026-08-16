@@ -1,0 +1,27 @@
+"""Board support package for the PL-hosted Cortex-M3 (Arm DesignStart FPGA edition)."""
+
+M3_COPTS = [
+    "-mcpu=cortex-m3",
+    "-mthumb",
+    "-mfloat-abi=soft",
+    "-ffreestanding",
+    "-fno-builtin",
+]
+
+# Expose the linker script so apps can reference it with $(location ...).
+filegroup(
+    name = "linker_script",
+    srcs = ["memory.lds"],
+    visibility = ["//visibility:public"],
+)
+
+# Minimal BSP: vector table + startup only. No UART/timer — the M3's only
+# job here is to generate ITM/TPIU trace and be a real SW-DP debug target.
+cc_library(
+    name = "bsp",
+    srcs = ["startup.S"],
+    hdrs = ["itm.h"],
+    copts = M3_COPTS,
+    includes = ["."],
+    visibility = ["//visibility:public"],
+)

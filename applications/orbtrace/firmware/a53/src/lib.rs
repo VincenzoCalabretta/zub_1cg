@@ -21,6 +21,11 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 pub const ORBTRACE_AXI_BASE: usize = 0xa000_0000;
 pub const AXI_DMA_BASE: usize = 0xa001_0000;
+/// The M3's own BRAM window (`create_bd.tcl`'s `m3_mem_ctrl`, the PS/A53
+/// preload view -- port B is the M3 core's own fetch path and is not
+/// reachable from here). Size must match `sdk/bsp/m3/memory.lds`'s `RAM`.
+pub const M3_BRAM_BASE: usize = 0xa002_0000;
+pub const M3_BRAM_SIZE: usize = 0x1_0000;
 const REG_CONTROL: usize = 0x08;
 const REG_SOURCE_FORMAT: usize = 0x0c;
 const REG_SWO_BAUD: usize = 0x10;
@@ -30,10 +35,29 @@ const REG_DMA_RING_SIZE: usize = 0x20;
 const REG_DAP_COMMAND: usize = 0x80;
 const REG_DAP_RESPONSE: usize = 0x84;
 const REG_DAP_STATUS: usize = 0x88;
+const REG_M3_CONTROL: usize = 0xa0;
 
 pub trait RegisterIo {
     fn read(&self, offset: usize) -> u32;
     fn write(&mut self, offset: usize, value: u32);
+
+    /// Write raw bytes into the M3's BRAM window -- a separate PL AXI4 slave
+    /// from the AXI-Lite register block `read`/`write` above address, and
+    /// the D2 load path's whole reason to exist: unlike the register block,
+    /// this BRAM does not reliably respond to JTAG-DAP-originated `mwr`/`dow`
+    /// (see load_m3.tcl's history), so it is loaded from the running A53
+    /// instead. Default no-op: only the real hardware `Mmio` impl needs
+    /// this; existing register-level test mocks don't exercise the M3 load
+    /// path. `offset + data.len()` is guaranteed `<= M3_BRAM_SIZE` by the
+    /// caller (`Controller::command`).
+    fn write_m3_bram(&mut self, _offset: usize, _data: &[u8]) {}
+
+    /// Read raw bytes back from the M3's BRAM window, to verify a load
+    /// before releasing the core (mirrors load_m3.tcl's own vector-word
+    /// readback check). Default: all zero, matching the write default.
+    fn read_m3_bram(&self, _offset: usize, out: &mut [u8]) {
+        out.fill(0);
+    }
 }
 
 pub struct Controller<IO> {
@@ -232,6 +256,34 @@ impl<IO: RegisterIo> Controller<IO> {
                         .copy_from_slice(&self.io.read(*offset).to_le_bytes());
                 }
                 Ok(36)
+            }
+            7 if request.len() >= 7 => {
+                let offset =
+                    u32::from_le_bytes([request[3], request[4], request[5], request[6]]) as usize;
+                let data = &request[7..];
+                let end = offset.checked_add(data.len()).ok_or(())?;
+                if end > M3_BRAM_SIZE {
+                    return Err(());
+                }
+                self.io.write_m3_bram(offset, data);
+                response[0] = 0;
+                Ok(1)
+            }
+            8 if request.len() == 9 => {
+                let offset =
+                    u32::from_le_bytes([request[3], request[4], request[5], request[6]]) as usize;
+                let length = u16::from_le_bytes([request[7], request[8]]) as usize;
+                let end = offset.checked_add(length).ok_or(())?;
+                if end > M3_BRAM_SIZE || response.len() < length {
+                    return Err(());
+                }
+                self.io.read_m3_bram(offset, &mut response[..length]);
+                Ok(length)
+            }
+            9 if request.len() == 4 => {
+                self.io.write(REG_M3_CONTROL, request[3] as u32);
+                response[0] = 0;
+                Ok(1)
             }
             _ => Err(()),
         }
@@ -536,6 +588,65 @@ mod tests {
             })
         );
         assert_eq!(&output[..7], &[3, 0, 0, 0, 5, 1, 1]);
+    }
+
+    #[derive(Default)]
+    struct M3Io {
+        bram: Vec<u8>,
+        reg_writes: Vec<(usize, u32)>,
+    }
+    impl RegisterIo for M3Io {
+        fn read(&self, _offset: usize) -> u32 {
+            0
+        }
+        fn write(&mut self, offset: usize, value: u32) {
+            self.reg_writes.push((offset, value));
+        }
+        fn write_m3_bram(&mut self, offset: usize, data: &[u8]) {
+            if self.bram.len() < offset + data.len() {
+                self.bram.resize(offset + data.len(), 0);
+            }
+            self.bram[offset..offset + data.len()].copy_from_slice(data);
+        }
+        fn read_m3_bram(&self, offset: usize, out: &mut [u8]) {
+            for (index, byte) in out.iter_mut().enumerate() {
+                *byte = self.bram.get(offset + index).copied().unwrap_or(0);
+            }
+        }
+    }
+
+    #[test]
+    fn m3_load_chunk_writes_and_reads_back() {
+        let mut controller = Controller::new(M3Io::default());
+        let mut response = [0; 64];
+        // [version_lo, version_hi, opcode=7, offset:u32 LE, data...]
+        let load = [1, 0, 7, 4, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd];
+        assert_eq!(controller.command(&load, &mut response), Ok(1));
+        assert_eq!(&controller.io.bram[4..8], [0xaa, 0xbb, 0xcc, 0xdd]);
+
+        // [version_lo, version_hi, opcode=8, offset:u32 LE, length:u16 LE]
+        // Read back the same offset (4) written above.
+        let read = [1, 0, 8, 4, 0, 0, 0, 4, 0];
+        assert_eq!(controller.command(&read, &mut response), Ok(4));
+        assert_eq!(&response[..4], [0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn m3_load_chunk_rejects_out_of_range_offset() {
+        let mut controller = Controller::new(M3Io::default());
+        let mut response = [0; 8];
+        let offset = (M3_BRAM_SIZE as u32).to_le_bytes();
+        let request = [1, 0, 7, offset[0], offset[1], offset[2], offset[3], 0xaa];
+        assert_eq!(controller.command(&request, &mut response), Err(()));
+    }
+
+    #[test]
+    fn m3_control_writes_the_control_register() {
+        let mut controller = Controller::new(M3Io::default());
+        let mut response = [0; 8];
+        // [version_lo, version_hi, opcode=9, bits]
+        assert_eq!(controller.command(&[1, 0, 9, 1], &mut response), Ok(1));
+        assert_eq!(controller.io.reg_writes, [(REG_M3_CONTROL, 1)]);
     }
 
     struct DmaIo {

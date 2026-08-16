@@ -2,11 +2,14 @@
 
 _APU_PLATFORM = Label("//sdk/platforms:apu_a53")
 _RPU_PLATFORM = Label("//sdk/platforms:rpu_r5_0")
+_M3_PLATFORM = Label("//sdk/platforms:pl_m3")
 
 _APU_BSP = Label("//sdk/bsp/apu:xilinx_runtime")
 _APU_LINKER_SCRIPT = Label("//sdk/bsp/apu:linker_script")
 _RPU_BSP = Label("//sdk/bsp/rpu:bsp")
 _RPU_LINKER_SCRIPT = Label("//sdk/bsp/rpu:linker_script")
+_M3_BSP = Label("//sdk/bsp/m3:bsp")
+_M3_LINKER_SCRIPT = Label("//sdk/bsp/m3:linker_script")
 
 def _platform_transition_impl(_settings, attr):
     return {"//command_line_option:platforms": attr.platform}
@@ -128,5 +131,49 @@ def r5_firmware(
         name = name,
         binary = ":" + binary_name,
         platform = str(_RPU_PLATFORM),
+        **_metadata(visibility, tags, testonly)
+    )
+
+def m3_firmware(
+        name,
+        srcs,
+        deps = [],
+        bsp = None,
+        linker_script = None,
+        extra_copts = [],
+        visibility = None,
+        tags = None,
+        testonly = None,
+        **kwargs):
+    """Builds a PL-hosted Cortex-M3 ELF and exposes it through an M3 platform transition."""
+    bsp = bsp or _M3_BSP
+    linker_script = linker_script or _M3_LINKER_SCRIPT
+    binary_name = name + "_elf"
+    native.cc_binary(
+        name = binary_name,
+        srcs = srcs,
+        additional_linker_inputs = [linker_script],
+        copts = [
+            "-mcpu=cortex-m3",
+            "-mthumb",
+            "-mfloat-abi=soft",
+            "-ffreestanding",
+            "-fno-builtin",
+        ] + extra_copts,
+        linkopts = [
+            "-T$(location %s)" % linker_script,
+            "-nostartfiles",
+            "--specs=nano.specs",
+            "--specs=nosys.specs",
+        ],
+        deps = [bsp] + deps,
+        tags = (tags or []) + ["manual"],
+        visibility = ["//visibility:private"],
+        **kwargs
+    )
+    _firmware_target(
+        name = name,
+        binary = ":" + binary_name,
+        platform = str(_M3_PLATFORM),
         **_metadata(visibility, tags, testonly)
     )

@@ -6,7 +6,7 @@ Host-verifiable targets:
 bazel test --config=host //applications/orbtrace/model:orbtrace_model_test
 bazel test --config=host //applications/orbtrace/model:register_schema_test
 bazel test --config=host //applications/orbtrace/firmware/common:firmware_common_test
-bazel test --config=host //applications/orbtrace/firmware/vexriscv:trace_workload_test
+bazel test --config=host //applications/orbtrace/firmware/m3:trace_workload_test
 bazel test //applications/orbtrace/firmware/a53:control_firmware_test
 XILINX_ROOT=/opt/Xilinx \
   bazel test //applications/orbtrace/rtl:rtl_unit_test \
@@ -37,8 +37,15 @@ regression.
 
 Board tests are `manual`, `exclusive`, and `requires-hardware`. Acceptance is:
 
-1. VexRiscv Rust workload boots and is debugged through TCP 3240 and the
-   remote-bitbang bridge.
+1. The PL-hosted Cortex-M3's deterministic ITM/TPIU firmware
+   (`//applications/orbtrace/firmware/m3_app`) boots and its trace is
+   captured via source_select==0, and is debugged through TCP 3240 and the
+   remote-bitbang bridge with `ORBTRACE_REG_M3_CONTROL` bit 1 set (routes
+   DAP_JTAG_Sequence/DAP_SWJ_Pins to the M3's real JTAG-DP instead of
+   `orbtrace_dap_engine.sv`'s synthetic responder — see its `use_real_target`
+   path). DAP_Transfer (register-level DP/AP access, not used by
+   remote-bitbang) remains synthetic-only; there's no ADIv5 DPACC/APACC
+   implementation here.
 2. R5-0 then A53-1 each traverse the common 4-bit DDR EMIO pipeline.
 3. Orbuculum decodes TCP 3402 directly.
 4. At least 3,000,000,000 Orbflow payload bytes arrive in 60 seconds (400

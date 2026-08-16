@@ -27,4 +27,5 @@ localparam logic [15:0] ORBTRACE_REG_DAP_CONTROL = 16'h008c;
 localparam logic [15:0] ORBTRACE_REG_DAP_TRANSFERS_LO = 16'h0090;
 localparam logic [15:0] ORBTRACE_REG_DAP_TRANSFERS_HI = 16'h0094;
 localparam logic [15:0] ORBTRACE_REG_DAP_ABORTS = 16'h0098;
+localparam logic [15:0] ORBTRACE_REG_M3_CONTROL = 16'h00a0;
 `endif

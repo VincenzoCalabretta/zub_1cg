@@ -12,6 +12,11 @@ pub const CMSIS_DAP_PORT: u16 = 3240;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_CONTROL_PAYLOAD: usize = 4096;
 pub const MAX_DAP_PACKET: usize = 1024;
+/// Size of the M3's own BRAM window (`sdk/bsp/m3/memory.lds`'s `RAM` region).
+pub const M3_BRAM_SIZE: usize = 0x1_0000;
+/// Per-`LoadM3Chunk` payload cap: comfortably under `MAX_CONTROL_PAYLOAD`
+/// once the opcode/version/offset header (7 bytes) is included.
+pub const M3_BRAM_CHUNK: usize = 2048;
 
 pub mod registers {
     pub const ID: u32 = 0x0000;
@@ -40,8 +45,11 @@ pub mod registers {
     pub const DAP_TRANSFERS_LO: u32 = 0x0090;
     pub const DAP_TRANSFERS_HI: u32 = 0x0094;
     pub const DAP_ABORTS: u32 = 0x0098;
+    pub const M3_CONTROL: u32 = 0x00a0;
 
     pub const ID_VALUE: u32 = 0x4f52_4254; // "ORBT"
+    pub const M3_CONTROL_RELEASE: u32 = 1 << 0;
+    pub const M3_CONTROL_DAP_REAL: u32 = 1 << 1;
     pub const CONTROL_START: u32 = 1 << 0;
     pub const CONTROL_STOP: u32 = 1 << 1;
     pub const CONTROL_RESET: u32 = 1 << 2;
@@ -53,7 +61,7 @@ pub mod registers {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Source {
-    VexRiscv = 0,
+    CortexM3 = 0,
     R5 = 1,
     A53 = 2,
     Test = 3,
@@ -63,7 +71,7 @@ impl TryFrom<u8> for Source {
     type Error = ProtocolError;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::VexRiscv),
+            0 => Ok(Self::CortexM3),
             1 => Ok(Self::R5),
             2 => Ok(Self::A53),
             3 => Ok(Self::Test),
@@ -136,6 +144,26 @@ pub enum Command {
     Stop,
     Reset,
     GetStats,
+    /// Write `data` (at most `M3_BRAM_CHUNK` bytes) into the M3's BRAM at
+    /// byte `offset`. The D2 load path (see M3_TRACE_VERIFICATION_PLAN.md):
+    /// streams the image over TCP instead of the JTAG-DAP `mwr`/`dow` path,
+    /// which does not reliably reach this BRAM (see load_m3.tcl's history).
+    LoadM3Chunk {
+        offset: u32,
+        data: Vec<u8>,
+    },
+    /// Read back `length` bytes from the M3's BRAM at byte `offset`, to
+    /// verify a load before releasing the core -- mirrors load_m3.tcl's own
+    /// vector-word readback check.
+    ReadM3Bram {
+        offset: u32,
+        length: u16,
+    },
+    /// Raw write to `registers::M3_CONTROL` (hold/release reset, and later
+    /// the Phase G real-DAP-route bit).
+    M3Control {
+        bits: u8,
+    },
 }
 
 impl Command {
@@ -155,6 +183,17 @@ impl Command {
             Self::Stop => out.push(4),
             Self::Reset => out.push(5),
             Self::GetStats => out.push(6),
+            Self::LoadM3Chunk { offset, data } => {
+                out.push(7);
+                out.extend(offset.to_le_bytes());
+                out.extend(data);
+            }
+            Self::ReadM3Bram { offset, length } => {
+                out.push(8);
+                out.extend(offset.to_le_bytes());
+                out.extend(length.to_le_bytes());
+            }
+            Self::M3Control { bits } => out.extend([9, *bits]),
         }
         out
     }
@@ -179,6 +218,18 @@ impl Command {
             4 => Ok(Self::Stop),
             5 => Ok(Self::Reset),
             6 => Ok(Self::GetStats),
+            7 if bytes.len() >= 7 => Ok(Self::LoadM3Chunk {
+                offset: u32::from_le_bytes(bytes[3..7].try_into().unwrap()),
+                data: bytes[7..].to_vec(),
+            }),
+            7 => Err(ProtocolError::Short),
+            8 if bytes.len() == 9 => Ok(Self::ReadM3Bram {
+                offset: u32::from_le_bytes(bytes[3..7].try_into().unwrap()),
+                length: u16::from_le_bytes(bytes[7..9].try_into().unwrap()),
+            }),
+            8 => Err(ProtocolError::Short),
+            9 if bytes.len() == 4 => Ok(Self::M3Control { bits: bytes[3] }),
+            9 => Err(ProtocolError::Short),
             other => Err(ProtocolError::UnknownCommand(other)),
         }
     }
@@ -601,6 +652,33 @@ mod tests {
         };
         assert_eq!(Command::decode(&command.encode()).unwrap(), command);
         assert!(length_frame(&vec![0; MAX_DAP_PACKET + 1], MAX_DAP_PACKET).is_err());
+    }
+
+    #[test]
+    fn m3_commands_round_trip() {
+        let load = Command::LoadM3Chunk {
+            offset: 0x1234,
+            data: vec![1, 2, 3, 4, 5],
+        };
+        assert_eq!(Command::decode(&load.encode()).unwrap(), load);
+
+        let read = Command::ReadM3Bram {
+            offset: 0x100,
+            length: 16,
+        };
+        assert_eq!(Command::decode(&read.encode()).unwrap(), read);
+
+        let control = Command::M3Control {
+            bits: registers::M3_CONTROL_RELEASE as u8,
+        };
+        assert_eq!(Command::decode(&control.encode()).unwrap(), control);
+
+        // An empty chunk is a degenerate but valid write of zero bytes.
+        let empty = Command::LoadM3Chunk {
+            offset: 0,
+            data: vec![],
+        };
+        assert_eq!(Command::decode(&empty.encode()).unwrap(), empty);
     }
 
     #[test]

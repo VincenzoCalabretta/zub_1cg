@@ -10,7 +10,11 @@ pub enum Event {
 }
 
 /// Allocation-free deterministic stimulus. Reinitializing with the same seed
-/// reproduces command/trace correlation exactly on RV32IMAC and in host tests.
+/// reproduces command/trace correlation exactly on the PL-hosted Cortex-M3
+/// and in host tests. The bare-metal `//applications/orbtrace/firmware/m3_app`
+/// entry point drives the same event cycle directly against the real ITM
+/// stimulus ports (see sdk/bsp/m3/itm.h) rather than linking this crate —
+/// see that app's main.c for the hand-ported C equivalent.
 pub struct Workload {
     state: u32,
     sequence: u32,

@@ -9,10 +9,17 @@ module orbtrace_dap_tb;
     logic force_wait=0, force_fault=0, force_parity_error=0, debug_complete;
     logic [63:0] transfer_count;
     logic [31:0] abort_count;
+    // Left at their `.*`-bound defaults (use_real_target=0) so this test
+    // exercises the synthetic DAP_JTAG_Sequence/DAP_SWJ_Pins path — an
+    // unconnected `use_real_target` input would otherwise float to 'z' and
+    // make the real-vs-synthetic branch in orbtrace_dap_engine.sv undefined.
+    logic use_real_target=0, jtag_tck, jtag_tms, jtag_tdi, jtag_tdo=0, jtag_ntrst, jtag_nreset;
     logic [7:0] captured [0:31];
     integer captured_length;
+    integer tck_pulses;
     always #5 clk=~clk;
     orbtrace_dap_engine #(.MAX_PACKET(64),.MAX_TRANSFERS(8)) dut(.*);
+    always @(posedge jtag_tck) tck_pulses = tck_pulses + 1;
 
     always @(posedge clk) if (response_valid && response_ready) begin
         captured[captured_length] <= response_data;
@@ -60,6 +67,37 @@ module orbtrace_dap_tb;
 
         send_byte(8,1); await_response(2);
         if (abort_count!==1) $fatal(1,"abort counter mismatch");
+        clear_response();
+
+        // use_real_target: DAP_JTAG_Sequence/DAP_SWJ_Pins drive real pins
+        // instead of synthesizing a response.
+        use_real_target=1;
+
+        jtag_tdo=1; tck_pulses=0;
+        send_byte(8'h14,0); send_byte(8'h01,0); send_byte(8'h81,0); send_byte(8'h01,1); // tms=1,tdi=1
+        await_response(3);
+        if (tck_pulses!==1) $fatal(1,"real JTAG: expected 1 TCK pulse, got %0d",tck_pulses);
+        if (jtag_tms!==1 || jtag_tdi!==1) $fatal(1,"real JTAG: TMS/TDI mismatch tms=%b tdi=%b",jtag_tms,jtag_tdi);
+        if (captured[2][0]!==1) $fatal(1,"real JTAG: TDO=1 not sampled, got %02x",captured[2]);
+        clear_response();
+
+        jtag_tdo=0; tck_pulses=0;
+        send_byte(8'h14,0); send_byte(8'h01,0); send_byte(8'h01,0); send_byte(8'h00,1); // tms=0,tdi=0
+        await_response(3);
+        if (tck_pulses!==1) $fatal(1,"real JTAG: expected 1 TCK pulse, got %0d",tck_pulses);
+        if (jtag_tms!==0 || jtag_tdi!==0) $fatal(1,"real JTAG: TMS/TDI mismatch tms=%b tdi=%b",jtag_tms,jtag_tdi);
+        if (captured[2][0]!==0) $fatal(1,"real JTAG: TDO=0 not sampled, got %02x",captured[2]);
+        clear_response();
+
+        send_byte(8'h10,0); send_byte(8'ha0,1); await_response(2); // nTRST/nRESET both deasserted
+        if (jtag_ntrst!==1 || jtag_nreset!==1) $fatal(1,"real SWJ_Pins: expected both deasserted");
+        clear_response();
+
+        send_byte(8'h10,0); send_byte(8'h00,1); await_response(2); // both asserted
+        if (jtag_ntrst!==0 || jtag_nreset!==0) $fatal(1,"real SWJ_Pins: expected both asserted");
+        clear_response();
+        use_real_target=0;
+
         $display("orbtrace CMSIS-DAP RTL tests passed");
         $finish;
     end

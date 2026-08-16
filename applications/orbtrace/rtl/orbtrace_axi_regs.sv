@@ -21,7 +21,8 @@ module orbtrace_axi_regs (
     input wire logic [7:0] dap_response_data, input wire logic dap_response_valid,
     input wire logic dap_response_last, output logic dap_response_ready,
     output logic dap_force_wait, output logic dap_force_fault, output logic dap_force_parity_error,
-    input wire logic [63:0] dap_transfer_count, input wire logic [31:0] dap_abort_count
+    input wire logic [63:0] dap_transfer_count, input wire logic [31:0] dap_abort_count,
+    output logic m3_release, output logic m3_dap_real
 );
     `include "orbtrace_regs.svh"
     logic [2:0] irq_status, irq_enable;
@@ -55,6 +56,7 @@ module orbtrace_axi_regs (
             dap_command_data <= 0; dap_command_valid <= 0; dap_command_last <= 0;
             dap_response_hold <= 0; dap_response_hold_valid <= 0; dap_response_hold_last <= 0;
             dap_force_wait <= 0; dap_force_fault <= 0; dap_force_parity_error <= 0;
+            m3_release <= 0; m3_dap_real <= 0;
         end else begin
             start_pulse <= 0; stop_pulse <= 0; reset_pulse <= 0;
             if (irq_dma_complete) irq_status[0] <= 1;
@@ -90,6 +92,10 @@ module orbtrace_axi_regs (
                         dap_force_fault <= write_data[1];
                         dap_force_parity_error <= write_data[2];
                     end
+                    ORBTRACE_REG_M3_CONTROL: begin
+                        m3_release <= write_data[0];
+                        m3_dap_real <= write_data[1];
+                    end
                     default: ;
                 endcase
             end
@@ -124,6 +130,7 @@ module orbtrace_axi_regs (
                     ORBTRACE_REG_DAP_TRANSFERS_LO: s_axi_rdata <= dap_transfer_count[31:0];
                     ORBTRACE_REG_DAP_TRANSFERS_HI: s_axi_rdata <= dap_transfer_count[63:32];
                     ORBTRACE_REG_DAP_ABORTS: s_axi_rdata <= dap_abort_count;
+                    ORBTRACE_REG_M3_CONTROL: s_axi_rdata <= {30'b0,m3_dap_real,m3_release};
                     default: s_axi_rdata <= 0;
                 endcase
             end

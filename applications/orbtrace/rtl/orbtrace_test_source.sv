@@ -1,7 +1,8 @@
 `default_nettype none
-// Deterministic byte source used for pipeline validation until the pinned
-// VexRiscv SoC is connected. TPIU modes emit sync plus a formatter frame;
-// serial modes emit the decoded workload bytes directly.
+// Deterministic byte source for the permanent synthetic regression path
+// (source_select==3) used for pipeline validation independent of any real
+// trace-generating core. TPIU modes emit sync plus a formatter frame; serial
+// modes emit the decoded workload bytes directly.
 module orbtrace_test_source #(
     parameter logic [7:0] RAW_BASE = 8'h40
 ) (

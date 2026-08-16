@@ -7,7 +7,7 @@ A53 or R5 applications:
   capture, deterministic replay, CMSIS-DAP, and OpenOCD remote-bitbang.
 - `rtl/`: SystemVerilog CDC, TPIU demux, SWO NRZ, packet boundaries, COBS,
   checksum, loss counters, and AXI-Lite registers.
-- `firmware/`: allocation-free common, A53, and RV32IMAC application logic,
+- `firmware/`: allocation-free common, A53, and Cortex-M3 application logic,
   including fragmented TCP framing and the AXI DMA scatter/gather ring.
 - `vivado/`: batch-only Vivado 2023.2 project and artifact generation.
 
@@ -18,7 +18,10 @@ The CMSIS-DAP payload crosses the AXI-Lite mailbox at `0x80`--`0x98`; command
 and response bytes carry an explicit last flag, and status bits provide
 backpressure. The PL engine implements deterministic Info, Connect, Transfer,
 TransferAbort/WriteABORT, SWJ-Pins, and JTAG-Sequence behavior including
-injectable WAIT, FAULT, and parity-error responses.
+injectable WAIT, FAULT, and parity-error responses. When
+`ORBTRACE_REG_M3_CONTROL` bit 1 is set, SWJ-Pins and JTAG-Sequence instead
+drive the PL-hosted Cortex-M3's real JTAG-DP (TCK/TMS/TDI/TDO/nTRST) —
+Transfer stays synthetic-only regardless.
 
 The complete physical-board throughput result, root-cause history, artifact
 hashes, and reproduction procedure are recorded in the

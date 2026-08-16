@@ -4,7 +4,7 @@ module orbtrace_core #(
 ) (
     input wire logic clk, input wire logic reset_n,
     input wire logic [1:0] source_select, input wire logic [2:0] trace_format, input wire logic reset_sync,
-    input wire logic [7:0] vex_data, input wire logic vex_valid, output logic vex_ready,
+    input wire logic [7:0] m3_data, input wire logic m3_valid, output logic m3_ready,
     input wire logic [7:0] coresight_data, input wire logic coresight_valid, output logic coresight_ready,
     input wire logic [7:0] test_data, input wire logic test_valid, output logic test_ready,
     output logic [7:0] m_axis_tdata, output logic m_axis_tvalid,

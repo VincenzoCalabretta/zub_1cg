@@ -1,25 +1,25 @@
-"""arm-none-eabi toolchain for Cortex-R5F (RPU) bare-metal."""
+"""arm-none-eabi toolchain for the PL-hosted Cortex-M3, bare-metal."""
 
 load("@rules_cc//cc:defs.bzl", "cc_toolchain")
-load(":config.bzl", "arm_none_eabi_toolchain_config")
+load(":config.bzl", "arm_none_eabi_m3_toolchain_config")
 
-arm_none_eabi_toolchain_config(name = "arm_none_eabi_config")
+arm_none_eabi_m3_toolchain_config(name = "arm_none_eabi_m3_config")
 
 filegroup(name = "empty")
 
 cc_toolchain(
-    name = "arm_none_eabi_cc_toolchain",
+    name = "arm_none_eabi_m3_cc_toolchain",
     all_files = ":empty",
     compiler_files = ":empty",
     dwp_files = ":empty",
     linker_files = ":empty",
     objcopy_files = ":empty",
     strip_files = ":empty",
-    toolchain_config = ":arm_none_eabi_config",
+    toolchain_config = ":arm_none_eabi_m3_config",
 )
 
 toolchain(
-    name = "arm_none_eabi_toolchain",
+    name = "arm_none_eabi_m3_toolchain",
     exec_compatible_with = [
         "@platforms//os:linux",
         "@platforms//cpu:x86_64",
@@ -27,8 +27,8 @@ toolchain(
     target_compatible_with = [
         "@platforms//os:none",
         "@platforms//cpu:armv7",
-        "//sdk/platforms:cortex_r5",
+        "//sdk/platforms:cortex_m3",
     ],
-    toolchain = ":arm_none_eabi_cc_toolchain",
+    toolchain = ":arm_none_eabi_m3_cc_toolchain",
     toolchain_type = "@rules_cc//cc:toolchain_type",
 )
