@@ -624,6 +624,15 @@ static void serve_control(NX_PACKET *packet)
                 response, sizeof(response), &response_len);
             offset += consumed ? (ULONG)consumed : 1U;
 
+            /* Temporary bring-up diagnostic: 2026-08-17 D2 investigation --
+             * the request provably arrives (see ip_dump) but no response is
+             * ever transmitted afterward. Settles whether orbtrace_control_feed
+             * itself is returning response_len==0 (protocol/decode-level
+             * issue) versus the response being computed but lost downstream
+             * in the packet-allocate/send path below. */
+            xil_printf("orbtrace: control_feed remaining=%lu consumed=%lu response_len=%lu\r\n",
+                       remaining - offset + consumed, consumed, response_len);
+
             if (response_len > 0U) {
                 NX_PACKET *reply;
                 if (nx_packet_allocate(&pool, &reply, NX_TCP_PACKET, NX_WAIT_FOREVER) == NX_SUCCESS) {

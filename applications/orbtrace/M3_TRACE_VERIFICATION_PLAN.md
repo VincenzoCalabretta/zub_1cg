@@ -1328,6 +1328,102 @@ bogus `msw=0`/`lsw=0` case.**
 4. Once D1 or D2 reliably loads and releases the M3, resume the Phase E
    ITM/TPIU investigation as previously planned.
 
+**Update 2026-08-17 (continued): both fixes applied, verified working as
+designed via real hardware + UART — but D2 STILL doesn't complete a
+round trip. Found a further, more precise layer: the request data
+provably arrives at the IP layer but never reaches `serve_control()` at
+all.**
+
+**Fix 1 (`gem2_packet_send()`'s all-zero-MAC check)** applied directly to
+`ThreadXGEM2Driver.c`. **Fix 2 (the vendored ARP-table race)** applied as
+a real Bazel patch, not a direct edit to the downloaded source (which
+would be silently lost on the next fetch): added
+`third_party/netxduo/patches/fix_arp_table_race.patch` (wraps both of
+`_nx_arp_packet_receive.c`'s ARP-table-write branches — "update
+existing" and "create new" — in `TX_DISABLE`/`TX_RESTORE`; the
+2026-08-08 report's claim that the "update existing" branch already had
+this protection turned out to be inaccurate for the actual vendored
+v6.5.1.202602_rel source checked this session — neither branch had it,
+so both are now protected for real correctness, not just the one branch
+originally suspected) and wired it into `third_party/extensions.bzl`'s
+`_netxduo_repo_impl` via `repo_ctx.patch()`. Verified the patch applies
+cleanly and takes effect: `grep TX_DISABLE` on the freshly-fetched,
+patched source in the Bazel sandbox shows all 4 expected occurrences
+(`TX_INTERRUPT_SAVE_AREA` + 2 disable/restore pairs). `bazel build
+//applications/orbtrace/...` and all 5 existing test targets pass clean.
+
+**Retested D2 on real hardware with the UART capture running — the ARP
+fix demonstrably works, but a full round trip still doesn't happen.**
+The connection still gets a garbage `physical_address_msw/lsw` from
+`req` at least once per attempt (e.g. `0xDEB20D49:0xBCD06DAD`,
+`0xB1B60D49:0x4D16BF1A` — still decoding as `src_port:dst_port` then a
+sequence number, i.e. this specific manifestation of the upstream race
+is not fully eliminated by the TX_DISABLE/TX_RESTORE fix alone — the
+race window this session's patch closes is narrower than the one
+actually producing this), but **`tx_dropped_bad_dst` stays at `0` and
+`orbtrace: control client connected` prints** — meaning the driver's
+existing `gem2_arp_lookup()` cache-override successfully substitutes the
+correct MAC before transmission in these cases (the diagnostic captures
+the pre-override `req` value by design, so a garbage value there no
+longer implies a garbage value actually went out on the wire). This is
+progress — Fix 1's dropped-path never triggers because Fix 1 and the
+cache override are both working together as intended — but the
+handshake completing was already possible before this session's fixes
+(seen once, 2026-08-17 earlier); it isn't the actual blocker.
+
+**New, more precise finding:** added a temporary diagnostic
+(`xil_printf` in `serve_control()`, `main.c`, printing
+`remaining`/`consumed`/`response_len` on every `orbtrace_control_feed()`
+call) and reflashed. **This line never printed at all**, across the
+full `connected`→`disconnected` window — meaning `serve_control()` is
+never invoked, i.e. `orbtrace_control_feed()` is never called, i.e. the
+client's request bytes never reach `nx_tcp_socket_receive()`
+successfully. Yet the same window's `ip_dump` (last received IP frame)
+shows a real `PSH,ACK` segment, `total_length=0x30` (48 bytes = 20 IP +
+20 TCP + exactly 8 bytes payload — precisely the framed
+`Command::M3Control{bits:0}` size), from the client's ephemeral port to
+port 3401 — **the request data physically arrives at the IP layer**,
+but the socket-level receive that would hand it to
+`control_thread_entry`'s loop never succeeds; the loop's `if
+(nx_tcp_socket_receive(...) != NX_SUCCESS) { break; }` must be taking
+the `break` path directly to the `disconnected` print, without ever
+calling `serve_control()`.
+
+**Leading hypothesis, not yet confirmed:** a race between the
+connection completing its handshake and processing the client's first
+data segment. The client (this session's Rust CLI) sends its request
+immediately after `connect()` returns, with no delay — if the client's
+final handshake ACK and its immediately-following data segment arrive
+close enough together, and this driver/NetX stack's handling of a data
+segment arriving right at (or fractionally before) the SYN_RECEIVED→
+ESTABLISHED transition has its own bug (distinct from the ARP-table
+race just fixed), the data could be silently dropped rather than queued
+— matching every observed symptom: `rx_frames` shows no *further*
+increase between `connected` and `disconnected` (the data frame is
+already folded into the same batch that completed the handshake, not a
+separate later arrival), no `control_feed` print ever fires, and
+`disconnected` eventually happens on what looks like a normal path
+(most likely the *client's* own 5-second read-timeout-triggered close,
+since the client believes its side of the connection succeeded and is
+just waiting for a reply that will now never come).
+
+**Not yet done:** confirming this specific hypothesis (vs. some other
+mechanism between "IP layer received it" and "socket receive returns
+it") would need either instrumenting NetX's own TCP receive path
+directly (another vendored-file patch, same mechanism now available via
+`third_party/netxduo/patches/`) or a real ILA/logic-level trace of the
+exact packet arrival order relative to the SYN_RECEIVED→ESTABLISHED
+transition — neither attempted yet this session.
+
+The temporary `serve_control()` diagnostic print was left in place
+(matches this file's own long-established convention of keeping
+"temporary" bring-up `xil_printf` instrumentation around — `diag`
+through `diag8` are all still-present examples from earlier sessions),
+since it is cheap and remains useful for exactly this class of
+investigation going forward. Board left on the unmodified `hybrid-fix2`
+PL bitstream, with the ARP-race-patched, backlog-adjusted,
+serve_control-diagnostic-added A53 firmware, responsive at session end.
+
 ## Phase E — Configure Orbtrace and start capture (original plan text)
 
 Using the `orbtrace` host CLI (`applications/orbtrace/model`):

@@ -995,8 +995,13 @@ TX_INTERRUPT_SAVE_AREA
         if (gem2_arp_lookup(dest_ip, &cached_msw, &cached_lsw) == NX_SUCCESS) {
             dst_msw = cached_msw;
             dst_lsw = cached_lsw;
-        } else if (dst_msw > 0xFFFFUL) {
-            /* No cache entry and req's value fails the sanity check —
+        } else if (dst_msw > 0xFFFFUL || (dst_msw == 0 && dst_lsw == 0)) {
+            /* No cache entry and req's value fails the sanity check — an
+             * all-zero MAC is exactly as invalid as msw>0xFFFF (confirmed
+             * live via UART, see M3_TRACE_VERIFICATION_PLAN.md's
+             * 2026-08-17 D2 writeup: a real send during the same
+             * connection that triggered "0xFFFF fails" also produced
+             * msw=0/lsw=0, which the old check let straight through) —
              * drop and let TCP's own retransmission timer retry later,
              * exactly how the ring-full case above handles a transient
              * send failure. */

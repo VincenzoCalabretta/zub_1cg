@@ -52,6 +52,23 @@ def _netxduo_repo_impl(repo_ctx):
         sha256 = "31a30408cc1637e4be8510e8a864e927307d424f41227ceb0d50867cb30f5be6",
         stripPrefix = "netxduo-6.5.1.202602_rel",
     )
+
+    # Real race, root-caused on real hardware: _nx_arp_packet_receive's two
+    # ARP-table-write branches (update an existing entry, create a new one)
+    # each write nx_arp_ip_address/physical_address_msw/physical_address_lsw
+    # as separate, unprotected statements -- a concurrent reader (a driver
+    # building an outgoing Ethernet header via nx_ip_driver_packet_send's ARP
+    # lookup) can observe the IP address already matching while the MAC
+    # fields are still stale/zero from the entry's previous use, producing a
+    # garbage destination MAC (confirmed live via UART: raw bytes from the
+    # replied-to packet's own TCP header, or an all-zero MAC). See
+    # applications/orbtrace/M3_TRACE_VERIFICATION_PLAN.md's 2026-08-17 D2
+    # writeup for the full diagnostic history.
+    repo_ctx.patch(
+        Label("//third_party/netxduo:patches/fix_arp_table_race.patch"),
+        strip = 1,
+    )
+
     repo_ctx.file(
         "BUILD.bazel",
         repo_ctx.read(Label("//third_party/netxduo:BUILD.bazel")),

@@ -238,7 +238,7 @@
     },
     "//third_party:extensions.bzl%netxduo_extension": {
       "general": {
-        "bzlTransitiveDigest": "XYqiTIR+Dr0tmV+NTPH2BLSVXaD8tDaxEbXlQOwDBLw=",
+        "bzlTransitiveDigest": "oVlonUkIhltsmxWVNdDwjT6BzxNaRKZZGDuKHbZ9Qfs=",
         "usagesDigest": "QgE2e/EcPILPjTyFKvLuQ8q/7V3jK9EfESes77BLxME=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
@@ -254,7 +254,7 @@
     },
     "//third_party:extensions.bzl%threadx_extension": {
       "general": {
-        "bzlTransitiveDigest": "XYqiTIR+Dr0tmV+NTPH2BLSVXaD8tDaxEbXlQOwDBLw=",
+        "bzlTransitiveDigest": "oVlonUkIhltsmxWVNdDwjT6BzxNaRKZZGDuKHbZ9Qfs=",
         "usagesDigest": "5Y8JMHsfduDFdtyJeEWDbruYCx+5EOqZ6lMAiHHIRfU=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},

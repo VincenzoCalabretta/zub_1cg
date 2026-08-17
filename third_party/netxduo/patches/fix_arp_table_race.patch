@@ -1,0 +1,47 @@
+--- a/common/src/nx_arp_packet_receive.c
++++ b/common/src/nx_arp_packet_receive.c
+@@ -71,6 +71,7 @@
+ /**************************************************************************/
+ VOID  _nx_arp_packet_receive(NX_IP *ip_ptr, NX_PACKET *packet_ptr)
+ {
++TX_INTERRUPT_SAVE_AREA
+
+ ULONG        *message_ptr;
+ ULONG         sender_physical_msw;
+@@ -447,9 +448,14 @@
+                 break;
+             }
+
+-            /* Save the physical address found in this ARP response.  */
++            /* Save the physical address found in this ARP response. Protect
++               against a concurrent reader observing the IP match while the
++               MAC fields are only partially updated (orbtrace zub_1cg fix,
++               see M3_TRACE_VERIFICATION_PLAN.md's 2026-08-17 D2 writeup). */
++            TX_DISABLE
+             arp_ptr -> nx_arp_physical_address_msw =  sender_physical_msw;
+             arp_ptr -> nx_arp_physical_address_lsw =  sender_physical_lsw;
++            TX_RESTORE
+
+             /* Set the update rate to the expiration rate since we now have an ARP
+                response.  */
+@@ -504,13 +510,19 @@
+             /* Setup a pointer to the new ARP entry.  */
+             arp_ptr =  (ip_ptr -> nx_ip_arp_table[index]) -> nx_arp_active_previous;
+
+-            /* Setup the IP address and clear the physical mapping.  */
++            /* Setup the IP address and clear the physical mapping. Protect
++               against a concurrent reader hash-matching this entry's IP
++               address while its MAC fields are still stale/uninitialized
++               from the slot's previous use (orbtrace zub_1cg fix, see
++               M3_TRACE_VERIFICATION_PLAN.md's 2026-08-17 D2 writeup). */
++            TX_DISABLE
+             arp_ptr -> nx_arp_ip_address =            sender_ip_address;
+             arp_ptr -> nx_arp_physical_address_msw =  sender_physical_msw;
+             arp_ptr -> nx_arp_physical_address_lsw =  sender_physical_lsw;
+             arp_ptr -> nx_arp_entry_next_update =     NX_ARP_EXPIRATION_RATE;
+             arp_ptr -> nx_arp_retries =               0;
+             arp_ptr -> nx_arp_ip_interface         =  interface_ptr;
++            TX_RESTORE
+         }
+     }
+ #endif /* NX_DISABLE_ARP_AUTO_ENTRY */
