@@ -6,7 +6,7 @@ TCP 3402, and (separately) that the CMSIS-DAP/JTAG debug path over TCP 3240
 reaches the same M3 for real. This is the concrete test of "the orbtrace
 testing capabilities" the M3 integration was built for.
 
-## Status (2026-08-16)
+## Status (2026-08-17, updated)
 
 | Phase | What | Status |
 |---|---|---|
@@ -15,10 +15,10 @@ testing capabilities" the M3 integration was built for.
 | A | Acquire and confirm the M3 IP | DONE |
 | B | Fix every `CONFIRM` marker in `create_bd.tcl` | DONE |
 | C | Build, flash, and bring up the board | DONE — hybrid build passes all gates (WNS=+0.071ns, CDC/methodology clean), flashed to real hardware, `orbtrace info` confirms `ZUBoard-Orbtrace/1` |
-| D | Load the M3 firmware image | DONE — root cause found and fixed 2026-08-16: `axi_bram_ctrl` defaulted to dual-port mode (`SINGLE_PORT_BRAM=0`) with only one BRAM port ever wired per controller, so each controller's unconnected second port was tied to a constant (confirmed: `m3_mem_ctrl`'s tied-off port decoded to exactly `0x00000008`, the fixed value every read returned) — writes landed via the connected port the whole time, reads always came from the disconnected one. Fix: `CONFIG.SINGLE_PORT_BRAM {1}` on both `m3_mem_ctrl`/`m3_mem_ctrl_core` in `create_bd.tcl`. Verified on real hardware via **both** load paths: `tooling/xsct/load_m3.tcl` (D1, JTAG) reads back correct vector words (`0x00010000`, `0x00000299`, ...) and `orbtrace load-m3` (D2, A53-native TCP) completes end-to-end, both releasing M3 reset. See the `orbtrace-m3-integration` memory note for full diagnostic history (a real-but-irrelevant AXI write-channel anomaly was ruled out first via ILA before the actual bug was found via post-route netlist inspection) |
-| E | Configure Orbtrace and start capture | NOT STARTED — unblocked, next up |
-| F | Verify the captured trace is genuinely correct | NOT STARTED — unblocked, follows E |
-| G | Verify the real JTAG debug path | NOT STARTED — unblocked (the JTAG-DAP path to `m3_control` itself was already confirmed working) |
+| D | Load the M3 firmware image | DONE (D1/JTAG path) — see below for D2's separate open blocker. Two distinct bugs found and fixed here across 2026-08-16/17: (1) `axi_bram_ctrl` defaulted to dual-port mode with an unconnected, tied-off second port (fixed: `SINGLE_PORT_BRAM {1}`); (2) a later regression, a 4:1 word-drop caused by a write-data pacing fault inside `control_ic` (smartconnect), fixed 2026-08-17 by routing `m3_mem_ctrl` through a dedicated `axi_interconnect` (`m3_mem_ctrl_ic`) instead of `control_ic`'s M02 leg — verified 16/16 words correct via direct JTAG `mwr`/`mrd` and via `load_m3.tcl`. D2 (`orbtrace load-m3`, native A53 path) is separately blocked by a pre-existing `M3_CONTROL`-register AXI hang, unrelated to either bug above — see the 2026-08-17 "Next steps" below |
+| E | Configure Orbtrace and start capture | BLOCKED on D2's `M3_CONTROL` hang (or D1-only workaround) before the real ITM/TPIU STIM-FIFO-stall investigation from 2026-08-16 can be trusted — that investigation ran against a firmware image that, in hindsight, may never have loaded correctly |
+| F | Verify the captured trace is genuinely correct | NOT STARTED — blocked on E |
+| G | Verify the real JTAG debug path | NOT STARTED — blocked on E; the JTAG-DAP bit-bang path to `m3_control` was previously confirmed working, but the newly-found `M3_CONTROL` register hang (a different register, `trace_pl`'s own AXI-Lite control register, not the JTAG-DAP bit-bang path) needs to be understood first in case it's related |
 
 Phases 1 through D are all done and verified against real hardware, not
 just tooling or reasoning — this includes a full synth/impl/route cycle on
@@ -838,6 +838,154 @@ causes this; (3) research whether this is a known `smartconnect`
 erratum for this Vivado version/usage pattern (single-outstanding,
 back-to-back same-slave AWLEN=0 writes) rather than something fixable in
 `create_bd.tcl` at all.
+
+**Update 2026-08-17 (continued): attempting fix (2) — interposing a
+dedicated `axi_interconnect` between `control_ic`'s M02 leg and
+`m3_mem_ctrl`.**
+
+First tried giving `m3_mem_ctrl` a fully separate PS master port
+(`M_AXI_HPM1_FPD`, `PSU__USE__M_AXI_GP1`) instead, on the theory that
+completely bypassing `control_ic` (not just re-timing after it) would be
+the more conclusive test. Caught by a fast BD-only elaboration probe
+(`validate_bd_design`/`assign_bd_address`, no synthesis, ~1 minute, same
+technique as the DATA_WIDTH/MEM_DEPTH check two updates up) before wasting
+a real build on it: real Vivado's address-decode rejects `0xA0xxxxxx` —
+the address firmware (`sdk/bsp/m3/memory.lds` indirectly, via
+`m3_mem_ctrl`'s fixed offset) and host tooling (`load_m3.tcl`'s
+`m3_bram_base`, `orbtrace load-m3`) already hardcode — as unreachable
+through `M_AXI_HPM1_FPD` at all: `"must fit an available aperture ...
+{<0xB000_0000 [256M]>, <0x5_0000_0000 [4G]>, <0x48_0000_0000 [224G]>}"`.
+Changing the address would mean touching firmware and host-tooling
+constants too, well beyond the scope of this fix, so this option is
+dropped in favor of the smaller change.
+
+**What's actually being tried:** `create_bd.tcl` now inserts
+`m3_mem_ctrl_ic` (a plain `xilinx.com:ip:axi_interconnect`, `NUM_SI
+{1}`/`NUM_MI {1}`, same IP type as the already-proven `m3_core_ic`)
+between `control_ic/M02_AXI` and `m3_mem_ctrl/S_AXI` — same address path
+as before (segment names under `/ps/Data` are unchanged, confirmed by the
+same fast BD-only probe), just one extra AXI hop. `control_ic` stays at
+`NUM_MI {3}`, unchanged. Verified clean via the fast BD-only probe first
+(no new errors/critical warnings beyond the pre-existing, already-explained
+`MEM_DEPTH`-is-read-only and `m3_core/WICENREQ`-has-no-pin ones) before
+committing to a real rebuild.
+
+**Real build launched** (`M3_OOC_EDIF` pointed at the cached
+`bazel-out/m3-ooc-2019/m3_core.edf`, output to a fresh
+`bazel-out/orbtrace-vivado-hybrid-fix3` so `hybrid-fix2`'s known-good
+bitstream stays available as a fallback) — result not yet known as of this
+write; see the next update for the outcome (build success/failure, gate
+results, and real-hardware retest).
+
+**Update 2026-08-17 (continued): build succeeded, all gates passed, and
+the fix is CONFIRMED on real hardware — the 4:1 word-drop bug is fixed.**
+
+Build completed clean: `synth_design Complete!`, `write_bitstream
+Complete!`, zero unwaived CDC violations, zero unwaived methodology
+violations, positive setup and hold slack. Flashed via `jtag_flash.sh`
+(full `rst -system`-based reflash, not a raw reprogram) to
+`bazel-out/orbtrace-vivado-hybrid-fix3/zub_orbtrace.bit` +
+its own generated `psu_init.tcl`, with `//...a53_app:a53_app` as the ELF.
+`orbtrace info` confirmed the board back up.
+
+Retested with `tooling/xsct/load_m3.tcl` (D1, JTAG): **all 4 verified
+words now correct** (`0x00010000`, `0x000002b9`, `0x000002d3`,
+`0x000002d3`) — previously only word 0 survived. Followed up with a wider
+direct `mwr`/`mrd` sweep (16 sequential words across 4 separate 16-byte
+blocks, the same pattern that originally exposed the bug): **16/16
+correct**, zero mismatches. The `m3_mem_ctrl_ic` isolation fix works —
+`control_ic` (smartconnect) really was the fault, and routing
+`m3_mem_ctrl` through a dedicated `axi_interconnect` instead of
+`control_ic`'s M02 leg genuinely fixes the write-data pacing fault, not
+just masks it under slow JTAG timing.
+
+**Second, separate finding — a pre-existing hang bug in the M3_CONTROL
+register path, unrelated to this fix and not a regression from it:**
+testing D2 (`orbtrace load-m3`, the native A53-side load path) on the
+*new* `fix3` bitstream, the very first command it issues —
+`Command::M3Control` (`applications/orbtrace/model/src/main.rs`'s
+`load_m3()`, step "[1] Holding M3 in reset...", which does
+`self.io.write(REG_M3_CONTROL, 0)` at `firmware/a53/src/lib.rs:284`,
+`REG_M3_CONTROL = 0xa0` inside `trace_pl`'s own register block) — hung
+the CLI with `orbtrace: Resource temporarily unavailable (os error 11)`
+(a 5-second TCP read timeout, per `model/src/main.rs`'s
+`set_read_timeout(Some(Duration::from_secs(5)))`, not a special error).
+Every subsequent command (`info`, `stop`, `reset`) hung identically until
+a full JTAG reflash recovered the board — consistent with the A53 CPU
+itself freezing mid-instruction on the `trace_mmio_write` store to that
+register (a plain `*(volatile u32*) = value` in
+`firmware/a53_app/src/main.c`, no software wait-loop involved) rather
+than any software-level bug, i.e. the physical AXI write to that specific
+register genuinely never completes (no `BRESP`) — a real RTL/hardware
+issue, not a CLI or firmware logic bug.
+
+**Confirmed NOT caused by today's `create_bd.tcl` fix:** reflashed back
+to the untouched, previously-verified-good `hybrid-fix2` bitstream from a
+completely clean boot, confirmed `info` (x3) and `stop` both succeed
+instantly and reliably with no prior M3 interaction — then the *same*
+`load-m3` D2 call hung identically on its very first `M3Control` command,
+on a bitstream this session never touched. `REG_M3_CONTROL` (offset
+`0xa0`) lives inside `trace_pl`'s `orbtrace_axi_regs` submodule
+(`applications/orbtrace/rtl/orbtrace_pl.v`), reached via `control_ic`'s
+*M00* leg (`trace_pl`, not `m3_mem_ctrl`'s M02 leg this session's fix
+touched) — and `stop`, which also writes an `orbtrace_axi_regs` register
+(`CONTROL`, offset `0x08`) over that exact same M00 leg, works instantly.
+So this is specific to the `M3_CONTROL` register's own AXI write-handling
+logic inside `orbtrace_axi_regs` — not `control_ic` generally, and not
+anything this session's fix inserted or touched.
+
+**Why this was never caught before:** the plan's last recorded D2 test
+(the 2026-08-17 "Phase D has REGRESSED" update, before today's fix) *did*
+get past this exact step — `orbtrace load-m3`'s own log showed it reaching
+step 3 ("readback mismatch") before failing, meaning `Command::M3Control`
+completed successfully at that time. Between then and now the only
+material change to real hardware state is the number of full
+reflash/reset cycles this board has been through — whether that's a red
+herring or an actual clue (e.g. some latch/register that only sticks
+after N resets, a marginal timing path, a JTAG-vs-power-on-reset
+difference) is unknown and not yet investigated.
+
+**Net status:** this session's actual goal — fixing the 4:1 BRAM
+word-drop bug — is DONE and verified via D1 (JTAG). D2 (native A53 load)
+is blocked by this separate, pre-existing `M3_CONTROL` hang, which needs
+its own investigation (most likely another real ILA capture, this time
+tapping `trace_pl`'s `s_axi` port around the `M3_CONTROL` write, or
+inspecting `orbtrace_axi_regs`' RTL directly for anything
+address-specific around offset `0xa0`) before D2, and therefore the rest
+of Phase E/F/G (all of which assume a running M3, releasable via either
+load path), can proceed. The board has been left on the known-good,
+unmodified `hybrid-fix2` bitstream (responsive, `orbtrace info`
+confirmed) — not `fix3` — since flashing `fix3` provides no additional
+usability until the `M3_CONTROL` hang itself is fixed (D1 still needs a
+fresh `m3_app.bin` reload after every reflash regardless of which
+bitstream is used, and the hang blocks D2 either way).
+
+### Next steps
+
+1. **Root-cause the `M3_CONTROL` AXI write hang** — the actual new
+   blocker. Cheapest to most expensive:
+   - Read `orbtrace_axi_regs`' RTL directly (no hardware needed) for
+     anything that makes offset `0xa0` structurally different from
+     `CONTROL` (`0x08`) — e.g. a combinational `BVALID`/`BRESP` term
+     gated on `m3_core` or JTAG-DAP state that could plausibly never
+     assert.
+   - If nothing obvious turns up statically, real ILA capture on
+     `trace_pl/s_axi` (same tap methodology already proven twice this
+     investigation), armed to trigger specifically on
+     `AWADDR==16'h00a0`.
+   - Once fixed, confirm D2 completes end-to-end on the `fix3` bitstream
+     (the BRAM fix is already independently verified via D1, so D2
+     succeeding would just be confirmation, not new information about
+     the BRAM fix itself).
+2. **Once D1 or D2 reliably releases a correctly-loaded M3**, resume the
+   still-open Phase E ITM/TPIU STIM-FIFO-stall investigation from the
+   2026-08-17 (earlier) updates — now finally trustworthy, since the
+   firmware image loads completely instead of being 75% zeroed. Read
+   `g_tpiu_sspsr_at_boot` (already latched by this session's firmware
+   change) via JTAG halt to settle the "does this synthesized instance
+   support 4-bit parallel trace at all" question before another ILA
+   cycle.
+3. Then Phase F/G as originally planned.
 
 ## Phase E — Configure Orbtrace and start capture (original plan text)
 

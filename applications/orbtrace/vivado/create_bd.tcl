@@ -35,6 +35,32 @@ set control_ic [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* contr
 set_property CONFIG.NUM_MI {3} $control_ic
 set data_ic [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* data_ic]
 set_property CONFIG.NUM_SI {2} $data_ic
+# m3_mem_ctrl (the A53 preload path into the M3's BRAM) gets a dedicated
+# axi_interconnect stage between it and control_ic's M02_AXI leg, instead
+# of connecting to that leg directly. Root cause, from real ILA capture on
+# control_ic/M02_AXI <-> m3_mem_ctrl/S_AXI (see
+# M3_TRACE_VERIFICATION_PLAN.md's 2026-08-17 Phase D regression writeup):
+# back-to-back single-beat writes through that leg only carry real
+# WDATA/WSTRB on the first of every 4 transactions -- the following 3 each
+# report BRESP=OKAY but silently repeat the PREVIOUS transaction's stale
+# WDATA with WSTRB=0, so 3 of every 4 words never actually land in BRAM.
+# Every hop's data width was independently confirmed 32-bit end to end
+# (ruling out a down-conversion beat-count mismatch), so this looks like a
+# fault specific to control_ic (smartconnect)'s own internal write-channel
+# demux/pipeline on that leg -- trace_pl and trace_dma, the other two
+# legs, show no such symptom. Giving m3_mem_ctrl a fully separate PS
+# master port (M_AXI_HPM1_FPD) was tried first and rejected: real Vivado
+# address-decode rejects 0xA0xxxxxx (the address firmware/host tooling
+# already hardcode) as unreachable through that port at all ("must fit an
+# available aperture ... {<0xB000_0000 [256M]>, <0x5_0000_0000 [4G]>,
+# <0x48_0000_0000 [224G]>}"), so this stays on control_ic's existing M02
+# leg/address path and instead interposes a plain axi_interconnect
+# (matching m3_core_ic's own proven role converting/re-timing AXI
+# transactions elsewhere in this design) right before m3_mem_ctrl, to see
+# whether normalizing/re-registering the transaction there is enough to
+# fix (or conclusively rule out) whatever control_ic itself is doing wrong.
+set m3_mem_ctrl_ic [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:* m3_mem_ctrl_ic]
+set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] $m3_mem_ctrl_ic
 set rst [create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:* pl_reset]
 set trace [create_bd_cell -type module -reference orbtrace_pl trace_pl]
 set irq_concat [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconcat:* irq_concat]
@@ -154,7 +180,8 @@ connect_bd_intf_net [get_bd_intf_pins m3_core/CM3_CODE_AXI3] [get_bd_intf_pins m
 connect_bd_intf_net [get_bd_intf_pins ps/M_AXI_HPM0_FPD] [get_bd_intf_pins control_ic/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins control_ic/M00_AXI] [get_bd_intf_pins trace_pl/s_axi]
 connect_bd_intf_net [get_bd_intf_pins control_ic/M01_AXI] [get_bd_intf_pins trace_dma/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins control_ic/M02_AXI] [get_bd_intf_pins m3_mem_ctrl/S_AXI]
+connect_bd_intf_net [get_bd_intf_pins control_ic/M02_AXI] [get_bd_intf_pins m3_mem_ctrl_ic/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins m3_mem_ctrl_ic/M00_AXI] [get_bd_intf_pins m3_mem_ctrl/S_AXI]
 connect_bd_intf_net [get_bd_intf_pins trace_pl/m_axis] [get_bd_intf_pins trace_dma/S_AXIS_S2MM]
 connect_bd_intf_net [get_bd_intf_pins trace_dma/M_AXI_S2MM] [get_bd_intf_pins data_ic/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins trace_dma/M_AXI_SG] [get_bd_intf_pins data_ic/S01_AXI]
@@ -165,14 +192,17 @@ connect_bd_net [get_bd_pins ps/pl_clk0] [get_bd_pins pl_reset/slowest_sync_clk] 
     [get_bd_pins trace_dma/m_axi_s2mm_aclk] [get_bd_pins trace_dma/m_axi_sg_aclk] [get_bd_pins trace_pl/aclk] \
     [get_bd_pins ps/pl_ps_trace_clk] [get_bd_pins ps/maxihpm0_fpd_aclk] [get_bd_pins ps/saxihp0_fpd_aclk] \
     [get_bd_pins m3_mem_ctrl/s_axi_aclk] [get_bd_pins m3_mem_ctrl_core/s_axi_aclk] \
-    [get_bd_pins m3_core_ic/ACLK] [get_bd_pins m3_core_ic/S00_ACLK] [get_bd_pins m3_core_ic/M00_ACLK]
+    [get_bd_pins m3_core_ic/ACLK] [get_bd_pins m3_core_ic/S00_ACLK] [get_bd_pins m3_core_ic/M00_ACLK] \
+    [get_bd_pins m3_mem_ctrl_ic/ACLK] [get_bd_pins m3_mem_ctrl_ic/S00_ACLK] [get_bd_pins m3_mem_ctrl_ic/M00_ACLK]
 connect_bd_net [get_bd_pins ps/trace_clk_out] [get_bd_pins trace_pl/trace_clk]
 connect_bd_net [get_bd_pins ps/ps_pl_tracedata] [get_bd_pins trace_pl/trace_data]
 connect_bd_net [get_bd_pins ps/pl_resetn0] [get_bd_pins pl_reset/ext_reset_in]
 connect_bd_net [get_bd_pins pl_reset/peripheral_aresetn] [get_bd_pins trace_pl/aresetn] \
     [get_bd_pins trace_dma/axi_resetn] [get_bd_pins m3_mem_ctrl/s_axi_aresetn] \
     [get_bd_pins m3_mem_ctrl_core/s_axi_aresetn] [get_bd_pins m3_core_ic/ARESETN] \
-    [get_bd_pins m3_core_ic/S00_ARESETN] [get_bd_pins m3_core_ic/M00_ARESETN]
+    [get_bd_pins m3_core_ic/S00_ARESETN] [get_bd_pins m3_core_ic/M00_ARESETN] \
+    [get_bd_pins m3_mem_ctrl_ic/ARESETN] [get_bd_pins m3_mem_ctrl_ic/S00_ARESETN] \
+    [get_bd_pins m3_mem_ctrl_ic/M00_ARESETN]
 connect_bd_net [get_bd_pins trace_dma/s2mm_introut] [get_bd_pins trace_pl/dma_complete]
 connect_bd_net [get_bd_pins zero/dout] [get_bd_pins trace_pl/dma_fault] [get_bd_pins trace_pl/debug_complete]
 connect_bd_net [get_bd_pins trace_pl/irq] [get_bd_pins irq_concat/In0]
