@@ -1220,6 +1220,114 @@ already-instrumented in `main.c`) that only a real serial cable can
 surface reliably. Board left on the unmodified `hybrid-fix2` PL bitstream
 with the backlog-adjusted A53 firmware, responsive at session end.
 
+**Correction, same session, immediately after: a physical serial cable
+*was* available the whole time — the "no `/dev/ttyUSB*`" finding above
+was a false negative from a shell-globbing mistake, not a real absence.**
+`ls /dev/ttyUSB* /dev/ttyACM*` in one command aborted entirely (zsh's
+default `nomatch` behavior when *any* one glob in the command fails to
+match) rather than just skipping the non-matching pattern, so the
+genuinely-present `/dev/ttyUSB1` (`/dev/serial/by-id/usb-Xilinx_JTAG+Serial_1234-oj1-if01-port0`)
+was never seen. Checking each glob separately (or `ls /dev/tty* | grep`)
+found it immediately. Worth remembering for any future "is X plugged in"
+check on this machine: check globs individually, don't combine them in
+one command and trust a "no matches" error to mean all of them failed.
+
+**With that fixed: connected via `stty -F /dev/ttyUSB1 115200 raw -echo`
++ a background `cat /dev/ttyUSB1 > log`, reflashed for a clean boot-banner
+capture, reproduced the hang, and got a DECISIVE, conclusive root cause —
+this is a real recurrence of the exact historical bug from
+`ORBTRACE_TEST_REPORT_2026-08-08.md`: NetX's own `req->nx_ip_driver_physical_address_msw/lsw`
+occasionally holds garbage (raw bytes from the TCP header of the packet
+being replied to) instead of a resolved MAC, for a genuine
+`NX_LINK_PACKET_SEND` (not ARP) request.**
+
+Live UART output showed `orbtrace: control client connected` — the
+handshake genuinely DID complete this time (contradicting the earlier
+JTAG-only reading of `nx_tcp_socket_state=4`, which must have caught a
+*later*, different connection attempt or a stale/cached value — a
+concrete example of the JTAG-cache-coherency caveat flagged just above
+turning out to matter in practice) — followed roughly a second later by
+`orbtrace: control client disconnected`, with no application-level
+response ever observed being sent in between (the diagnostic capture
+that would show a new send during that window never changed).
+
+Decoded the raw `req_bytes` hex dump (`diag: req_addr=... req_bytes=...`)
+against NetX's real `NX_IP_DRIVER_STRUCT` layout (`nx_api.h`: command,
+status, physical_address_msw, physical_address_lsw, packet ptr, return
+ptr, ip ptr, interface ptr — 48 bytes total, matching `sizeof_req=48`
+exactly) for two separate sends captured this reproduction:
+
+1. **At connect time:** `nx_ip_driver_command=0` (`NX_LINK_PACKET_SEND`,
+   a real data/TCP send, not ARP) with `physical_address_msw=0xB96A0D49`,
+   `_lsw=0x75846910` — decoding exactly as `src_port:dst_port` (`0xB96A`
+   = 47466, the client's ephemeral port; `0x0D49` = 3401, the control
+   port) then a TCP sequence number, **not a MAC at all** — precisely the
+   failure signature the 2026-08-08 report described ("occasionally
+   arrives holding garbage that decodes as raw bytes from the received
+   packet's own TCP header").
+2. **Later, still during/around the same connection's brief life:**
+   another `NX_LINK_PACKET_SEND` with `physical_address_msw=0x0`,
+   `_lsw=0x0` — an all-zero destination MAC, which is just as invalid as
+   the first case but is **structurally different**: it's not caught by
+   `gem2_packet_send()`'s existing defensive check
+   (`else if (dst_msw > 0xFFFFUL) { drop }`), since `0` legitimately
+   passes `<= 0xFFFF`. If the driver-local ARP cache lookup for that
+   packet's destination IP also missed at that exact moment, this send
+   would go out on the wire with a literal all-zero destination MAC —
+   a gap in the existing mitigation, not just the original bug.
+
+Both are genuine NetX-driver-request-level corruption, confirmed live,
+not a JTAG artifact this time (the UART value is what the CPU itself
+printed from its own, guaranteed-coherent view of the same memory).
+Whether the driver's own `gem2_arp_lookup()` override successfully
+corrected either specific packet before it hit the wire is not
+separately confirmed (the diagnostic captures the pre-override value by
+design), but the *upstream* corruption recurring at all — twice within
+one short connection — is itself sufficient to explain a persistently
+unreliable handshake/response path without needing any other
+explanation, and matches a bug this project already spent a prior
+session on without a full fix.
+
+**Root cause, at last: a real, reproducible, upstream vendored NetX Duo
+bug (the `_nx_arp_packet_receive.c` TX_DISABLE-unprotected "create new
+ARP entry" race identified in the 2026-08-08 report) recurring — the
+driver-local ARP-cache workaround built to mitigate it is real and
+partially effective (the connection DID complete once, this time) but
+does not cover every case: it only fires when a cache entry for the
+destination IP already exists, and the fallback sanity check on `req`'s
+own value only rejects `msw > 0xFFFF`, silently accepting the equally
+bogus `msw=0`/`lsw=0` case.**
+
+### Next steps
+
+1. **Harden `gem2_packet_send()`'s fallback sanity check** (`main.c`'s
+   nested driver file, `ThreadXGEM2Driver.c` around the `else if (dst_msw
+   > 0xFFFFUL)` branch): also reject `dst_msw == 0 && dst_lsw == 0` (an
+   all-zero MAC is never legitimate either) the same way, dropping and
+   letting TCP retransmission retry — closes the specific gap found this
+   session. Cheap, A53-firmware-only change.
+2. **More robust, addresses the actual root cause rather than a
+   narrower symptom:** investigate always preferring the driver-local
+   ARP cache once *any* entry exists for the relevant interface (not
+   just an exact per-destination-IP hit), or — most conclusive — apply
+   the fix the 2026-08-08 report already identified but flagged as
+   "upstream vendored-library behavior, not something to patch
+   directly here": wrap `_nx_arp_packet_receive.c`'s "create new ARP
+   entry" branch's three unprotected writes (`nx_arp_ip_address`, then
+   `_msw`, then `_lsw`) in `TX_DISABLE`/`TX_RESTORE`, matching the
+   sibling "update existing entry" branch a few lines above it that
+   already does this. This file is vendored/external — confirm the
+   project's policy on patching vendored dependencies (a local patch
+   file vs. an in-tree fork) before changing it, per that report's own
+   note not to modify it directly without doing so deliberately.
+3. Re-run D2 (`orbtrace load-m3`) after either fix to confirm the
+   connection completes AND the M3Control response actually reaches the
+   client — this session only confirmed the *handshake* can complete,
+   not that a full request/response round-trip has ever succeeded end to
+   end.
+4. Once D1 or D2 reliably loads and releases the M3, resume the Phase E
+   ITM/TPIU investigation as previously planned.
+
 ## Phase E — Configure Orbtrace and start capture (original plan text)
 
 Using the `orbtrace` host CLI (`applications/orbtrace/model`):
