@@ -12,6 +12,13 @@
 static uint32_t state = 7;
 static uint32_t sequence = 0;
 
+/* Latched here (not traced out — the STIM path is exactly what's under
+ * test and may block forever) so a JTAG halt-and-read can recover which
+ * parallel port widths this synthesized TPIU instance actually supports,
+ * independent of what TPIU_CSPSR was told to select. See
+ * M3_TRACE_VERIFICATION_PLAN.md's Phase E "Not yet determined" section. */
+volatile uint32_t g_tpiu_sspsr_at_boot;
+
 static void emit_next(void) {
     state ^= state << 13;
     state ^= state >> 17;
@@ -46,6 +53,7 @@ int main(void) {
      * create_bd.tcl's PSU__TRACE__WIDTH default so the same trace_format
      * register values apply to both the PS and M3 sources. */
     m3_itm_init(2);
+    g_tpiu_sspsr_at_boot = M3_TPIU_SSPSR; /* DEMCR.TRCENA must be set first (done above) */
 
     for (;;) {
         emit_next();

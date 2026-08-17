@@ -24,6 +24,7 @@
 #define M3_ITM_LAR (*(volatile uint32_t *)0xE0000FB0UL) /* Lock Access Register */
 #define M3_ITM_LAR_UNLOCK 0xC5ACCE55u
 
+#define M3_TPIU_SSPSR (*(volatile uint32_t *)0xE0040000UL) /* Supported parallel port sizes (RO, silicon-fixed) */
 #define M3_TPIU_ACPR (*(volatile uint32_t *)0xE0040010UL)  /* Async clock prescaler (SWO baud) */
 #define M3_TPIU_SPPR (*(volatile uint32_t *)0xE00400F0UL)  /* Selected pin protocol */
 #define M3_TPIU_SPPR_PARALLEL 0u

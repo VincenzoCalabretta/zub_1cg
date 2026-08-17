@@ -114,8 +114,29 @@ set m3_mem_ctrl_core [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_bram_ctrl:
 # port B. SINGLE_PORT_BRAM {1} makes each controller use its single
 # connected port for both reads and writes, matching how it's actually
 # wired here.
+#
+# DATA_WIDTH {32} / MEM_DEPTH {16384}: explicit, to match m3_mem's real
+# Write_Width_A/B {32} x Write_Depth_A/B {16384} below -- harmless and
+# arguably correct practice, but NOT a fix for anything: a 2026-08-17
+# investigation initially concluded (via `get_pins -hier -filter {NAME =~
+# "*ctrl/U0/*s_axi_wdata*"}`) that these controllers were silently running
+# 128-bit/4096-deep instead, and added these properties to force 32-bit --
+# two full Vivado rebuilds later, that finding turned out to be a
+# measurement error (the loose wildcard matched an unrelated internal
+# signal, not the real port; a precise `get_pins -of_objects [get_cells
+# .../U0] -filter {...}` check, and the real generated VHDL's `GENERIC MAP`,
+# both confirm both controllers were genuinely 32-bit/16384-deep all along,
+# even before this fix was added). The actual M3 BRAM load bug this was
+# chasing -- a reproducible 4:1 word-drop, only every 4th 32-bit word
+# surviving a write, on both this controller and m3_mem_ctrl_core -- is
+# NOT explained by this and remains open. See M3_TRACE_VERIFICATION_PLAN.md's
+# 2026-08-17 Phase D regression writeup (including the correction) for the
+# full history; real ILA hardware capture on m3_mem_ctrl/S_AXI is the next
+# step, not further CONFIG.* changes here.
 set_property CONFIG.SINGLE_PORT_BRAM {1} $m3_mem_ctrl
+set_property -dict [list CONFIG.DATA_WIDTH {32} CONFIG.MEM_DEPTH {16384}] $m3_mem_ctrl
 set_property CONFIG.SINGLE_PORT_BRAM {1} $m3_mem_ctrl_core
+set_property -dict [list CONFIG.DATA_WIDTH {32} CONFIG.MEM_DEPTH {16384}] $m3_mem_ctrl_core
 set m3_mem [create_bd_cell -type ip -vlnv xilinx.com:ip:blk_mem_gen:* m3_mem]
 # 64K (16384 x 32-bit) per port — must match RAM's LENGTH in
 # sdk/bsp/m3/memory.lds. True dual-port so the A53 preload path (port A,
