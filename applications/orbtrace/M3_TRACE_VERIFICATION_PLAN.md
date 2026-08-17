@@ -1607,6 +1607,67 @@ verify the CPU's own output — not the capture chain that consumes it).
    diff against the Rust `Workload` reference) and Phase G (real JTAG
    debug path) as originally planned.
 
+**Update 2026-08-17 (continued): did the static RTL review (step 2,
+free) — found no bug, but found something more useful: a plausible,
+well-reasoned refinement of *why* this is happening, resurrecting the
+"bandwidth/clocking mismatch" hypothesis this document ruled out on
+2026-08-16 based on what's now a retracted finding.**
+
+Read `orbtrace_pl.v`, `orbtrace_core.sv`, `orbtrace_source_mux.sv`, and
+`orbtrace_ddr_capture.sv` in full. The M3 and PS capture/mux/demux
+paths are **structurally symmetric and clean** — same `orbtrace_async_fifo`
+module instantiated identically for both, `orbtrace_source_mux`'s
+`select==0` (M3) case routes `m3_data`/`m3_valid`/`m3_ready` exactly
+like the PS case routes its own signals, and `orbtrace_core`'s
+TPIU-demux/sync-detection logic (where the `0xFFFFFF7F` search actually
+happens) is entirely generic — it has no idea which physical source fed
+it. No structural M3-specific bug found anywhere in this path.
+
+**What the review *did* surface: `orbtrace_ddr_capture.sv`'s 4-bit-width
+case (`active_width==2'd2`, matching `tpiu4`) asserts `byte_valid` on
+*every single* `trace_clk_m3` cycle once enabled and primed — not just
+when the M3 has real data to report.** This matches the CM3 TRM's
+documented formatter behavior (continuous half-sync/idle-frame
+insertion when there's nothing real to output, confirmed by
+documentation research on 2026-08-17 earlier in this document) — in
+Parallel mode, the TPIU never goes quiet; it emits a byte every clock,
+forever, real data or not. The CDC FIFO downstream
+(`orbtrace_async_fifo`, `DEPTH_LOG2=5` → **32 entries**, matching the
+observed `fifo_high_water=63`/saturated) has to absorb that *continuous,
+never-idle* production rate indefinitely, not just during bursts of
+real trace activity.
+
+**This reframes the whole symptom:** `rx_bytes=0` with `dropped_bytes`
+in the tens of millions and `fifo_high_water` permanently pegged isn't
+necessarily evidence that the sync pattern is malformed or never
+present — it's consistent with the CDC FIFO overflowing continuously
+from essentially the first few cycles, before the demux logic downstream
+ever gets a clean, unbroken run of bytes long enough to find *any* sync
+pattern at all, real or otherwise. If `trace_clk_m3`'s actual rate
+(nominally ~100 MHz per `create_bd.tcl`'s `HCLK`, but — per this
+document's own still-unresolved 2026-08-16 note — possibly higher if
+the DesignStart IP internally multiplies it) exceeds what the DMA/NetX/
+GEM2 software pipeline downstream can sustain *continuously forever*
+(as opposed to the PS path's "sustained 400 Mbit/s" milestone, which
+most plausibly measured real, useful trace load rather than an eternal
+100%-duty-cycle idle-fill stream), permanent overflow from the very
+first moment is exactly what this architecture would produce — no
+sync-detection bug required at all.
+
+**Not yet tested — the natural next experiment, but it costs a real
+Vivado rebuild (not free), so flagging rather than doing unilaterally:**
+lower `trace_clk_m3`'s source frequency (`create_bd.tcl`'s
+`PSU__CRF_APB__DBG_TRACE_CTRL__FREQMHZ`, currently `100`) and retest —
+if `rx_bytes` becomes nonzero at a lower rate, that directly confirms
+the bandwidth-mismatch hypothesis and points straight at the real fix
+(run the M3 trace clock slower, or find/increase downstream throughput
+headroom). This is a more targeted, higher-information experiment than
+another blind ILA capture, and produces real value either way (fixes it
+outright, or gives the next ILA session a specific rate to look for
+instead of searching blind). Not attempted this session — a full
+synth/impl/route cycle (~30-90 min) is a meaningful cost to spend
+without checking in first.
+
 Board left on `hybrid-fix3` with the current `a53_app` (all diagnostics
 kept) and the diagnostic-enhanced `m3_app` (SSPSR/TCR/STIM0/FFSR/FFCR/
 heartbeat latches), M3 running, responsive at session end.
