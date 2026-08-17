@@ -15,10 +15,10 @@ testing capabilities" the M3 integration was built for.
 | A | Acquire and confirm the M3 IP | DONE |
 | B | Fix every `CONFIRM` marker in `create_bd.tcl` | DONE |
 | C | Build, flash, and bring up the board | DONE — hybrid build passes all gates (WNS=+0.071ns, CDC/methodology clean), flashed to real hardware, `orbtrace info` confirms `ZUBoard-Orbtrace/1` |
-| D | Load the M3 firmware image | DONE (D1/JTAG path) — see below for D2's separate open blocker. Two distinct bugs found and fixed here across 2026-08-16/17: (1) `axi_bram_ctrl` defaulted to dual-port mode with an unconnected, tied-off second port (fixed: `SINGLE_PORT_BRAM {1}`); (2) a later regression, a 4:1 word-drop caused by a write-data pacing fault inside `control_ic` (smartconnect), fixed 2026-08-17 by routing `m3_mem_ctrl` through a dedicated `axi_interconnect` (`m3_mem_ctrl_ic`) instead of `control_ic`'s M02 leg — verified 16/16 words correct via direct JTAG `mwr`/`mrd` and via `load_m3.tcl`. D2 (`orbtrace load-m3`, native A53 path) is separately blocked by a pre-existing `M3_CONTROL`-register AXI hang, unrelated to either bug above — see the 2026-08-17 "Next steps" below |
-| E | Configure Orbtrace and start capture | BLOCKED on D2's `M3_CONTROL` hang (or D1-only workaround) before the real ITM/TPIU STIM-FIFO-stall investigation from 2026-08-16 can be trusted — that investigation ran against a firmware image that, in hindsight, may never have loaded correctly |
+| D | Load the M3 firmware image | DONE (D1/JTAG path). Two distinct hardware bugs found and fixed across 2026-08-16/17: (1) `axi_bram_ctrl` defaulted to dual-port mode with an unconnected, tied-off second port (fixed: `SINGLE_PORT_BRAM {1}`); (2) a later regression, a 4:1 word-drop caused by a write-data pacing fault inside `control_ic` (smartconnect), fixed 2026-08-17 by routing `m3_mem_ctrl` through a dedicated `axi_interconnect` (`m3_mem_ctrl_ic`) instead of `control_ic`'s M02 leg — verified 16/16 words correct via direct JTAG `mwr`/`mrd` and via `load_m3.tcl`. D2 (`orbtrace load-m3`, native A53 path) is separately blocked, but root-caused as NOT a hardware bug at all — see below |
+| E | Configure Orbtrace and start capture | BLOCKED on D2 (or a D1-only workaround) before the real ITM/TPIU STIM-FIFO-stall investigation from 2026-08-16 can be trusted — that investigation ran against a firmware image that, in hindsight, may never have loaded correctly |
 | F | Verify the captured trace is genuinely correct | NOT STARTED — blocked on E |
-| G | Verify the real JTAG debug path | NOT STARTED — blocked on E; the JTAG-DAP bit-bang path to `m3_control` was previously confirmed working, but the newly-found `M3_CONTROL` register hang (a different register, `trace_pl`'s own AXI-Lite control register, not the JTAG-DAP bit-bang path) needs to be understood first in case it's related |
+| G | Verify the real JTAG debug path | NOT STARTED — blocked on E; the JTAG-DAP bit-bang path to `m3_control` was previously confirmed working and is unrelated to D2's NetX-level block (different code path entirely) |
 
 Phases 1 through D are all done and verified against real hardware, not
 just tooling or reasoning — this includes a full synth/impl/route cycle on
@@ -962,21 +962,13 @@ bitstream is used, and the hang blocks D2 either way).
 
 ### Next steps
 
-1. **Root-cause the `M3_CONTROL` AXI write hang** — the actual new
-   blocker. Cheapest to most expensive:
-   - Read `orbtrace_axi_regs`' RTL directly (no hardware needed) for
-     anything that makes offset `0xa0` structurally different from
-     `CONTROL` (`0x08`) — e.g. a combinational `BVALID`/`BRESP` term
-     gated on `m3_core` or JTAG-DAP state that could plausibly never
-     assert.
-   - If nothing obvious turns up statically, real ILA capture on
-     `trace_pl/s_axi` (same tap methodology already proven twice this
-     investigation), armed to trigger specifically on
-     `AWADDR==16'h00a0`.
-   - Once fixed, confirm D2 completes end-to-end on the `fix3` bitstream
-     (the BRAM fix is already independently verified via D1, so D2
-     succeeding would just be confirmation, not new information about
-     the BRAM fix itself).
+1. ~~Root-cause the `M3_CONTROL` AXI write hang~~ — **RE-SCOPED, see the
+   2026-08-17 (continued) update immediately below: this is NOT an AXI/RTL
+   hang at all.** The `orbtrace_axi_regs`.sv RTL read (free, no hardware)
+   ruled out an address-specific hardware bug; a live JTAG investigation
+   then proved the actual mechanism is a NetX/Ethernet-stack block, not
+   anything in `create_bd.tcl`/`orbtrace_pl.v`/`m3_mem_ctrl_ic`. See below
+   for the real next step.
 2. **Once D1 or D2 reliably releases a correctly-loaded M3**, resume the
    still-open Phase E ITM/TPIU STIM-FIFO-stall investigation from the
    2026-08-17 (earlier) updates — now finally trustworthy, since the
@@ -986,6 +978,83 @@ bitstream is used, and the hang blocks D2 either way).
    support 4-bit parallel trace at all" question before another ILA
    cycle.
 3. Then Phase F/G as originally planned.
+
+**Update 2026-08-17 (continued): root-caused the `M3_CONTROL` hang —
+it is NOT an AXI/hardware/RTL bug. `control_thread` is blocked inside
+NetX's `_nx_tcp_server_socket_accept`, not anywhere near the AXI write.**
+
+Investigated entirely via free (no-rebuild) JTAG/xsct inspection of the
+already-flashed `hybrid-fix2` board, in this order:
+
+1. **RTL read (`orbtrace_axi_regs.sv`), free:** the register block's write
+   path (`write_fire`/`s_axi_bvalid`) asserts unconditionally for ANY
+   address via a `case` statement with a harmless `default: ;` arm —
+   `ORBTRACE_REG_M3_CONTROL` (`0xa0`) is handled exactly like every other
+   register, including `CONTROL` (`0x08`, used by the already-working
+   `stop`/`start`/`reset` commands). No address-specific gating exists
+   here at all — ruling out the RTL as the cause before touching hardware.
+2. **Exception-vector check (`tx_initialize_low_level.S`), free:** the
+   EL3 vector table's Synchronous and SError entries are both a bare
+   `B .` (infinite self-branch) — if the AXI write had actually faulted
+   (SLVERR/DECERR/bus timeout → Data Abort/SError), the CPU would be
+   frozen at that exact, fixed vector address forever. It never was.
+3. **Live PC sampling via repeated JTAG halt/resume:** the CPU is mostly
+   sitting in ThreadX's own idle scheduler loop (`_tx_thread_schedule`),
+   not spinning on anything AXI-related.
+4. **Peeked the Rust FFI's global `LOCK` (`AtomicBool`) directly at its
+   symbol address (`0x937b0`):** reads back `0x00` — not held. Rules out
+   a stuck mutex/unreleased lock from a `panic=abort` panic inside the
+   `self.io.write(REG_M3_CONTROL, ...)` critical section (the panic
+   handler is a bare `loop {}` with no unwinding, so a panic there would
+   leave `LOCK` permanently `true` — it doesn't).
+5. **Waited 90s post-hang and retried `info`:** still fails identically —
+   rules out a slow-but-eventually-successful TCP retry/backoff.
+6. **Decisive: walked `control_thread`'s ThreadX TCB directly** (found via
+   `nm` on the ELF: `control_thread` at `0x53aa0`; `TX_THREAD_STRUCT`
+   layout from the vendored `tx_api.h`/`tx_port.h` for this
+   `cortex_a53/gnu` port, `ULONG`/`UINT` both 4 bytes). Confirmed a valid
+   TCB (`tx_thread_id` = `0x54485244` = ASCII `"THRD"`, the ThreadX magic;
+   `tx_thread_name` pointer dereferences to `"orbtrace_control"`).
+   **`tx_thread_state = 0x0000000c` = `TX_TCP_IP`** (from `tx_api.h`'s own
+   state enum) — the thread is genuinely suspended inside a NetX TCP/IP
+   call, not busy-spinning on anything. Walked the saved stack from
+   `tx_thread_stack_ptr` (`0x76e50`) and found return addresses that
+   `addr2line` resolves to **`_nx_tcp_server_socket_accept`, called from
+   `control_thread_entry`** (`main.c`'s outer `for(;;)` accept loop, after
+   the previous connection's `nx_tcp_socket_disconnect`/
+   `nx_tcp_server_socket_unaccept`/`_relisten` sequence) — **not** anywhere
+   inside `Controller::command()`'s opcode-9 handling, `Mmio::write()`, or
+   `serve_control()`'s response-send path.
+
+**What this means:** by the time this state was captured, the M3Control
+request had almost certainly already been fully handled (matching
+`LOCK=0`) and the connection torn down — `control_thread` had already
+looped back around to wait for the *next* TCP connection, which then
+never completes. This points at the GEM2 Ethernet driver / NetX socket
+lifecycle (accept/disconnect/relisten sequence, specifically after
+handling a `control` connection that behaves differently from `info`'s —
+possibly tied to `nx_tcp_server_socket_listen`'s backlog of `1U` in
+`main.c`, or a lost/dropped reply packet on the GEM2 TX/RX path this
+codebase's own extensive pre-existing `diag`/`diag2`-`diag8` `xil_printf`
+instrumentation in `main.c` was clearly already built to chase, per its
+comments about GEM2/NetX bring-up issues), **not `create_bd.tcl`, not
+`orbtrace_pl.v`/`orbtrace_axi_regs.sv`, and not anything this session's
+`m3_mem_ctrl_ic` fix touched.** No physical serial console is available
+in this environment (`/dev/ttyUSB*`/`/dev/ttyACM*`: none present) to read
+the existing diagnostic prints directly, which would otherwise be the
+fastest way to see exactly what the GEM2/NetX diagnostics already report
+at the moment of the hang.
+
+**Real next step (different domain from anything else in this doc — no
+more Vivado/RTL work indicated):** either (a) get a physical serial
+cable connected to this board's UART and read the already-extensive
+`diag`/`diag2`-`diag8` output live during a reproduction, by far the
+fastest path given how much relevant instrumentation already exists, or
+(b) continue via JTAG-only register/struct inspection — decode the
+`NX_TCP_SOCKET`/GEM2 BD-ring C structs referenced by `main.c`'s own diag
+prints (`rx_bd_base`, `txqbase`, etc. — same technique used here for the
+ThreadX TCB) to see the actual socket/ring state at the moment
+`_nx_tcp_server_socket_accept` is stuck, without needing a UART at all.
 
 ## Phase E — Configure Orbtrace and start capture (original plan text)
 
