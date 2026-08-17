@@ -16,7 +16,7 @@ testing capabilities" the M3 integration was built for.
 | B | Fix every `CONFIRM` marker in `create_bd.tcl` | DONE |
 | C | Build, flash, and bring up the board | DONE — hybrid build passes all gates (WNS=+0.071ns, CDC/methodology clean), flashed to real hardware, `orbtrace info` confirms `ZUBoard-Orbtrace/1` |
 | D | Load the M3 firmware image | **DONE — both D1 and D2 confirmed fully working**, 2026-08-17. Two hardware bugs fixed (dual-port tied-off BRAM port; a write-pacing 4:1 word-drop fixed by routing `m3_mem_ctrl` through a dedicated `axi_interconnect`) plus a real vendored NetX ARP-table race fixed (see below) — but D2's long "hang" this session turned out to be **two stacked build/flash mistakes, not a design bug**: `jtag_flash.sh` was repeatedly given a stale (`2026-08-09`) `a53_app_elf` artifact instead of the freshly-rebuilt `a53_app` symlink, so none of this session's firmware edits were ever actually running; independently, the board was flashed with `hybrid-fix2` (the *pre*-BRAM-fix bitstream) instead of `hybrid-fix3` during the whole D2 investigation. Once both were corrected, D2 completes cleanly and repeatably, including as the very first command after a fresh reflash. See the 2026-08-17 "stale artifact" correction below for the full account |
-| E | Configure Orbtrace and start capture | **UNBLOCKED** — D1 and D2 both load real, correct firmware now; the Phase E ITM/TPIU STIM-FIFO-stall investigation from 2026-08-16 needs re-running from scratch, since it ran against firmware images that (per Phase D's whole history this session) may never have loaded correctly |
+| E | Configure Orbtrace and start capture | IN PROGRESS, M3/CPU side conclusively cleared 2026-08-17 — re-ran the ITM/TPIU investigation with a genuinely healthy, verified-running M3 (heartbeat counter proves it) and the 2026-08-16 "CPU stuck on first blocking write" diagnosis is retracted (SSPSR confirms 4-bit supported, TCR readback matches exactly what was written, STIM0 reads ready at boot). `rx_bytes` is still `0` with the capture running, but the blocker is now isolated entirely to `orbtrace_pl.v`'s PL-side M3 DDR capture/CDC/sync-detection chain, not the M3 or its ITM state |
 | F | Verify the captured trace is genuinely correct | NOT STARTED — unblocked, follows E |
 | G | Verify the real JTAG debug path | NOT STARTED — unblocked (the JTAG-DAP bit-bang path to `m3_control` was previously confirmed working) |
 
@@ -1521,6 +1521,95 @@ invocation. Always use `bazel-bin/applications/orbtrace/firmware/a53_app/a53_app
 edit actually reached the flashed binary, verify with `strings` on the
 resolved artifact for a string unique to that edit before spending any
 more hardware-cycle time debugging.
+
+**Update 2026-08-17 (continued): with Phase D genuinely fixed, re-ran
+Phase E's ITM/TPIU investigation from scratch — and the 2026-08-16
+"CPU permanently stuck on its first blocking ITM write" diagnosis is
+RETRACTED. The M3 CPU is proven healthy and running normally; the real
+Phase E blocker is now conclusively isolated to the PL-side capture
+chain (`orbtrace_pl.v`'s DDR capture/CDC/sync-detection logic), not the
+M3 or its ITM/TPIU state.**
+
+Rebuilt `m3_app` (verifying freshness via `strings`/`nm` this time, per
+the lesson above), reflashed `hybrid-fix3` + the current `a53_app`,
+loaded via D2 (clean, as expected now), then added a few more latched
+diagnostics to `sdk/bsp/m3/itm.h`/`m3_app`'s `main.c` — same technique
+as `g_tpiu_sspsr_at_boot` (a normal SRAM global, readable via the A53's
+AXI preload window, since the M3's own Private Peripheral Bus/ITM/TPIU
+registers are *not* reachable that way — only via the M3's own
+JTAG-DAP, which needs Phase G's real-DAP route, not wired up yet):
+
+- **`M3_TPIU_SSPSR` (Supported Parallel Port Sizes) = `0x0000000b`** —
+  bits 0, 1, 3 set = 1-bit, 2-bit, **and 4-bit** all genuinely supported
+  by this synthesized instance. Conclusively rules out the "this
+  DesignStart FPGA edition doesn't implement a functional parallel
+  port" contingency from the `Not yet determined` list two updates up —
+  the 4-bit port firmware actually selects is real and silicon-supported.
+- **`M3_ITM_TCR` readback = `0x00010009`** — exactly the value
+  `m3_itm_init()` wrote (`ITMENA|TXENA|(1<<TRACEBUSID_SHIFT)`, no bits
+  silently cleared). The ITM enable sequence genuinely took effect.
+- **`M3_ITM_STIM(0)` (bit 0 = FIFOREADY) = `0x00000001`, i.e. ready** —
+  read immediately after `m3_itm_init()`, before the first
+  `m3_itm_write()` call. **This directly contradicts the 2026-08-16 ILA
+  finding** ("the real firmware's very first blocking `m3_itm_write()`
+  call inside `emit_next()` never returns"). If the FIFO is ready at
+  this exact point, the first write should not have blocked at all.
+- **Decisive follow-up: added `g_heartbeat` (incremented once per
+  `emit_next()` call, i.e. once per successful pass through the loop
+  including its STIM writes) and sampled it three times over real
+  wall-clock time via JTAG:** `2707` → (1s later) `2940` → (2s more)
+  `3406` — incrementing steadily at roughly the expected rate given the
+  firmware's own busy-wait delay loop. **The CPU is genuinely,
+  continuously executing `emit_next()` in a normal loop right now,
+  including real STIM writes succeeding — not stuck at all.**
+
+**What this means:** the 2026-08-16 "STIM FIFO never ready" diagnosis —
+which drove the entire subsequent Phase E narrative in this document —
+was almost certainly a downstream artifact of the M3 BRAM corruption bug
+that was *also* active that day (per this same document's own
+2026-08-17 "why this matters" reasoning, written *before* today's proof:
+a CPU NOP-sliding through 75%-zeroed memory could easily produce
+exactly that appearance without ever reaching real branch/loop-control
+logic). With the BRAM bug now genuinely fixed and the loaded image
+verified correct, the CPU has no trouble at all with the ITM/STIM path.
+
+**Re-ran the actual Phase E capture with the now-proven-healthy CPU
+running:** `orbtrace configure 192.168.1.50 m3 tpiu4 2000000` + `start`
+still shows `rx_bytes=0`, `dropped_bytes`/`sync_loss` in the tens/
+hundreds of millions, `fifo_high_water` pegged at max (63/63) — **the
+exact same symptom as before, but now with the M3 side conclusively
+ruled out as the cause.** The real bytes the CPU is producing are
+reaching *something* in the PL (dropped/sync-loss counts are large and
+nonzero, not just idle silence), but Orbtrace's own capture/demux logic
+never finds the sync pattern it's looking for. This narrows the
+remaining investigation entirely onto `orbtrace_pl.v`'s M3 DDR capture
+chain — the CDC FIFO between `trace_clk_m3` and `aclk`, and/or the
+sync-pattern detection logic — which has not yet been the subject of
+its own dedicated investigation (all prior ILA work tapped `TRACECLK`/
+`TRACEDATA` at the `m3_core` IP boundary, upstream of this logic, to
+verify the CPU's own output — not the capture chain that consumes it).
+
+### Next steps
+
+1. Real ILA capture, this time tapping *downstream* of `m3_core` —
+   either `trace_pl`'s own internal CDC FIFO write/read sides, or the
+   demux/sync-detection logic in `orbtrace_pl.v` — to see whether the
+   CDC FIFO is genuinely keeping up with `trace_clk_m3`'s actual rate,
+   and whether the expected `0xFFFFFF7F` sync pattern ever actually
+   appears in what the FIFO produces.
+2. Static RTL review of `orbtrace_pl.v`'s M3 DDR capture path first
+   (free, no hardware) — compare it structurally against the PS trace
+   path's equivalent logic (which is known-working, per the earlier
+   "Achieve sustained 400 Mbit/s Orbtrace streaming" milestone) to spot
+   any M3-specific difference before spending ILA rebuild time.
+3. Once real trace data flows (`rx_bytes > 0`, `dropped_bytes`/
+   `sync_loss` near zero), proceed to Phase F (decode `captured.bin` and
+   diff against the Rust `Workload` reference) and Phase G (real JTAG
+   debug path) as originally planned.
+
+Board left on `hybrid-fix3` with the current `a53_app` (all diagnostics
+kept) and the diagnostic-enhanced `m3_app` (SSPSR/TCR/STIM0/FFSR/FFCR/
+heartbeat latches), M3 running, responsive at session end.
 
 ## Phase E — Configure Orbtrace and start capture (original plan text)
 

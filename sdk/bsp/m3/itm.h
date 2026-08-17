@@ -31,6 +31,7 @@
 #define M3_TPIU_SPPR_SWO_MANCHESTER 1u
 #define M3_TPIU_SPPR_SWO_NRZ 2u
 #define M3_TPIU_CSPSR (*(volatile uint32_t *)0xE0040004UL) /* Current sync port size (1/2/4-bit trace port) */
+#define M3_TPIU_FFSR (*(volatile uint32_t *)0xE0040300UL)  /* Formatter and flush status (RO) */
 #define M3_TPIU_FFCR (*(volatile uint32_t *)0xE0040304UL)  /* Formatter and flush control */
 
 /* Enables tracing and stimulus ports 0-7 with the default synchronous
