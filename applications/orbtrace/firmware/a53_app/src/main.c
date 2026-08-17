@@ -644,8 +644,18 @@ static void control_thread_entry(ULONG arg)
 {
     (void)arg;
 
+    /* backlog 4U, not 1U: confirmed via JTAG (M3_TRACE_VERIFICATION_PLAN.md's
+     * 2026-08-17 D2 investigation) that a single TCP handshake can get stuck
+     * at NX_TCP_SYN_RECEIVED and never complete -- with backlog 1U that one
+     * stuck half-open connection permanently starves every later connection
+     * attempt on this port, since nx_tcp_server_socket_accept only ever
+     * waits on the single queued slot. A backlog >1 lets NetX's listen queue
+     * hold several pending handshakes independently, so a later one reaching
+     * NX_TCP_ESTABLISHED can still be accepted even while an earlier one
+     * never resolves. Doesn't address why that ACK is lost in the first
+     * place, only stops one bad connection from wedging the whole service. */
     UINT listen_status = nx_tcp_server_socket_listen(&ip, ORBTRACE_CONTROL_PORT, &control_socket,
-                                                      1U, NX_NULL);
+                                                      4U, NX_NULL);
     xil_printf("orbtrace: control socket listen = %d\r\n", listen_status);
 
     for (;;) {

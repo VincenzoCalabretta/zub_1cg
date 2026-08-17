@@ -1135,6 +1135,91 @@ gets stuck, though it wouldn't explain the root cause. Not yet
 implemented this session — flagged here for the next session or for
 explicit approval before changing firmware behavior.
 
+**Update 2026-08-17 (continued): tried the backlog fix — it does NOT
+unblock D2. Confirmed this is not a queueing/starvation problem at all:
+the exact same single connection independently fails its own handshake
+every time, regardless of backlog.**
+
+Applied `main.c`'s backlog change (`1U` → `4U`, with a comment recording
+the rationale), rebuilt (`bazel build
+//applications/orbtrace/firmware/a53_app:a53_app`), reflashed via
+`jtag_flash.sh` — no Vivado rebuild needed, this cycle took under a
+minute. Retested `orbtrace load-m3`: **hangs identically**, exit code 1,
+`Resource temporarily unavailable`. Re-read `control_socket`'s state
+live: still `4` (`NX_TCP_SYN_RECEIVED`). Also retested with `load-m3` as
+the **first and only** command issued on a completely fresh reflash (no
+preceding `info` calls at all, ruling out any effect from a growing
+connection count): identical hang, identical stuck state. This
+conclusively rules out "one earlier bad connection's queue slot blocks
+later ones" — the very first, only connection attempt from `load-m3`
+fails its *own* handshake every single time, deterministically, no
+matter how many free backlog slots exist. The backlog change is
+harmless/correct defensively (matches good NetX practice generally) but
+is not the fix and has been left in place without further claims about
+what it does or doesn't solve.
+
+**Followed the lead from a near-identical historical bug
+(`documentation/ORBTRACE_TEST_REPORT_2026-08-08.md`'s "NetX's ARP table
+holds a wrong destination MAC for the host, despite ARP itself resolving
+correctly") — checked whether it has recurred. It has not, at least not
+in the same form:** that report's diagnosis was a race in vendored
+NetX's own ARP table (`_nx_arp_packet_receive.c`), worked around by this
+driver's own local IP→MAC cache (`gem2_arp_learn()`/`gem2_arp_lookup()`,
+`Gem2Ctx.arp_cache_*`), which `gem2_packet_send()` prefers over NetX's
+(possibly racy) resolved address whenever it has a hit. Read the live
+driver-local cache during a reproduction: `arp_cache_count=1`,
+`entry[0]`: IP `0xc0a80101` (192.168.1.1, this host) → MAC
+`00:e0:4c:75:87:68` — **exactly correct**, byte for byte, matching `ip
+link show`'s real value. So the specific, previously-documented ARP
+corruption is not what's happening this time.
+
+**Tried to check whether the SYN-ACK actually went out with the right
+destination MAC via `gem2_packet_send()`'s own `diag_last_tx_dst_msw/lsw`
+diagnostic fields (added in the 2026-08-08 investigation specifically for
+this) — inconclusive, and surfaced a real limitation of this session's
+JTAG-only method.** Found these fields' exact runtime addresses the same
+compiler-verified way as before (disassembling `gem2_diag_get_tx_dst`).
+Read back `0xefefefef` — an untouched/poison pattern — for both,
+**despite `diag_tx_frames` independently reading `13`** (`gem2_packet_send`
+increments both `diag_last_tx_dst_msw/lsw` — unconditionally, near the
+top of the function, for every call that reaches that far — and
+`diag_tx_frames` — later, only on a successful, non-dropped send — in
+the same function body, no branch in between that skips one but not the
+other). A real send completing 13 times while its own earlier diagnostic
+write appears never to have happened is a contradiction the source can't
+explain on its own. Ruled out an address-computation mistake (re-derived
+from a fresh disassembly of the just-rebuilt ELF, byte-identical
+offsets; the neighboring `tx_head`/`tx_tail`/`tx_count`/`isr_calls`
+fields, computed via the exact same base-pointer method, read back
+sensible, correctly-changing values across repeated checks). **Most
+likely explanation: a genuine cache-coherency gap, not a code bug** —
+nothing in `gem2_packet_send()` explicitly flushes this specific struct
+region to DRAM the way it does for the TX buffer/BD ring (which DMA
+needs coherent), and this session's JTAG memory reads go through the
+debug port directly to DRAM, bypassing the A53's D-cache entirely — so a
+value the CPU wrote and reads back correctly from its own cache can
+still appear stale/untouched to an external JTAG peek if it was never
+evicted/flushed. **This means this specific field cannot be trusted via
+JTAG alone, and by extension, any single "surprising" JTAG read in this
+investigation that isn't cross-checked against an independently-changing
+counter (like `isr_calls`, which visibly increments run to run and is
+therefore known-fresh) should be treated with the same suspicion** — a
+real methodological caveat for whoever continues this, not just a dead
+end on the MAC-address question specifically.
+
+**Net conclusion for this session:** the actual defect remains
+unidentified. Ruled out: GEM2 DMA/hardware health (clean), the
+previously-documented ARP-table race (driver-local cache is correct),
+and connection-queue starvation (backlog fix has zero effect, same
+single connection fails every time regardless). Not ruled out, not
+confirmed either: a wrong-destination-MAC SYN-ACK via some other
+mechanism (JTAG couldn't get a trustworthy read on this specific
+question), a NetX-internal issue unrelated to this driver, or something
+requiring the live diagnostic prints (`diag`/`diag2`-`diag8`,
+already-instrumented in `main.c`) that only a real serial cable can
+surface reliably. Board left on the unmodified `hybrid-fix2` PL bitstream
+with the backlog-adjusted A53 firmware, responsive at session end.
+
 ## Phase E — Configure Orbtrace and start capture (original plan text)
 
 Using the `orbtrace` host CLI (`applications/orbtrace/model`):
