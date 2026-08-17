@@ -1056,6 +1056,85 @@ prints (`rx_bd_base`, `txqbase`, etc. — same technique used here for the
 ThreadX TCB) to see the actual socket/ring state at the moment
 `_nx_tcp_server_socket_accept` is stuck, without needing a UART at all.
 
+**Update 2026-08-17 (continued): took path (b) — pinned it down further.
+`control_socket.nx_tcp_socket_state = 4` (`NX_TCP_SYN_RECEIVED`) at the
+moment of the hang. The TCP 3-way handshake never completes; it does not
+just fail to see a new connection attempt.**
+
+Found `nx_tcp_socket_state`'s exact offset (`+84`/`0x54`) the same way as
+the ThreadX TCB fields — not from NetX Duo's header layout (which would
+need computing through `NX_TCP_SOCKET`'s many preceding fields by hand,
+error-prone) but straight from the **compiler's own generated code**:
+disassembled `_nx_tcp_server_socket_accept` itself
+(`nx_tcp_server_socket_accept.o`, address `0x7140` in the ELF) and read
+off its own `ldr w0, [x0, #84]; cmp w0, #0x5` (checking for
+`NX_TCP_ESTABLISHED`) at the very top — a technique worth reusing for any
+future NetX/ThreadX struct-offset need, since it's immune to hand-arithmetic
+mistakes (which is what happened trying to hand-derive `Gem2Ctx`'s layout
+byte-by-byte from its `.c` struct definition below — `tx_buf`'s declared
+`[64][10240]` size alone (655,360 bytes) doesn't fit inside the compiled
+struct's actual reported size (`nm -S`: `0x19640` = 104,000 bytes) at
+all, meaning something about the field either isn't what the source
+currently shows or isn't sized the way it looks — never resolved, and
+irrelevant once the compiler's own generated offsets were used instead
+via the same `gem2_diag_get*` accessor-disassembly method).
+
+Read `control_socket` (`0x534e8`, from `nm`) `+84` directly via JTAG
+while the hang was live: **`4` = `NX_TCP_SYN_RECEIVED`**, not `2`
+(`NX_TCP_LISTEN_STATE`, which would mean "genuinely idle, nothing
+attempted a connection yet"). A client's SYN was received and (per
+`_nx_tcp_server_socket_accept`'s own logic, which treats `LISTEN`/
+`SYN_RECEIVED` as the two "keep waiting" states before calling
+`_nx_tcp_socket_thread_suspend`) the board's side of the handshake got
+as far as sending a SYN-ACK — but the final ACK that would move the
+connection to `ESTABLISHED` never arrived or never got processed, and it
+just sits there forever (waited past 90s with no recovery, confirmed
+earlier). This also revises the earlier "the M3Control request was
+already handled" reading of `LOCK=0` — more likely `orbtrace_control_feed`
+was **never called at all** for this connection, since NetX never hands
+an unestablished connection up to the application; `LOCK=0` is simply
+because nothing ever acquired it for this connection, not evidence of a
+completed handshake.
+
+**GEM2 hardware/DMA itself checked clean at the same moment (rules out a
+DMA/BD-ring stall as the cause):** `diag_isr_calls=37`, `diag_rx_frames=22`,
+`diag_tx_frames=13` (real interrupt-driven traffic has been flowing all
+session, not frozen); `tx_head==tx_tail==13`, `tx_count=0` (TX ring fully
+drained, nothing in flight); all 4 dumped TX BD slots show the hardware
+`USED` bit set (`stat` values all have bit31 set, e.g. `0x80008036` —
+successfully completed, not stuck); all 4 dumped RX BD slots show
+`stat=0`, consistent with `rxused_count=0` (nothing currently pending,
+not backed up); `GEM2_NWSR`/`ISR`/`RXSR` registers show ordinary
+steady-state values, nothing resembling a link-down or DMA-halt pattern.
+`diag_tx_recover_attempts=2` (the existing watchdog *has* intervened
+twice this session, confirming the driver's own self-healing logic is
+active and not itself wedged) but that's a separate, already-known
+recovery path, not what's blocking `control_socket` right now.
+
+**Not yet determined:** *why* this specific handshake's final ACK is
+lost/unprocessed — `diag_last_tx_dst_msw/lsw` (the last-TX destination
+MAC, which would settle the "wrong ARP entry" hypothesis directly) read
+back `0xefefefef` (an uninitialized-memory pattern), meaning that
+particular diagnostic capture point was never exercised this session and
+can't confirm or rule out a stale/wrong ARP-cache-driven MAC on the
+SYN-ACK. Whether this specific stuck connection is the CLI's own
+`load-m3` attempt (most likely, given it's the deterministic trigger
+every time) or some later retry queued behind it (given
+`nx_tcp_server_socket_listen`'s backlog of `1U` means only one pending
+connection can ever be tracked at a time) is also not yet distinguished —
+either way, `backlog=1U` means whichever connection gets stuck this way
+blocks every later one until a reflash.
+
+**Next step, concrete and cheap (A53 firmware rebuild + `jtag_flash.sh`
+only — no Vivado rebuild needed):** try raising
+`nx_tcp_server_socket_listen`'s backlog (`main.c`, currently `1U`) so a
+single stuck half-open connection can't starve every later attempt, as a
+first mitigation to test/confirm this theory in practice — this would
+very likely unblock D2 even without understanding *why* one handshake
+gets stuck, though it wouldn't explain the root cause. Not yet
+implemented this session — flagged here for the next session or for
+explicit approval before changing firmware behavior.
+
 ## Phase E — Configure Orbtrace and start capture (original plan text)
 
 Using the `orbtrace` host CLI (`applications/orbtrace/model`):
