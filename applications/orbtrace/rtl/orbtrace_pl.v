@@ -38,7 +38,9 @@ module orbtrace_pl (
     // single-bit input internally), muxed by source_select instead.
     wire [7:0] m3_trace_byte, m3_cdc_data;
     wire m3_trace_valid, m3_cdc_valid, m3_cdc_ready, m3_cdc_write_ready;
-    wire [5:0] m3_cdc_level;
+    // 11 bits, not 6: M3_TRACE_CDC_DEPTH_LOG2 below widens this FIFO past the
+    // default depth (see that parameter's own comment for why).
+    wire [10:0] m3_cdc_level;
     reg [31:0] m3_high_water;
     reg m3_cdc_overrun;
     reg [63:0] m3_cdc_drops, m3_cdc_drops_gray;
@@ -135,7 +137,22 @@ module orbtrace_pl (
     orbtrace_ddr_capture m3_capture(.trace_clk(trace_clk_m3),.reset_n(m3_trace_reset_n),
         .enable(running_trace_m3_s && format_trace_m3_s<=2),.width_select(format_trace_m3_s[1:0]),
         .trace_data(trace_data_m3),.byte_data(m3_trace_byte),.byte_valid(m3_trace_valid));
-    orbtrace_async_fifo m3_trace_fifo(.write_clk(trace_clk_m3),.write_reset_n(m3_trace_reset_n),.write_data(m3_trace_byte),
+    // M3_TRACE_CDC_DEPTH_LOG2=10 (1024 entries), not the default 5 (32):
+    // 2026-08-17 investigation (M3_TRACE_VERIFICATION_PLAN.md) found the
+    // M3's own TPIU, in Parallel/4-bit mode, asserts byte_valid on every
+    // single trace_clk_m3 cycle continuously (documented CoreSight
+    // half-sync/idle-frame formatter behavior, not a bug) -- this FIFO has
+    // to absorb that never-idle production rate, unlike the PS trace path's
+    // fifo (left at the default depth; it has its own separately-proven
+    // "sustained 400 Mbit/s" track record and this session found no reason
+    // to touch it). A deeper FIFO here is a direct, low-risk test of
+    // whether the observed rx_bytes=0/dropped_bytes-in-the-millions/
+    // fifo_high_water-pegged symptom is a genuine sustained bandwidth
+    // mismatch (a bigger buffer would only delay, not fix, permanent
+    // overflow) versus enough headroom being sufficient on its own.
+    localparam M3_TRACE_CDC_DEPTH_LOG2 = 10;
+    orbtrace_async_fifo #(.DEPTH_LOG2(M3_TRACE_CDC_DEPTH_LOG2)) m3_trace_fifo(
+        .write_clk(trace_clk_m3),.write_reset_n(m3_trace_reset_n),.write_data(m3_trace_byte),
         .write_valid(m3_trace_valid),.write_ready(m3_cdc_write_ready),.write_level(m3_cdc_level),
         .read_clk(aclk),.read_reset_n(aresetn),.read_data(m3_cdc_data),.read_valid(m3_cdc_valid),.read_ready(m3_cdc_ready));
     always @(posedge trace_clk_m3) begin

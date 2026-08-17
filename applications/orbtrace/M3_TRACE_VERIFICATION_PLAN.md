@@ -1654,19 +1654,92 @@ most plausibly measured real, useful trace load rather than an eternal
 first moment is exactly what this architecture would produce — no
 sync-detection bug required at all.
 
-**Not yet tested — the natural next experiment, but it costs a real
-Vivado rebuild (not free), so flagging rather than doing unilaterally:**
-lower `trace_clk_m3`'s source frequency (`create_bd.tcl`'s
-`PSU__CRF_APB__DBG_TRACE_CTRL__FREQMHZ`, currently `100`) and retest —
-if `rx_bytes` becomes nonzero at a lower rate, that directly confirms
-the bandwidth-mismatch hypothesis and points straight at the real fix
-(run the M3 trace clock slower, or find/increase downstream throughput
-headroom). This is a more targeted, higher-information experiment than
-another blind ILA capture, and produces real value either way (fixes it
-outright, or gives the next ILA session a specific rate to look for
-instead of searching blind). Not attempted this session — a full
-synth/impl/route cycle (~30-90 min) is a meaningful cost to spend
-without checking in first.
+**Correction before attempting the above: `PSU__CRF_APB__DBG_TRACE_CTRL__FREQMHZ`
+was the wrong parameter, and simply lowering it wouldn't have worked
+anyway.** Checked `create_bd.tcl` again before spending the rebuild:
+`PSU__CRF_APB__DBG_TRACE_CTRL__FREQMHZ` drives `ps/trace_clk_out`, which
+only feeds `trace_pl/trace_clk` — the **PS's own** trace clock, entirely
+unrelated to the M3's `TRACECLK`. `m3_core/HCLK` (and hence its
+internally-derived `TRACECLK`, "the IP's own output... not tied to
+pl_clk0 directly, even though HCLK feeds both") is tied to `ps/pl_clk0`
+— **the exact same clock that also drives `aclk`**, the downstream
+consumer side (`control_ic`, `data_ic`, the CDC FIFO's read clock,
+`m3_core_ic`, everything). Lowering that one shared clock would slow
+the M3's production rate and the downstream consumption rate by the
+same factor, changing nothing about their relative ratio. Genuinely
+decoupling them would require a new, independent PS clock output *and*
+re-clocking the M3's entire AXI interconnect path (`m3_core_ic`,
+`m3_mem_ctrl_core`) to bridge a new clock domain — a materially bigger,
+riskier change than a one-line parameter edit, with real potential to
+regress the BRAM load path this session already spent so much effort
+fixing. Not attempted.
+
+**Safer alternative implemented and tested instead: widen the M3 trace
+CDC FIFO from 32 entries to 1024 (`orbtrace_pl.v`'s `m3_trace_fifo`,
+`DEPTH_LOG2` 5→10 via a new `M3_TRACE_CDC_DEPTH_LOG2` localparam,
+scoped to the M3 path only — the separately-proven PS trace path's FIFO
+is untouched). No clock changes, no new domains, minimal risk to
+anything else.** Syntax-checked clean via Vivado `check_syntax` before
+committing to the rebuild. Full production build
+(`bazel-out/orbtrace-vivado-hybrid-fix4`) passed all gates cleanly.
+Flashed, reloaded M3 via D2 (still clean — the BRAM fix is unaffected,
+as expected), re-ran the Phase E capture:
+
+```
+rx_bytes=0 dropped_bytes=100927045 sync_loss=55566131 fifo_high_water=2047 dma_faults=0
+```
+
+**Definitive result: `fifo_high_water=2047` — the FIFO's new maximum,
+32× the old ceiling — is reached and stays pegged, `rx_bytes` is still
+exactly `0`.** A 32× bigger buffer changed nothing about the outcome.
+This conclusively rules out "just needed more headroom for a transient
+burst" — the mismatch is **sustained**, not bursty: given enough
+wall-clock time (2 seconds, easily enough for even a 32-entry FIFO to
+have cycled many times over if drainable at all), the write side
+permanently outpaces the read side regardless of buffer depth. The
+bandwidth-mismatch hypothesis is now confirmed, not just plausible.
+
+**What this actually implies for a fix, and why it's a real fork in
+the road, not another incremental diagnostic step:** the M3's Parallel-
+mode production rate is architecturally fixed at 1 byte per
+`trace_clk_m3` cycle, continuously, forever (CoreSight formatter
+behavior, not something firmware can throttle) — at `trace_clk_m3`'s
+nominal ~100MHz, that's a worst-case ~800 Mbit/s *sustained, forever*
+production rate. The PS trace path's own proven "sustained 400 Mbit/s"
+milestone almost certainly reflects real, bursty CoreSight trace tied
+to actual PS execution/debug events — not an artificial, permanent,
+100%-duty-cycle idle-fill stream — so it may never have exercised the
+shared downstream pipeline's (`orbtrace_core`'s demux/packetizer/
+encoder, DMA, NetX, GEM2 — all common to both sources) *true* ceiling
+the way the M3's worst-case output does. Two real paths forward from
+here, meaningfully different in scope and risk:
+1. **Make Parallel mode work anyway** — either genuinely decouple
+   `trace_clk_m3` from `aclk` with a slower, independent PS clock (the
+   AXI-interconnect re-clocking risk above), or find and raise a real
+   throughput ceiling somewhere in the shared downstream pipeline.
+   Unknown effort, unknown whether it's even achievable at the rate the
+   M3 demands.
+2. **Pivot to SWO** — already partially scoped by this same document's
+   2026-08-17 (earlier) research: `CM3DbgAXI/component.xml` has a real,
+   dedicated `SWV` pin, and the concrete fix is already identified
+   (thread `m3_core/SWV` through `create_bd.tcl` into `orbtrace_pl`,
+   correct the two SWO mux expressions in `orbtrace_pl.v` that currently
+   read `trace_data_m3[0]` instead). SWO's rate is software-configured
+   (the existing `swo_baud`/`orbtrace configure ... 2000000` parameter,
+   currently 2 Mbit/s) — trivially far below any plausible pipeline
+   ceiling, sidestepping this entire class of problem. Real cost: a
+   different RTL/firmware path to build and verify, another rebuild
+   cycle, and it changes Phase 1's original "4-bit parallel CoreSight
+   trace source" framing to "SWO serial trace source."
+
+**Paused here rather than picking a direction unilaterally** — this is
+a genuine architectural fork affecting how Phase 1's whole premise gets
+delivered, not another incremental diagnostic. Board restored to a
+clean, responsive state (`orbtrace stop`, M3 still loaded and running)
+on `hybrid-fix4` (BRAM fix + widened M3 CDC FIFO, both confirmed
+working; the FIFO widening is harmless and kept regardless of which
+direction comes next). `a53_app` unchanged from the last session update
+(backlog fix, ARP fixes, all diagnostics).
 
 Board left on `hybrid-fix3` with the current `a53_app` (all diagnostics
 kept) and the diagnostic-enhanced `m3_app` (SSPSR/TCR/STIM0/FFSR/FFCR/
