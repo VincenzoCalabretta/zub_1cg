@@ -15,10 +15,10 @@ testing capabilities" the M3 integration was built for.
 | A | Acquire and confirm the M3 IP | DONE |
 | B | Fix every `CONFIRM` marker in `create_bd.tcl` | DONE |
 | C | Build, flash, and bring up the board | DONE — hybrid build passes all gates (WNS=+0.071ns, CDC/methodology clean), flashed to real hardware, `orbtrace info` confirms `ZUBoard-Orbtrace/1` |
-| D | Load the M3 firmware image | DONE (D1/JTAG path). Two distinct hardware bugs found and fixed across 2026-08-16/17: (1) `axi_bram_ctrl` defaulted to dual-port mode with an unconnected, tied-off second port (fixed: `SINGLE_PORT_BRAM {1}`); (2) a later regression, a 4:1 word-drop caused by a write-data pacing fault inside `control_ic` (smartconnect), fixed 2026-08-17 by routing `m3_mem_ctrl` through a dedicated `axi_interconnect` (`m3_mem_ctrl_ic`) instead of `control_ic`'s M02 leg — verified 16/16 words correct via direct JTAG `mwr`/`mrd` and via `load_m3.tcl`. D2 (`orbtrace load-m3`, native A53 path) is separately blocked, but root-caused as NOT a hardware bug at all — see below |
-| E | Configure Orbtrace and start capture | BLOCKED on D2 (or a D1-only workaround) before the real ITM/TPIU STIM-FIFO-stall investigation from 2026-08-16 can be trusted — that investigation ran against a firmware image that, in hindsight, may never have loaded correctly |
-| F | Verify the captured trace is genuinely correct | NOT STARTED — blocked on E |
-| G | Verify the real JTAG debug path | NOT STARTED — blocked on E; the JTAG-DAP bit-bang path to `m3_control` was previously confirmed working and is unrelated to D2's NetX-level block (different code path entirely) |
+| D | Load the M3 firmware image | **DONE — both D1 and D2 confirmed fully working**, 2026-08-17. Two hardware bugs fixed (dual-port tied-off BRAM port; a write-pacing 4:1 word-drop fixed by routing `m3_mem_ctrl` through a dedicated `axi_interconnect`) plus a real vendored NetX ARP-table race fixed (see below) — but D2's long "hang" this session turned out to be **two stacked build/flash mistakes, not a design bug**: `jtag_flash.sh` was repeatedly given a stale (`2026-08-09`) `a53_app_elf` artifact instead of the freshly-rebuilt `a53_app` symlink, so none of this session's firmware edits were ever actually running; independently, the board was flashed with `hybrid-fix2` (the *pre*-BRAM-fix bitstream) instead of `hybrid-fix3` during the whole D2 investigation. Once both were corrected, D2 completes cleanly and repeatably, including as the very first command after a fresh reflash. See the 2026-08-17 "stale artifact" correction below for the full account |
+| E | Configure Orbtrace and start capture | **UNBLOCKED** — D1 and D2 both load real, correct firmware now; the Phase E ITM/TPIU STIM-FIFO-stall investigation from 2026-08-16 needs re-running from scratch, since it ran against firmware images that (per Phase D's whole history this session) may never have loaded correctly |
+| F | Verify the captured trace is genuinely correct | NOT STARTED — unblocked, follows E |
+| G | Verify the real JTAG debug path | NOT STARTED — unblocked (the JTAG-DAP bit-bang path to `m3_control` was previously confirmed working) |
 
 Phases 1 through D are all done and verified against real hardware, not
 just tooling or reasoning — this includes a full synth/impl/route cycle on
@@ -1420,9 +1420,107 @@ The temporary `serve_control()` diagnostic print was left in place
 "temporary" bring-up `xil_printf` instrumentation around — `diag`
 through `diag8` are all still-present examples from earlier sessions),
 since it is cheap and remains useful for exactly this class of
-investigation going forward. Board left on the unmodified `hybrid-fix2`
-PL bitstream, with the ARP-race-patched, backlog-adjusted,
-serve_control-diagnostic-added A53 firmware, responsive at session end.
+investigation going forward.
+
+**Update 2026-08-17 (continued): D2 is FIXED. The entire "hang"
+investigated across this whole session's D2 work — the M3_CONTROL AXI
+hang, the NetX/SYN_RECEIVED finding, today's ARP-race investigation —
+was chasing symptoms of two stacked build/flash mistakes, not (only) a
+design bug. Both are now identified, corrected, and D2 works cleanly and
+repeatably, including as the very first command after a fresh reflash.**
+
+**Mistake 1 — wrong firmware artifact, present for essentially this
+entire session's D2 testing.** `jtag_flash.sh` was repeatedly invoked
+with `bazel-bin/applications/orbtrace/firmware/a53_app/a53_app_elf` as
+its ELF argument. That file is a **flat, unrelated build output dated
+2026-08-09** — eight days stale, from an earlier session's explicit
+`bazel build --platforms=//sdk/platforms:apu_a53
+//applications/orbtrace/firmware/a53_app:a53_app_elf` invocation (a
+recipe documented in `ORBTRACE_TEST_REPORT_2026-08-08.md`). Every
+`bazel build //applications/orbtrace/firmware/a53_app:a53_app` run this
+session (the correct, transition-based invocation, no explicit
+`--platforms`) updates a *different* artifact: `bazel-bin/.../a53_app`,
+a **symlink** into a platform-transitioned output directory
+(`k8-fastbuild-ST-<hash>/.../a53_app_elf`) — never the flat
+`a53_app_elf` path. So every `jtag_flash.sh` call this session flashed
+firmware that predated not just today's `main.c` edits (the backlog
+change, both diagnostic prints) but potentially other, earlier-session
+changes too — while every subsequent edit-rebuild-reflash-retest cycle
+silently kept testing the exact same unchanged Aug-9 binary. Caught by
+`strings bazel-bin/.../a53_app_elf | grep <a string added today>` coming
+up empty, then confirmed the *correct* artifact
+(`strings "$(readlink -f bazel-bin/.../a53_app)" | grep ...`) did have
+it, with a fresh `2026-08-17` mtime. **The fix: always pass
+`bazel-bin/applications/orbtrace/firmware/a53_app/a53_app` (no `_elf`
+suffix) to `jtag_flash.sh`, matching the exact same symlink-vs-flat-file
+pitfall this file already documented for `m3_app` — this is now
+documented for `a53_app` too, since it bit a real session.**
+
+**Mistake 2 — wrong PL bitstream, independent of the first.** During
+the M3_CONTROL hang investigation earlier in this session, the board was
+deliberately reflashed to `hybrid-fix2` (the bitstream from *before*
+this session's `m3_mem_ctrl_ic` BRAM fix) specifically to isolate that
+investigation from the BRAM work. That was reasonable at the time — but
+every subsequent D2/NetX/ARP session turn kept using `hybrid-fix2`
+without ever switching back to `hybrid-fix3` (the bitstream that
+actually has the BRAM fix), including all of today's UART-based ARP
+investigation. This means the *real*, already-diagnosed 4:1 BRAM
+word-drop bug was silently active the entire time, and D2's
+"readback mismatch" / "hang before any response" symptoms were at least
+partly just that same old bug wearing a new disguise (once Mistake 1 was
+fixed and D2 actually started reaching real requests, its true failure
+mode reverted to exactly the historical 4:1 pattern: word 0 correct,
+words 1–3 zero, word 4 correct, ... — confirmed via direct JTAG `mrd`
+immediately after a `hybrid-fix2` D2 attempt).
+
+**Both fixed together, verified repeatedly on real hardware:**
+```sh
+XILINX_ROOT=/home/v/opt/vitis \
+XSCT=/home/v/opt/vitis/Vitis/2023.2/bin/xsct \
+PSINIT=bazel-out/orbtrace-vivado-hybrid-fix3/psu_init.tcl \
+BITSTREAM=bazel-out/orbtrace-vivado-hybrid-fix3/zub_orbtrace.bit \
+  tooling/xsct/jtag_flash.sh bazel-bin/applications/orbtrace/firmware/a53_app/a53_app
+```
+- **D2** (`orbtrace load-m3`): completes cleanly — `[1] Holding M3 in
+  reset...` → `[2] Streaming 748 bytes...` → `[3] Verifying reset-vector
+  words...` → `[4] Releasing M3 reset...` → `Done. M3 is running`. UART
+  capture during this run shows all 5 request/response cycles succeeding
+  at the protocol level (`GetInfo`, `M3Control`×2, `LoadM3Chunk`,
+  `ReadM3Bram`, response sizes exactly matching each command's expected
+  reply length) — the earlier "control socket receive failed status=56"
+  lines seen mid-investigation are the *normal*, expected signal for
+  "client closed this connection after getting its reply," not an error.
+  Repeated 3× including as the sole first command after a completely
+  fresh reflash — 100% reliable every time.
+- **D1** (`tooling/xsct/load_m3.tcl`): also retested on the same
+  `hybrid-fix3` flash — all 4 checked words correct
+  (`0x00010000`/`0x000002b9`/`0x000002d3`/`0x000002d3`), M3 releases and
+  reports running.
+
+**What this means for everything investigated earlier today:** the ARP
+sanity-check fix (Fix 1) and the vendored `_nx_arp_packet_receive.c`
+`TX_DISABLE`/`TX_RESTORE` patch (Fix 2) are both real, confirmed-live
+fixes for a genuine upstream race — kept, since they're correct and
+harmless regardless — but it is **not established that either was
+actually necessary for D2 to work**, since every test of them happened
+while Mistake 2 (`hybrid-fix2`) was still active, confounding the
+result. Given D2 now works reliably with everything applied together
+and re-isolating each variable would cost more real hardware cycles for
+a question that no longer blocks anything, this is left open rather than
+further investigated — worth revisiting only if the ARP corruption is
+ever independently suspected of causing a *different* symptom later.
+Similarly, the backlog change (`1U`→`4U`) and the temporary
+`serve_control()`/`receive_status` diagnostics are all kept as
+real, low-risk, still-informative additions, not reverted.
+
+**Lesson for any future session touching `a53_app`:** the `bazel-bin/.../a53_app_elf`
+path is a **trap** — it silently exists, silently looks like a
+plausible ELF to flash, and silently never updates via the normal build
+invocation. Always use `bazel-bin/applications/orbtrace/firmware/a53_app/a53_app`
+(the symlink) for `jtag_flash.sh`, and when in doubt whether a *specific*
+edit actually reached the flashed binary, verify with `strings` on the
+resolved artifact for a string unique to that edit before spending any
+more hardware-cycle time debugging.
 
 ## Phase E — Configure Orbtrace and start capture (original plan text)
 

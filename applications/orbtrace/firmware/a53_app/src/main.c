@@ -672,7 +672,16 @@ static void control_thread_entry(ULONG arg)
             xil_printf("orbtrace: control client connected\r\n");
             for (;;) {
                 NX_PACKET *packet;
-                if (nx_tcp_socket_receive(&control_socket, &packet, NX_WAIT_FOREVER) != NX_SUCCESS) {
+                /* Temporary bring-up diagnostic: 2026-08-17 D2 investigation,
+                 * continued -- the request provably arrives at the IP layer
+                 * (see ip_dump) but serve_control()'s own diagnostic never
+                 * fires, meaning this receive call itself must be the point
+                 * where the data is lost. Capture the real status code
+                 * instead of just branching on it, to see exactly which
+                 * NetX error (if any) this is. */
+                UINT receive_status = nx_tcp_socket_receive(&control_socket, &packet, NX_WAIT_FOREVER);
+                if (receive_status != NX_SUCCESS) {
+                    xil_printf("orbtrace: control socket receive failed status=%d\r\n", receive_status);
                     break;
                 }
                 serve_control(packet);
