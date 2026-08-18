@@ -1854,3 +1854,113 @@ Separate from trace capture, exercises `orbtrace_dap_engine.sv`'s
   attempted — still untested against real hardware. If Phase G's
   halt/read-PC doesn't respond, that's the first thing to check, not
   assume the wiring is wrong.
+
+## 2026-08-18 continuation — Phase E implementation closure
+
+- The Parallel/4-bit bandwidth direction was retained: M3 HCLK is on the
+  independent `pl_clk1` domain (38.889 MHz in the implemented design), while
+  the trace consumer remains at 100 MHz on `clk_pl_0`.  The AXI master path
+  uses the SmartConnect data FIFO and the trace path uses its own asynchronous
+  FIFO.
+- The initial 1024-entry M3 trace FIFO experiment was removed after a real
+  implementation showed that its asynchronous-read LUT RAM congested the
+  ZU1CG and failed timing.  At the reduced M3 clock the normal 32-entry FIFO
+  provides sufficient elasticity without a sustained-rate mismatch.
+- `orbtrace-vivado-hybrid-fix11` passed all production gates: WNS `+1.473 ns`,
+  WHS `+0.010 ns`, no failing endpoints, and no unwaived critical CDC or
+  methodology finding.  The only two newly-visible M3-TPIU-to-SWO CDC-11
+  findings are explicit pin-to-pin waivers into the already
+  `ASYNC_REG`-tagged first stages of the NRZ and Manchester synchronizers.
+  Bitstream SHA-256 is
+  `3f23b287922eaa393582b55d5aadea6aec06c457a66200de2ff48ee8d5d412b2`.
+- The signed-off bitstream, generated `psu_init.tcl`, and current A53 ELF were
+  flashed successfully through `tooling/xsct/jtag_flash.sh`.  UART diagnostics
+  show the A53 firmware running, DMA initialized (`dmasr=0x10009`), and the
+  board PHY linked (`phy_addr=7`, `link_up=1`).
+- Phase E's network capture remains pending external host connectivity: after
+  the reflash, this host had no USB-Ethernet network interface at all (only
+  `lo`, `wlo1`, and `wg1`), so it cannot reach the board at `192.168.1.50` to
+  upload `m3_app` or issue the `tpiu4` start/capture commands.  Reconnect or
+  re-enumerate the host USB-Ethernet adapter, restore its MAC-bound
+  `192.168.1.1/24` NetworkManager profile, then continue with Phase E/F.
+
+## 2026-08-18 hardware result — Parallel/4-bit branch rejected
+
+With the host adapter restored, the signed-off `hybrid-fix11` image was
+flashed again, `m3_app` was uploaded and released successfully, and Orbtrace
+was configured `source=m3`, `format=tpiu4`.  The implemented timing report
+confirms `clk_pl_1`/`trace_clk_m3` are really 38.889 MHz (25.714 ns), not the
+original 100 MHz.  Nevertheless, after starting capture, the live counters
+were `rx_bytes=0`, `fifo_high_water=63`, and rapidly growing
+`dropped_bytes`/`sync_loss` (about 100 million drops within the first sample;
+over 530 million by stop); `dma_faults=0`.  The UART shows the A53 firmware,
+PHY link, and trace DMA are healthy.
+
+This rejects the Phase E parallel-clock-decoupling branch as a functional
+solution: even its slowest implemented PS clock cannot sustain or correctly
+decode the M3 TPIU formatter stream.  Do **not** treat the timing-clean
+parallel bitstream as an end-to-end trace success.  The next implementation
+branch is SWO: configure `m3_app`'s TPIU for NRZ (or Manchester if required),
+select the matching existing Orbtrace decoder, and choose a baud rate safely
+below the receiver/DMA capacity before repeating upload/start/capture.  Reset
+the trace counters or reflash before assessing the SWO run, since the parallel
+drop counters are intentionally sticky diagnostics.
+
+## 2026-08-18 hardware result — first SWO-NRZ attempt still unverified
+
+`m3_app` was changed to configure the TPIU for NRZ SWO with `ACPR=18`
+(about 2.047 MHz from the verified 38.889 MHz HCLK), rebuilt through Bazel,
+uploaded, and captured with `source=m3`, `format=swo-nrz`, and matching
+`swo_baud=2046784`. `rx_bytes` remained zero and `sync_loss` immediately
+advanced, while `dma_faults` remained zero. The accumulated `dropped_bytes`
+and high-water values cannot assess this attempt because those diagnostics are
+sticky from the deliberately-overflowing Parallel run.
+
+Treat this as an SWO receiver/protocol-alignment defect, not a successful
+pivot. The current `orbtrace_swo_nrz.sv` assumes UART-like 8N1 framing and
+begins its 4x sampling phase directly from the synchronized falling-edge
+observation; verify that against the M3 TPIU's actual NRZ framing and align
+the first sample at a half-bit offset before relying on it. A lower-rate NRZ
+A/B test after a trace-counter reset/reflash is also appropriate.
+
+## 2026-08-18 hardware result — true 10 MHz M3 clock, SWO core proof, and Parallel/4-bit retest
+
+The prior `PSU__FPGA_PL1_ENABLE` request for 10 MHz had implemented as
+38.889 MHz, so the M3 HCLK was moved to a fabric `clk_wiz` driven by the
+100 MHz PL0 clock. The routed report for
+`bazel-out/orbtrace-vivado-m3-10mhz-r4` confirms both the Clocking-Wizard
+output and `trace_clk_m3` are 100 ns/10 MHz. The production build passed
+with WNS `+1.628 ns`, WHS `+0.010 ns`, only the two reviewed `CDC-11`
+waivers, and no unwaived critical methodology findings. Bitstream SHA-256:
+`04012169fe2893223a6e09ff15b8dafc3f58b22a79e4e6a1beb34c612f885dd7`.
+
+This reimplementation initially reintroduced the historical M3-BRAM
+preload symptom (only reset-vector word 0 survived; word 1 read back zero)
+through both TCP D2 and JTAG D1. Adding a fully registered AXI4 register
+slice directly before `m3_mem_ctrl` fixed it: after the r4 flash, D1 verified
+all four consecutive words and released the M3 successfully.
+
+SWO-NRZ was then run at `ACPR=18` (`~526316` baud at real 10 MHz) after a
+clean reflash. It still yielded `rx_bytes=0` with rising `sync_loss`, but
+the M3 is independently proven to execute: its BRAM-visible heartbeat moved
+from `676` to `686` over one second, while the latched TPIU/ITM values were
+`SSPSR=0x0000000b`, `TCR=0x00010009`, `STIM0=1`, `FFSR=8`, and `FFCR=258`.
+Therefore the remaining SWO problem is receiver/protocol decoding, not a
+stalled or misclocked M3 core.
+
+Finally, the firmware was returned to `m3_itm_init(2)` and a clean
+Parallel/4-bit test was performed on that same 10 MHz image. The M3 preload
+again verified all four words before release. After five seconds of
+`configure m3 tpiu4 2000000`/`start`, the counters were:
+
+```
+rx_bytes=0 dropped_bytes=250910394 sync_loss=30113981 \
+fifo_high_water=63 dma_faults=0
+```
+
+`stop` left the same functional result (`rx_bytes=0`, FIFO high-water
+pegged, no DMA fault). This rules out the M3 core-clock rate itself as the
+solution to Parallel/4-bit capture: a real 10 MHz M3 still produces an
+undecodable/overflowing parallel formatter stream. The next useful work is
+to correct the M3-specific capture/demux protocol path (and separately the
+SWO-NRZ receiver framing), not to reduce HCLK further.

@@ -18,7 +18,14 @@ module orbtrace_swo_nrz (
             if (output_valid && output_ready) output_valid <= 0;
             if (!active && !swo_s && !output_valid) begin active<=1; bit_index<=0; quarter<=0; end
             else if (active && sample_tick) begin
-                if (quarter == 2) begin
+                // A detected falling edge is the start of a UART-like NRZ
+                // start bit.  With a free-running 4x tick, sample at the
+                // first available half-bit phase (quarter==1), then at that
+                // same phase for every following bit.  quarter==2 sampled
+                // the start bit at about 3/4 bit and every data bit a full
+                // quarter-bit late; the real M3 SWO run consequently never
+                // produced a valid frame.
+                if (quarter == 1) begin
                     if (bit_index == 0 && swo_s) begin
                         active<=0;
                         malformed_count<=malformed_count+1'b1;

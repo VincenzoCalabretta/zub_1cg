@@ -49,6 +49,18 @@ static inline void m3_itm_init(uint32_t port_width_select) {
     M3_ITM_TCR = M3_ITM_TCR_ITMENA | M3_ITM_TCR_TXENA | (1u << M3_ITM_TCR_TRACEBUSID_SHIFT);
 }
 
+/* Configure asynchronous NRZ SWO. `acpr` is the architectural divider-minus-
+ * one, so with the 10 MHz M3 HCLK, acpr=18 yields about 526 kHz -- deliberately
+ * conservative for the PL receiver. */
+static inline void m3_itm_init_swo_nrz(uint32_t acpr) {
+    M3_DEMCR |= M3_DEMCR_TRCENA;
+    M3_ITM_LAR = M3_ITM_LAR_UNLOCK;
+    M3_TPIU_ACPR = acpr;
+    M3_TPIU_SPPR = M3_TPIU_SPPR_SWO_NRZ;
+    M3_ITM_TER = 0xffu;
+    M3_ITM_TCR = M3_ITM_TCR_ITMENA | M3_ITM_TCR_TXENA | (1u << M3_ITM_TCR_TRACEBUSID_SHIFT);
+}
+
 /* Blocks until the stimulus port FIFO has room, then writes one word. */
 static inline void m3_itm_write(uint32_t port, uint32_t value) {
     while (!(M3_ITM_STIM(port) & 1u)) {

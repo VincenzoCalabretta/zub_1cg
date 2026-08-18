@@ -22,6 +22,7 @@ set_property -dict [list \
     CONFIG.PSU__USE__S_AXI_GP2 {1} CONFIG.PSU__USE__IRQ {1} CONFIG.PSU__USE__IRQ0 {1} \
     CONFIG.PSU__FPGA_PL0_ENABLE {1} CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ {100} \
     CONFIG.PSU__CRF_APB__DBG_TRACE_CTRL__FREQMHZ {100} \
+    CONFIG.PSU__FPGA_PL1_ENABLE {1} CONFIG.PSU__CRL_APB__PL1_REF_CTRL__FREQMHZ {10} \
     CONFIG.PSU__TRACE__PERIPHERAL__ENABLE {1} CONFIG.PSU__TRACE__PERIPHERAL__IO {EMIO} \
     CONFIG.PSU__TRACE__WIDTH {4Bit} CONFIG.PSU__TRACE__INTERNAL_WIDTH {32} \
     CONFIG.PSU__MAXIGP0__DATA_WIDTH {32}] $ps
@@ -61,6 +62,12 @@ set_property CONFIG.NUM_SI {2} $data_ic
 # fix (or conclusively rule out) whatever control_ic itself is doing wrong.
 set m3_mem_ctrl_ic [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:* m3_mem_ctrl_ic]
 set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] $m3_mem_ctrl_ic
+# Keep the final hop into axi_bram_ctrl fully registered. This isolates the
+# BRAM write-data channel from control_ic's implementation-dependent internal
+# scheduling; it is the path that previously showed the 4:1 stale-WDATA drop
+# on hardware. The register-slice IP's default is the fully registered AXI4
+# datapath, preserving ordering while adding one safe PL0-clocked stage.
+set m3_mem_ctrl_slice [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_register_slice:* m3_mem_ctrl_slice]
 set rst [create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:* pl_reset]
 set trace [create_bd_cell -type module -reference orbtrace_pl trace_pl]
 set irq_concat [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconcat:* irq_concat]
@@ -123,7 +130,31 @@ set_property -dict [list \
 # AXI master interface is legal in Vivado (a benign "incomplete address
 # path" warning, not an error).
 set m3_core_ic [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:* m3_core_ic]
-set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] $m3_core_ic
+ # PS PL1's requested 10 MHz output realizes as 38.889 MHz on this ZU1CG.
+ # Use a fabric MMCM instead so the M3 HCLK/TRACECLK rate is genuinely
+ # 10 MHz for the Parallel/4-bit bandwidth A/B test; PL0 and all capture/DMA
+ # logic remain at 100 MHz.
+set m3_clk_10m [create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:* m3_clk_10m]
+set_property -dict [list CONFIG.PRIM_IN_FREQ {100.000} \
+    CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {10.000} CONFIG.NUM_OUT_CLKS {1} \
+    CONFIG.USE_RESET {false}] $m3_clk_10m
+# S00_HAS_DATA_FIFO {1} ("32_deep"): 2026-08-17 investigation
+# (M3_TRACE_VERIFICATION_PLAN.md's Phase E bandwidth-mismatch writeup)
+# found the M3's own TPIU, in Parallel mode, produces trace bytes at a
+# fixed worst-case rate tied directly to HCLK -- a genuine, *sustained*
+# bandwidth mismatch against the downstream capture pipeline (confirmed:
+# a 32x deeper CDC FIFO downstream made no difference at all). The real
+# fix is to give m3_core (and therefore its HCLK-derived TRACECLK) its
+# own independent, slower clock instead of sharing pl_clk0 with
+# everything else -- see the m3_core/HCLK connection below. Since
+# CM3_CODE_AXI3 is HCLK-synchronous (the IP has no separate bus clock,
+# confirmed via a real Vivado get_bd_pins probe: HCLK is its only clock
+# input), m3_core_ic's S00 leg becomes genuinely asynchronous relative
+# to its own ACLK/M00 leg (which stays on pl_clk0, matching
+# m3_mem_ctrl_core/m3_mem's unchanged 100MHz domain) for the first time
+# -- S00_HAS_DATA_FIFO enables the interconnect's own clock-conversion
+# logic for that leg, matching how PG059 documents mixed-clock usage.
+set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1} CONFIG.S00_HAS_DATA_FIFO {1}] $m3_core_ic
 set m3_mem_ctrl [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_bram_ctrl:* m3_mem_ctrl]
 set m3_mem_ctrl_core [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_bram_ctrl:* m3_mem_ctrl_core]
 # SINGLE_PORT_BRAM {1}: axi_bram_ctrl defaults to dual-port mode
@@ -181,7 +212,8 @@ connect_bd_intf_net [get_bd_intf_pins ps/M_AXI_HPM0_FPD] [get_bd_intf_pins contr
 connect_bd_intf_net [get_bd_intf_pins control_ic/M00_AXI] [get_bd_intf_pins trace_pl/s_axi]
 connect_bd_intf_net [get_bd_intf_pins control_ic/M01_AXI] [get_bd_intf_pins trace_dma/S_AXI_LITE]
 connect_bd_intf_net [get_bd_intf_pins control_ic/M02_AXI] [get_bd_intf_pins m3_mem_ctrl_ic/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins m3_mem_ctrl_ic/M00_AXI] [get_bd_intf_pins m3_mem_ctrl/S_AXI]
+connect_bd_intf_net [get_bd_intf_pins m3_mem_ctrl_ic/M00_AXI] [get_bd_intf_pins m3_mem_ctrl_slice/S_AXI]
+connect_bd_intf_net [get_bd_intf_pins m3_mem_ctrl_slice/M_AXI] [get_bd_intf_pins m3_mem_ctrl/S_AXI]
 connect_bd_intf_net [get_bd_intf_pins trace_pl/m_axis] [get_bd_intf_pins trace_dma/S_AXIS_S2MM]
 connect_bd_intf_net [get_bd_intf_pins trace_dma/M_AXI_S2MM] [get_bd_intf_pins data_ic/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins trace_dma/M_AXI_SG] [get_bd_intf_pins data_ic/S01_AXI]
@@ -192,17 +224,37 @@ connect_bd_net [get_bd_pins ps/pl_clk0] [get_bd_pins pl_reset/slowest_sync_clk] 
     [get_bd_pins trace_dma/m_axi_s2mm_aclk] [get_bd_pins trace_dma/m_axi_sg_aclk] [get_bd_pins trace_pl/aclk] \
     [get_bd_pins ps/pl_ps_trace_clk] [get_bd_pins ps/maxihpm0_fpd_aclk] [get_bd_pins ps/saxihp0_fpd_aclk] \
     [get_bd_pins m3_mem_ctrl/s_axi_aclk] [get_bd_pins m3_mem_ctrl_core/s_axi_aclk] \
-    [get_bd_pins m3_core_ic/ACLK] [get_bd_pins m3_core_ic/S00_ACLK] [get_bd_pins m3_core_ic/M00_ACLK] \
-    [get_bd_pins m3_mem_ctrl_ic/ACLK] [get_bd_pins m3_mem_ctrl_ic/S00_ACLK] [get_bd_pins m3_mem_ctrl_ic/M00_ACLK]
+    [get_bd_pins m3_core_ic/ACLK] [get_bd_pins m3_core_ic/M00_ACLK] \
+    [get_bd_pins m3_mem_ctrl_ic/ACLK] [get_bd_pins m3_mem_ctrl_ic/S00_ACLK] [get_bd_pins m3_mem_ctrl_ic/M00_ACLK] \
+    [get_bd_pins m3_mem_ctrl_slice/aclk]
+# m3_core_ic/S00_ACLK is deliberately NOT in the list above -- it's the
+# leg feeding m3_core's own HCLK-synchronous AXI3 master, and HCLK is now
+# on the dedicated 10 MHz fabric clock (see m3_core/HCLK below), not
+# pl_clk0. S00_HAS_DATA_FIFO {1} (set on m3_core_ic above) is what makes
+# this a legal, genuine clock-domain crossing rather than a mismatch.
+connect_bd_net [get_bd_pins ps/pl_clk0] [get_bd_pins m3_clk_10m/clk_in1]
+connect_bd_net [get_bd_pins m3_clk_10m/clk_out1] [get_bd_pins m3_core_ic/S00_ACLK] [get_bd_pins m3_core/HCLK] \
+    [get_bd_pins trace_pl/m3_hclk]
 connect_bd_net [get_bd_pins ps/trace_clk_out] [get_bd_pins trace_pl/trace_clk]
 connect_bd_net [get_bd_pins ps/ps_pl_tracedata] [get_bd_pins trace_pl/trace_data]
 connect_bd_net [get_bd_pins ps/pl_resetn0] [get_bd_pins pl_reset/ext_reset_in]
 connect_bd_net [get_bd_pins pl_reset/peripheral_aresetn] [get_bd_pins trace_pl/aresetn] \
     [get_bd_pins trace_dma/axi_resetn] [get_bd_pins m3_mem_ctrl/s_axi_aresetn] \
     [get_bd_pins m3_mem_ctrl_core/s_axi_aresetn] [get_bd_pins m3_core_ic/ARESETN] \
-    [get_bd_pins m3_core_ic/S00_ARESETN] [get_bd_pins m3_core_ic/M00_ARESETN] \
+    [get_bd_pins m3_core_ic/M00_ARESETN] \
     [get_bd_pins m3_mem_ctrl_ic/ARESETN] [get_bd_pins m3_mem_ctrl_ic/S00_ARESETN] \
-    [get_bd_pins m3_mem_ctrl_ic/M00_ARESETN]
+    [get_bd_pins m3_mem_ctrl_ic/M00_ARESETN] [get_bd_pins m3_mem_ctrl_slice/aresetn]
+# m3_core_ic/S00_ARESETN is deliberately NOT in the pl_clk0-synchronous
+# group above: its associated clock (S00_ACLK) is now the dedicated 10 MHz
+# fabric clock, not
+# pl_clk0 (see m3_core_ic/S00_ACLK above), so a pl_clk0-synchronous reset
+# there is itself a CDC hazard -- confirmed for real: Vivado's BD
+# elaborator flags it directly ("Reset pin ... is connected to reset
+# source ... synchronous to clock source /ps/pl_clk0", recommending a
+# Processor System Reset synchronous to the M3 clock). trace_pl/m3_reset_n_sync
+# (below) is already exactly that: a real synchronizer in the pl_clk1
+# domain, driving m3_core/SYSRESETn|DBGRESETn -- reuse it here too rather
+# than instantiating a second proc_sys_reset for the same purpose.
 connect_bd_net [get_bd_pins trace_dma/s2mm_introut] [get_bd_pins trace_pl/dma_complete]
 connect_bd_net [get_bd_pins zero/dout] [get_bd_pins trace_pl/dma_fault] [get_bd_pins trace_pl/debug_complete]
 connect_bd_net [get_bd_pins trace_pl/irq] [get_bd_pins irq_concat/In0]
@@ -212,11 +264,25 @@ connect_bd_net [get_bd_pins irq_concat/dout] [get_bd_pins ps/pl_ps_irq0]
 # delivered IP-XACT — there is no HRESETn/PORESETn on this IP; instead a
 # single SYSRESETn plus a separate DBGRESETn for the debug-logic domain,
 # both driven the same way trace_pl's m3_release-gated reset already was.
-connect_bd_net [get_bd_pins ps/pl_clk0] [get_bd_pins m3_core/HCLK]
-connect_bd_net [get_bd_pins trace_pl/m3_reset_n] [get_bd_pins m3_core/SYSRESETn] \
-    [get_bd_pins m3_core/DBGRESETn]
+# HCLK itself is connected above, alongside m3_core_ic/S00_ACLK, on the
+# dedicated 10 MHz fabric clock.
+#
+# trace_pl/m3_reset_n is generated in the pl_clk0/aclk domain
+# (orbtrace_axi_regs' m3_release bit, combined with the DAP's jtag_nreset).
+# Since HCLK is now on the dedicated 10 MHz clock (not the same net as aclk
+# any more), driving SYSRESETn/DBGRESETn from the raw aclk-domain signal is
+# a genuine, unsynchronized CDC hazard -- confirmed for real: an initial
+# attempt at exactly that produced dozens of UNWAIVED CRITICAL CDC
+# violations (every m3_core-internal register async-reset by it) on a real
+# build. trace_pl/m3_reset_n_sync is the same signal run through a real
+# two-flop, ASYNC_REG-tagged, async-assert/synchronous-deassert
+# synchronizer in the m3_hclk domain (orbtrace_pl.v, mirroring the
+# already-proven m3_trace_reset_sync pattern for aresetn) -- use that
+# instead.
+connect_bd_net [get_bd_pins trace_pl/m3_reset_n_sync] [get_bd_pins m3_core/SYSRESETn] \
+    [get_bd_pins m3_core/DBGRESETn] [get_bd_pins m3_core_ic/S00_ARESETN]
 # TPIU trace clock is the IP's own output (mirrors ps/trace_clk_out above),
-# not tied to pl_clk0 directly, even though HCLK feeds both.
+# now derived from the dedicated 10 MHz HCLK, not pl_clk0.
 connect_bd_net [get_bd_pins m3_core/TRACECLK] [get_bd_pins trace_pl/trace_clk_m3]
 connect_bd_net [get_bd_pins m3_core/TRACEDATA] [get_bd_pins trace_pl/trace_data_m3]
 

@@ -13,7 +13,14 @@ module orbtrace_pl (
     output wire [63:0] m_axis_tdata, output wire [7:0] m_axis_tkeep,
     output wire m_axis_tvalid, output wire m_axis_tlast, input wire m_axis_tready,
     input wire dma_complete, input wire dma_fault, input wire debug_complete, output wire irq,
-    output wire m3_reset_n,
+    // m3_hclk: m3_core's own HCLK (create_bd.tcl's pl_clk1, independent of
+    // aclk since 2026-08-17's Phase E bandwidth fix -- see
+    // M3_TRACE_VERIFICATION_PLAN.md). m3_reset_n below is generated in the
+    // aclk domain; SYSRESETn/DBGRESETn need a properly HCLK-synchronized
+    // version, not the raw aclk-domain signal, now that the two clocks are
+    // genuinely independent -- see m3_reset_n_sync below.
+    input wire m3_hclk,
+    output wire m3_reset_n, output wire m3_reset_n_sync,
     output wire jtag_tck, output wire jtag_tms, output wire jtag_tdi, input wire jtag_tdo,
     output wire jtag_ntrst, output wire jtag_nreset
 );
@@ -46,6 +53,26 @@ module orbtrace_pl (
     reg [63:0] m3_cdc_drops, m3_cdc_drops_gray;
     (* ASYNC_REG="TRUE" *) reg m3_overrun_s1, m3_overrun_s2;
     (* ASYNC_REG="TRUE" *) reg [63:0] m3_drops_gray_s1, m3_drops_gray_s2;
+    // m3_cdc_level (orbtrace_async_fifo's write_level) is combinational
+    // logic valid only relative to trace_clk_m3 edges (wr_bin minus the
+    // *already write-domain-synchronized* rd_gray_w2, both trace_clk_m3
+    // registers) -- reading it directly from aclk, as this file did before
+    // 2026-08-17, was safe only because trace_clk_m3 and aclk were the same
+    // physical clock (HCLK == clk_pl_0) at the time. Now that HCLK is on
+    // its own independent pl_clk1 (Phase E bandwidth fix), that direct read
+    // is a genuine, unsynchronized multi-bit CDC hazard.
+    //
+    // Track the running maximum in trace_clk_m3, then transfer that maximum
+    // exactly like a normal Gray-coded counter. Although write_level itself
+    // can fall by more than one when the synchronized read pointer catches
+    // up, its *maximum* can only rise by one per trace_clk_m3 edge: wr_bin
+    // advances by at most one each write and rd_gray_w2 never goes backwards.
+    // That monotonic property makes this Gray transfer safe, unlike copying
+    // write_level directly through a multi-bit synchronizer.
+    reg [10:0] m3_level_max_w;
+    reg [10:0] m3_level_max_gray;
+    (* ASYNC_REG="TRUE" *) reg [10:0] m3_level_max_gray_s1, m3_level_max_gray_s2;
+    wire [10:0] m3_level_max_sync;
     wire [63:0] m3_cdc_drops_sync;
     wire [1:0] source_select; wire [2:0] trace_format; wire [31:0] swo_baud;
     wire [63:0] dma_base; wire [31:0] dma_ring_size;
@@ -65,6 +92,17 @@ module orbtrace_pl (
     (* ASYNC_REG="TRUE" *) reg running_trace_m3_m, running_trace_m3_s;
     (* ASYNC_REG="TRUE" *) reg [1:0] m3_trace_reset_sync;
     wire m3_trace_reset_n=m3_trace_reset_sync[1];
+    // m3_reset_n (below) is generated in the aclk domain and, before
+    // 2026-08-17, safely drove m3_core/SYSRESETn/DBGRESETn directly because
+    // HCLK was still literally the same net as aclk. Now that HCLK is on
+    // its own independent m3_hclk (create_bd.tcl's pl_clk1, the Phase E
+    // bandwidth fix), that raw crossing is a genuine, unsynchronized
+    // async-reset CDC hazard -- Vivado's report_cdc correctly flagged every
+    // register inside m3_core reset by it. Same async-assert/
+    // synchronous-deassert 2-flop pattern as m3_trace_reset_sync above,
+    // just in the m3_hclk domain instead of trace_clk_m3.
+    (* ASYNC_REG="TRUE" *) reg [1:0] m3_reset_sync;
+    assign m3_reset_n_sync = m3_reset_sync[1];
     wire [7:0] dap_command_data, dap_response_data;
     wire dap_command_valid, dap_command_last, dap_command_ready;
     wire dap_response_valid, dap_response_last, dap_response_ready;
@@ -83,6 +121,7 @@ module orbtrace_pl (
     endfunction
     assign cdc_drops_sync=gray_to_binary(drops_gray_s2);
     assign m3_cdc_drops_sync=gray_to_binary(m3_drops_gray_s2);
+    assign m3_level_max_sync=gray_to_binary({53'b0,m3_level_max_gray_s2});
 
     always @(posedge aclk) begin
         if (!aresetn) running<=0;
@@ -134,39 +173,54 @@ module orbtrace_pl (
         if (!aresetn) m3_trace_reset_sync<=0;
         else m3_trace_reset_sync<={m3_trace_reset_sync[0],1'b1};
     end
+    // Async-assert (m3_reset_n low, e.g. software holding M3 in reset, or
+    // jtag_nreset low) / synchronous-deassert into the m3_hclk domain --
+    // see m3_reset_sync's declaration above for why this exists.
+    always @(posedge m3_hclk or negedge m3_reset_n) begin
+        if (!m3_reset_n) m3_reset_sync<=0;
+        else m3_reset_sync<={m3_reset_sync[0],1'b1};
+    end
     orbtrace_ddr_capture m3_capture(.trace_clk(trace_clk_m3),.reset_n(m3_trace_reset_n),
         .enable(running_trace_m3_s && format_trace_m3_s<=2),.width_select(format_trace_m3_s[1:0]),
         .trace_data(trace_data_m3),.byte_data(m3_trace_byte),.byte_valid(m3_trace_valid));
-    // M3_TRACE_CDC_DEPTH_LOG2=10 (1024 entries), not the default 5 (32):
-    // 2026-08-17 investigation (M3_TRACE_VERIFICATION_PLAN.md) found the
-    // M3's own TPIU, in Parallel/4-bit mode, asserts byte_valid on every
-    // single trace_clk_m3 cycle continuously (documented CoreSight
-    // half-sync/idle-frame formatter behavior, not a bug) -- this FIFO has
-    // to absorb that never-idle production rate, unlike the PS trace path's
-    // fifo (left at the default depth; it has its own separately-proven
-    // "sustained 400 Mbit/s" track record and this session found no reason
-    // to touch it). A deeper FIFO here is a direct, low-risk test of
-    // whether the observed rx_bytes=0/dropped_bytes-in-the-millions/
-    // fifo_high_water-pegged symptom is a genuine sustained bandwidth
-    // mismatch (a bigger buffer would only delay, not fix, permanent
-    // overflow) versus enough headroom being sufficient on its own.
-    localparam M3_TRACE_CDC_DEPTH_LOG2 = 10;
+    // The M3 TPIU emits a byte every trace_clk_m3 in Parallel/4-bit mode,
+    // including formatter-idle bytes.  HCLK was consequently moved to the
+    // independent 38.889 MHz pl_clk1 while this AXI/stream side remains at
+    // 100 MHz (Phase E in M3_TRACE_VERIFICATION_PLAN.md).  The consumer now
+    // has ample sustained bandwidth, so the normal 32-entry asynchronous
+    // FIFO is sufficient for clock-crossing elasticity.  A 1024-entry FIFO
+    // was useful to prove the old 100 MHz source overflow, but this FIFO's
+    // asynchronous-read storage is LUT RAM; retaining that depth congests
+    // the ZU1CG and prevents the 100 MHz stream logic from closing timing.
+    localparam M3_TRACE_CDC_DEPTH_LOG2 = 5;
     orbtrace_async_fifo #(.DEPTH_LOG2(M3_TRACE_CDC_DEPTH_LOG2)) m3_trace_fifo(
         .write_clk(trace_clk_m3),.write_reset_n(m3_trace_reset_n),.write_data(m3_trace_byte),
         .write_valid(m3_trace_valid),.write_ready(m3_cdc_write_ready),.write_level(m3_cdc_level),
         .read_clk(aclk),.read_reset_n(aresetn),.read_data(m3_cdc_data),.read_valid(m3_cdc_valid),.read_ready(m3_cdc_ready));
     always @(posedge trace_clk_m3) begin
-        if (!m3_trace_reset_n) begin m3_cdc_overrun<=0; m3_cdc_drops<=0; m3_cdc_drops_gray<=0; end
-        else if (m3_trace_valid && !m3_cdc_write_ready) begin
-            m3_cdc_overrun<=1; m3_cdc_drops<=m3_cdc_drops+1'b1;
-            m3_cdc_drops_gray<=((m3_cdc_drops+1'b1)>>1)^(m3_cdc_drops+1'b1);
+        if (!m3_trace_reset_n) begin
+            m3_cdc_overrun<=0; m3_cdc_drops<=0; m3_cdc_drops_gray<=0;
+            m3_level_max_w<=0; m3_level_max_gray<=0;
+        end
+        else begin
+            if (m3_trace_valid && !m3_cdc_write_ready) begin
+                m3_cdc_overrun<=1; m3_cdc_drops<=m3_cdc_drops+1'b1;
+                m3_cdc_drops_gray<=((m3_cdc_drops+1'b1)>>1)^(m3_cdc_drops+1'b1);
+            end
+            if (m3_cdc_level > m3_level_max_w) begin
+                m3_level_max_w<=m3_cdc_level;
+                m3_level_max_gray<=(m3_cdc_level >> 1)^m3_cdc_level;
+            end
         end
     end
     always @(posedge aclk) begin
-        if (!aresetn) begin m3_overrun_s1<=0; m3_overrun_s2<=0; m3_drops_gray_s1<=0; m3_drops_gray_s2<=0; m3_high_water<=0; end
-        else begin
+        if (!aresetn) begin
+            m3_overrun_s1<=0; m3_overrun_s2<=0; m3_drops_gray_s1<=0; m3_drops_gray_s2<=0; m3_high_water<=0;
+            m3_level_max_gray_s1<=0; m3_level_max_gray_s2<=0;
+        end else begin
             m3_overrun_s1<=m3_cdc_overrun; m3_overrun_s2<=m3_overrun_s1; m3_drops_gray_s1<=m3_cdc_drops_gray; m3_drops_gray_s2<=m3_drops_gray_s1;
-            if (m3_cdc_level > m3_high_water) m3_high_water<=m3_cdc_level;
+            m3_level_max_gray_s1<=m3_level_max_gray; m3_level_max_gray_s2<=m3_level_max_gray_s1;
+            if (m3_level_max_sync > m3_high_water) m3_high_water<=m3_level_max_sync;
         end
     end
 

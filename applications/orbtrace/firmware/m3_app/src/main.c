@@ -72,9 +72,9 @@ static void emit_next(void) {
 }
 
 int main(void) {
-    /* 4-bit TPIU trace port, matching applications/orbtrace/vivado/
-     * create_bd.tcl's PSU__TRACE__WIDTH default so the same trace_format
-     * register values apply to both the PS and M3 sources. */
+    /* 10 MHz Parallel/4-bit TPIU bandwidth A/B test. The M3 core's HCLK
+     * now comes from the dedicated fabric Clocking Wizard, while the PL
+     * capture/DMA domain remains at 100 MHz. */
     m3_itm_init(2);
     g_tpiu_sspsr_at_boot = M3_TPIU_SSPSR; /* DEMCR.TRCENA must be set first (done above) */
     g_itm_tcr_at_boot = M3_ITM_TCR;

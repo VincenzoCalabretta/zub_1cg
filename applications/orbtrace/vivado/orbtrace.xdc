@@ -16,6 +16,15 @@ create_generated_clock -name trace_clk_m3 \
     -source [get_pins zub_orbtrace_i/m3_core/inst/inst/HCLK] \
     -divide_by 1 [get_pins zub_orbtrace_i/m3_core/inst/inst/TRACECLK]
 
+# The M3 HCLK is a 10 MHz Clocking-Wizard output fed from PL0.  Although the
+# frequencies have a 10:1 ratio, the PS clock and MMCM output do not have a
+# STA-usable phase relationship.  All crossings are through the M3 AXI clock
+# converter or m3_trace_fifo, so declare the domains asynchronous rather than
+# timing arbitrary phase-dependent paths between them.
+set_clock_groups -asynchronous \
+    -group [get_clocks {clk_pl_0 trace_clk_emio}] \
+    -group [get_clocks {clk_out1_zub_orbtrace_m3_clk_10m_0 trace_clk_m3}]
+
 # SWCLKTCK is bit-banged from FPGA logic by orbtrace_dap_engine.sv
 # (JTAG_HALF_PERIOD), not a free-running clock -- JTAG/SWD transactions are
 # far slower than any setup/hold margin here. Give it a nominal slow clock so
