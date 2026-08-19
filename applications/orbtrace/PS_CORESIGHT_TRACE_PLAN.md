@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-19 — two real address/offset bugs found+fixed with real UG1085/DDI0500J documentation; ETM confirmed genuinely tracing; still 0 bytes reach the PL, TPIU formatter suspected next.** See section 13 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-19 — 3 real bugs found+fixed (2 addr/offset, 1 wrong psu_init.tcl); real bytes now reach the PL FIFO for the first time (fifo_high_water=63); TPIU sync-packet emission still blocks `rx_bytes`.** See section 14 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -572,44 +572,181 @@ confirm/deny whether a Replicator stage needs separate enabling) instead
 of the current best-effort carryover from the M3 macrocell's TRM-verified
 layout.
 
-**Session end state:** all code changes (both real fixes) committed. The
-one FFCR write this session was a live JTAG probe only, never added to
-firmware — nothing to revert. Board left with A53 Orbtrace service
-confirmed responsive (`orbtrace info`); R5-0 left running
-`orbtrace_workload`. No destructive hardware state left behind.
+**Session end state (superseded by section 14 below — a materially bigger
+finding landed the same day; kept for history):** all code changes (both
+real fixes) committed. The one FFCR write this session was a live JTAG
+probe only, never added to firmware — nothing to revert. Board left with
+A53 Orbtrace service confirmed responsive (`orbtrace info`); R5-0 left
+running `orbtrace_workload`. No destructive hardware state left behind.
+
+## 14. Phase 6 continued — real bytes reach the PL for the first time (2026-08-19, same day)
+
+Section 13's fixes (real funnel/ETM addresses, real ETMv4 offsets)
+confirmed the ETM genuinely tracing and the funnels genuinely routing, but
+a real capture retry still showed 0 bytes. This section chases that down
+to its actual root cause — a **third, structurally different kind of bug**
+from the first two: not a wrong constant in this repo's code, but **this
+entire investigation (this session and, per [[board_bitstream_state]],
+likely every prior Orbtrace hardware session) has been flashing the board
+with the wrong `psu_init.tcl`.**
+
+**The `sync_loss` metric was a red herring, worth flagging clearly so a
+future session doesn't repeat the mistake:** `orbtrace_pl.v` wires the
+`stats` command's `sync_loss` field to `tpiu_sync_loss + nrz_malformed +
+manchester_malformed` — the SWO NRZ/Manchester decoders run
+*unconditionally*, regardless of the configured trace format, continuously
+sampling `trace_data[0]`. In Parallel/TPIU4 mode (what this whole
+investigation uses), those decoders are decoding meaningless noise the
+whole time and dominate the reported number. The huge, climbing
+`sync_loss` values seen throughout sections 12-13 were **not** evidence of
+real PS-side activity — the actually-informative signals are `rx_bytes`
+and `fifo_high_water`, both of which stayed at exactly `0` through every
+test in sections 12-13.
+
+**Investigated three more hypotheses in order, ruling out two and
+confirming the third:**
+1. **FPD debug power domain gating — ruled out.** Table 39-12 (UG1085)
+   places all trace-related components (Funnels 1/2, TMC, TPIU) in the
+   FPD, requiring a `CSYSPWRUPREQ`/`CSYSPWRUPACK` handshake through the
+   JTAG-DP's own `CTRL/STAT` register before FPD debug logic is genuinely
+   powered. Read `CTRL/STAT` directly via `openocd`'s built-in `dap dpreg
+   0x4` command (much safer than hand-rolling raw ADIv5 DPACC shifts,
+   which this session tried once and got nonsense back): `0xf0000001` —
+   `CSYSPWRUPACK` (bit31) and `CDBGPWRUPACK` (bit29) both already `1`.
+   Already satisfied by `aes_zub.cfg`'s existing setup event; not the
+   blocker.
+2. **TPIU formatter config (`CSPSR`/`SPPR`/`FFCR`) — tried, not
+   sufficient alone, later found to be a red herring for a different
+   reason (see below).** Read TPIU's real register state
+   (`0xfe98_0000`, offsets reused from `sdk/bsp/m3/itm.h`'s
+   hardware-proven M3 TPIU layout — same ARM CoreSight TPIU component
+   family): `SPPR=0` (parallel, correct), `CSPSR=0x9` (bits 0 and 3 both
+   set — plausibly wrong for a one-hot selector), `FFCR=0` (formatter
+   continuous-output disabled). Live JTAG writes of `CSPSR=0x8` (pure
+   4-bit) and `FFCR=0x2` (`EnFCont`) both stuck but didn't unblock
+   anything by themselves.
+3. **The PS trace debug clock was never enabled at all — confirmed real,
+   the actual first domino.** UG1085 Table 37-7 documents
+   `CRF_APB.DBG_TRACE_CTRL`'s reset value as `0000_2500h` with
+   `[CLKACT] = Clock stop`. Read it live: **`0x00002500`** — exactly the
+   documented reset value. Compare `DBG_FPD_CTRL` (used for CoreSight
+   *register* access): `0x01000200`, `CLKACT` bit set — explaining why
+   every earlier register read/write against Funnel/TPIU/ETM "worked" at
+   the APB level while the TPIU's actual DDR output serializer (which
+   specifically needs `DBG_TRACE_CLK`, a separate clock) never ran.
+   Confirmed the generic board-level
+   `sdk/boards/zub_1cg/generated/psu_init.tcl` this whole investigation
+   has used (a known gap already flagged in [[board_bitstream_state]] for
+   AXI HPM/fabric-width registers — trace clock is the same class of gap)
+   has **zero** references to `DBG_TRACE_CTRL` — `grep -c` on the literal
+   string returns `0`. `create_bd.tcl` sets `PSU__TRACE__PERIPHERAL__ENABLE
+   {1}` / `PSU__TRACE__PERIPHERAL__IO {EMIO}` / `PSU__TRACE__WIDTH {4Bit}`
+   directly on the PS block — real PS-configuration properties the generic
+   board-level design never had reason to set.
+
+**The real fix, and it's not a hand-patch:** `applications/orbtrace/vivado/build.tcl`
+already exports Orbtrace's *own* `psu_init.tcl` alongside every bitstream
+build, via `write_hw_platform` + `export_psu_init.tcl` (see that file's
+own tail). It was sitting unused, right next to the bitstream, in every
+cached build this whole investigation has flashed from
+(`bazel-out/orbtrace-vivado-m3-10mhz-r4/psu_init.tcl` for the specific
+build used this session) — this repo's own documented hardware workflow
+(`AGENTS.md`) always pairs the Orbtrace bitstream with the *generic*
+board-level `psu_init.tcl` instead, a choice whose own justifying comment
+in [[board_bitstream_state]] only ever audited it for DDR/AXI-HPM
+correctness, not trace. Confirmed the real, Orbtrace-specific
+`psu_init.tcl` genuinely programs `DBG_TRACE_CTRL` correctly:
+`mask_write 0XFD1A0064 0x01003F07 0x01000500` — `CLKACT=1` **and**
+`DIVISOR0=5`, a materially different (and presumably correctly-tuned for
+the real 100 MHz target) value from the `DIVISOR0=37` reset default this
+session's own hand-patch had left unchanged (only setting `CLKACT`, not
+the divisor) — explaining why the hand-patch alone hadn't been enough.
+
+**Reflashed A53 using this real `psu_init.tcl` for the first time.** No
+DDR hang (the historical reason this was avoided is fixed as of the
+2026-08-09 `zub1cg_apply_ps_preset` fix, already baked into the current
+`create_bd.tcl`/this build). `orbtrace info` confirmed responsive
+immediately after. Bonus confirmation this was the right document: `TPIU
+CSPSR` now reads `0x8` (pure 4-bit) **on its own**, without this session's
+earlier hand-patch — the real `psu_init.tcl` already configures it
+correctly, unprompted.
+
+**Result: real bytes reach the PL capture FIFO for the first time in this
+entire investigation.** Re-ran the exact same `configure r5 tpiu4` →
+`start` → check sequence: `fifo_high_water=63` (pegged at its max depth —
+the same "real overflow, not idle" signature
+`M3_TRACE_VERIFICATION_PLAN.md`'s own Phase E first hit early in that
+investigation). `rx_bytes` still `0` and stayed at `0` through a real
+`orbtrace capture` attempt (the TCP connection itself worked fine this
+time — no hang) — `fifo_high_water` staying pegged rather than draining
+even with a live client connected points at the **TPIU demux never
+achieving `synced`**, not a downstream TCP/DMA issue. Given
+`orbtrace_tpiu_demux.sv`'s sync search looks for a generic CoreSight TPIU
+Full Sync Packet (source-agnostic framing, should apply to ETMv4 content
+the same as it did to M3's ITM content), and `M3_TRACE_VERIFICATION_PLAN.md`
+independently root-caused an extremely similar-shaped M3 symptom to "the
+TPIU formatter's Full Sync Packet requires an explicit trigger, it's not
+periodic/automatic" (TRM §11.2.2, for the M3's own local TPIU macrocell) —
+the leading hypothesis is that the **system TPIU (SoC-400 macrocell) needs
+some additional trigger/flush beyond `FFCR.EnFCont` to actually emit a
+Full Sync Packet**, and the still-missing Arm CoreSight SoC-400 TRM (see
+section 13) is very likely exactly where that's documented.
+
+**Session end state:** no new firmware/code changes this section — every
+fix here was either a live JTAG register probe (CSPSR/FFCR, harmless,
+firmware still doesn't set these) or a **flash-time tooling choice**
+(which `psu_init.tcl` to pass to `jtag_flash.sh`), not a code change to
+commit. Board left flashed with the real Orbtrace `psu_init.tcl` +
+current `a53_app`; R5-0 running `orbtrace_workload`; `orbtrace info`
+confirmed responsive. **This flash-time choice does not survive a future
+`jtag_flash.sh` call that reverts to the generic board-level
+`psu_init.tcl`** — a future session must deliberately keep using the
+Orbtrace-specific one (see next steps item 1) or this exact regression
+will silently reappear.
 
 ## Next steps for a future session
 
-1. **Cheapest, do first:** get the real **Arm CoreSight SoC-400 Technical
-   Reference Manual** (UG1085's own Ref 39 citation for Funnel/TPIU/DAP/
-   Timestamp/CTI) — not currently in the private reference-document
-   archive; check there first (same place UG1085/DDI0500J were found this
-   session) before searching further afield. This should resolve the
-   `TPIU_FFCR` bit-definition gap directly and confirm whether a
-   Funnel-2-to-TPIU Replicator stage (visible in Figure 39-8's map but
-   never touched by this code) needs its own explicit enable.
-2. If that document remains unavailable, the fallback is a real PL-side
-   ILA capture on `coresight_data`/`trace_data_m3`-equivalent signals at
-   the `orbtrace_pl`/`orbtrace_tpiu_demux` boundary — the same proven
-   methodology `M3_TRACE_VERIFICATION_PLAN.md` used repeatedly to
-   distinguish "PS-side CoreSight isn't producing anything real" from "PL
-   isn't receiving/decoding what's genuinely being sent." This session's
-   findings (ETM genuinely tracing, funnels genuinely routing) make "PS
-   config is still incomplete" the leading hypothesis over a PL/wiring
-   bug, but an ILA capture would settle it definitively either way.
-3. Once bytes start flowing, mirror `M3_TRACE_VERIFICATION_PLAN.md`'s
-   Phase E/F methodology exactly: confirm real content recovery against
+1. **Cheapest, do first, and don't lose this fix:** update the *documented*
+   Orbtrace hardware workflow (`AGENTS.md`'s "Flash over JTAG" section, and
+   any session muscle-memory) to use the Orbtrace-specific `psu_init.tcl`
+   (`bazel-out/<build>/psu_init.tcl`, sitting next to `zub_orbtrace.bit` in
+   the same Vivado build output — already exported by `build.tcl`, no new
+   tooling needed) instead of `sdk/boards/zub_1cg/generated/psu_init.tcl`,
+   for *any* Orbtrace hardware session, not just R5/A53 CoreSight work —
+   this affects the trace-clock path for the M3 path too, potentially
+   relevant to revisiting `M3_TRACE_VERIFICATION_PLAN.md`'s own
+   still-unresolved Parallel-mode findings. `[[hardware_test_environment]]`
+   and `[[board_bitstream_state]]` are updated with this finding — read
+   those before the next hardware session so this isn't silently lost
+   again.
+2. Get the real **Arm CoreSight SoC-400 Technical Reference Manual**
+   (UG1085's own Ref 39 citation for Funnel/TPIU/DAP/Timestamp/CTI) — not
+   currently in the private reference-document archive; check there first
+   (same place UG1085/DDI0500J were found this session) before searching
+   further afield. This is now specifically targeted at one question: what
+   (beyond `FFCR.EnFCont`) makes the system TPIU emit a genuine Full Sync
+   Packet.
+3. If that document remains unavailable, the fallback is a real PL-side
+   ILA capture on `coresight_data` at the `orbtrace_pl`/
+   `orbtrace_tpiu_demux` boundary — the same proven methodology
+   `M3_TRACE_VERIFICATION_PLAN.md` used repeatedly. With real bytes now
+   confirmed reaching the FIFO, this would show their actual byte pattern
+   directly, which might make the missing-sync-trigger question moot (or
+   reveal it's something else entirely) without needing the SoC-400 TRM at
+   all.
+4. Once `rx_bytes` moves, mirror `M3_TRACE_VERIFICATION_PLAN.md`'s Phase
+   E/F methodology exactly: confirm real content recovery against
    `applications/orbtrace/firmware/rpu`'s known-reproducible `Workload`
    sequence before trusting anything downstream (this project has been
    burned before by declaring victory on `rx_bytes > 0` alone — see that
    document's own Phase E cautionary history).
-4. Before investing further in Phase 6-8's ambition level, it's worth
+5. Before investing further in Phase 6-8's ambition level, it's worth
    doing the real UG1085/Cortex-A53 TRM check flagged in section 3, point
    5 — if this silicon's ETM genuinely has address/data comparators or an
    ETR path, that changes how ambitious those phases are worth being from
-   the start. (Now easy to combine with item 1 — both documents are
-   findable via the same private archive this session used.)
-5. Everything from Phase 6 onward is new engineering, not just wiring —
+   the start. (Easy to combine with item 2 — both documents are findable
+   via the same private archive this session used.)
+6. Everything from Phase 6 onward is new engineering, not just wiring —
    size it accordingly before starting, the same way
    `M3_TRACE_VERIFICATION_PLAN.md` Phase H sized the ETM-on-M3 path
    before recommending against starting it without a clear bandwidth case.

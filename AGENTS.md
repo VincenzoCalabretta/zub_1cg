@@ -272,12 +272,27 @@ find ~/.cache/bazel -iname "zub_orbtrace.bit" 2>/dev/null
 If nothing is found, it needs a fresh Vivado build (see
 `documentation/ORBTRACE_400MBPS_HANDOFF_2026-08-09.md`'s "Fresh Vivado build" continuation
 for the exact `build.tcl` invocation and expected timing/WNS — this takes
-real synthesis+implementation wall-clock time, not seconds). The board-level
-`psu_init.tcl` (DDR/PS config, shared across applications, *not*
-Orbtrace-specific) is regenerated on demand and gitignored:
+real synthesis+implementation wall-clock time, not seconds).
+
+**Use the Orbtrace-specific `psu_init.tcl`, not the generic board-level
+one, for any hardware session touching the PS trace path** (R5/A53
+CoreSight, `PS_CORESIGHT_TRACE_PLAN.md`, or the M3's own Parallel-mode
+trace clock). `build.tcl` already exports one alongside every bitstream —
+it sits right next to `zub_orbtrace.bit` in the same output directory
+(`<build_dir>/psu_init.tcl`, produced via `write_hw_platform` +
+`export_psu_init.tcl`). `PS_CORESIGHT_TRACE_PLAN.md`'s Phase 6 section 14
+root-caused a real, previously-unnoticed bug from *not* using this file:
+the generic `sdk/boards/zub_1cg/generated/psu_init.tcl` (DDR/PS config,
+shared across applications, *not* Orbtrace-specific — regenerated on
+demand and gitignored, see below) never programs `CRF_APB.DBG_TRACE_CTRL`
+at all, leaving the PS trace-port output clock permanently disabled
+(reset default) — every trace-related PL signal can be perfectly
+configured and it still won't produce a single byte without this. Confirm
+on real hardware with `grep -c DBG_TRACE_CTRL <psu_init.tcl>` before
+trusting either file for trace work — `0` means it's the wrong one.
 
 ```bash
-ls sdk/boards/zub_1cg/generated/psu_init.tcl   # present + valid if sha256 matches generated/psu_init.sha256
+ls sdk/boards/zub_1cg/generated/psu_init.tcl   # generic board-level; present + valid if sha256 matches generated/psu_init.sha256
 # if missing/stale:
 nix develop -c bazel run //sdk/boards/zub_1cg:generate_psu_init
 ```
@@ -289,7 +304,8 @@ nix develop -c env \
   XILINX_ROOT=/home/v/opt/vitis \
   XSCT="$(nix develop -c which xsct)" \
   BITSTREAM=<path to zub_orbtrace.bit found/built above> \
-  PSINIT=sdk/boards/zub_1cg/generated/psu_init.tcl \
+  PSINIT=<path to the SAME build's own psu_init.tcl -- e.g. bazel-out/<build>/psu_init.tcl;
+          use sdk/boards/zub_1cg/generated/psu_init.tcl ONLY for non-trace work> \
   bash tooling/xsct/jtag_flash.sh bazel-bin/applications/orbtrace/firmware/a53_app/a53_app
 ```
 
