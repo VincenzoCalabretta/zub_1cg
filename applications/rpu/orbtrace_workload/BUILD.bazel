@@ -1,0 +1,13 @@
+"""Deterministic ETM trace workload for AES-ZUB Cortex-R5F (PS_CORESIGHT_TRACE_PLAN.md Phase 4)."""
+
+load("//sdk/rules:defs.bzl", "r5_firmware")
+
+r5_firmware(
+    name = "orbtrace_workload",
+    srcs = ["main.c"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sdk/bsp:test_proto",
+        "//sdk/rtos:threadx_r5",
+    ],
+)

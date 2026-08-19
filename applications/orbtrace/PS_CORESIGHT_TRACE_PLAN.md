@@ -38,8 +38,8 @@ short:
 | 1 | Confirm what already exists and what's actually reachable from real firmware | **DONE, 2026-08-19 — analysis only, no hardware touched.** See section 2 |
 | 2 | Wire `coresight::select()` into `a53_app`'s real `configure` command handler | **DONE, 2026-08-19 — host unit tests + real aarch64 cross-build only, no hardware touched.** See section 9 |
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
-| 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | NOT STARTED |
-| 5 | Boot/load path for that target firmware | NOT STARTED |
+| 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
+| 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
 | 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | NOT STARTED |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
@@ -288,19 +288,92 @@ network-dependent A53 test is in progress or being relied upon** — treat
 them as mutually exclusive board sessions, plan on a reflash after
 switching from RPU work back to A53 work.
 
+## 11. Phases 4 and 5 — R5 target firmware + boot path (2026-08-19)
+
+Built the "new, real workload" section 6 called for, deliberately scoped
+small per this document's own "before attempting anything
+application-specific" guidance:
+
+- **`applications/orbtrace/firmware/rpu`** (new Rust crate, host-testable):
+  a `Workload` producing a deterministic, reproducible sequence of
+  `Action`s (`Marker`/`Spin`/`Branch`/`Fault`/`Call(0..=6)`) from a
+  seeded xorshift PRNG. Deliberately **not** a port of the M3 `Workload`'s
+  ITM-stimulus-event model — ETMv4 traces instruction/branch flow
+  directly, there's no "emit" call to model. What this instead captures is
+  *which distinguishable, noinline branch target* a real R5 workload
+  visits next, so a future ETM decoder can cross-check recovered branch
+  addresses against a known sequence — the same verify-against-a-known-
+  sequence methodology `M3_TRACE_VERIFICATION_PLAN.md` Phase F used for
+  ITM content. Two host unit tests (`reproducible`, matching M3's own;
+  `visits_every_call_target`, confirming the PRNG's distribution actually
+  exercises all 7 call targets within a bounded window).
+- **`applications/rpu/orbtrace_workload`** (new C firmware, ThreadX,
+  mirrors `applications/rpu/hello_world`'s structure): hand-ports the same
+  xorshift/dispatch sequence, calling real `__attribute__((noinline))`
+  functions per action so the branch targets stay genuinely distinct
+  addresses in the compiled ELF (not inlined/merged away) — `action_call0`
+  through `action_call6`, `action_branch_true`/`_false`, `action_fault`,
+  `action_marker`, plus a bounded busy-loop for `Spin`. Each does a real,
+  cheap side effect (`g_heartbeat` update) so the compiler can't dead-code
+  them either. `TEST_BEGIN`/`TEST_PASS` markers follow the same
+  `zub_ctl`/`test_proto.h` convention as every other RPU app in this repo.
+- Test scaffolding added to `tests/BUILD.bazel`/`tests/rpu_orbtrace_workload_test.sh`,
+  mirroring `rpu_hello_world_*` exactly (`firmware_elf_test`,
+  `firmware_size_test`, `onboard_firmware_test`).
+
+**Phase 5 needed no new work at all** — section 7's assumption that R5
+needs its own boot/load mechanism was wrong (superseded by section 10's
+finding): the exact same `tooling/openocd/load_r5.tcl` +
+`psu_init_run.tcl` + `zub_ctl watch-r5` flow Phase 3 already proved on
+`hello_world` booted this new firmware unchanged, just pointed at a
+different ELF.
+
+**Verified for real, not just built:** `bazel test --config=host
+//tests:rpu_orbtrace_workload_elf_test //tests:rpu_orbtrace_workload_size_test`
+pass, and `bazel test --config=host --config=onboard --test_env=ZUB1CG_PSINIT
+//tests:rpu_orbtrace_workload_test` passed against real hardware — R5-0
+booted, printed `--- ThreadX ETM Workload (AES-ZUB R5F) ---`, and reached
+`[TEST PASS] orbtrace_workload` (confirming the thread reached its main
+loop, not that any ETM capture was attempted — that's still Phase 6).
+As expected per section 10's gotcha, this again killed the A53 Orbtrace
+service's network reachability; recovered with the same `jtag_flash.sh`
+reflash as before (`orbtrace-vivado-m3-10mhz-r4` + freshly rebuilt
+`a53_app`), confirmed via `orbtrace info` afterward.
+
+**Not yet done:** actually enabling ETM tracing on R5-0 while this
+workload runs (`coresight::select()`'s current implementation only
+unlocks components and wires funnels — it does not program the ETM's own
+`TRCPRGCTLR`/config/comparator registers to start tracing), and attempting
+any capture at all. That's Phase 6.
+
+Committed vs. scratch: all changes are in tracked source files (new
+`firmware/rpu` crate, new `applications/rpu/orbtrace_workload` app,
+`tests/BUILD.bazel`, new `tests/rpu_orbtrace_workload_test.sh`) plus this
+document; nothing left uncommitted. Hardware state: board left running the
+just-reflashed A53 Orbtrace service (confirmed responsive via
+`orbtrace info`), same production bitstream as every other recent session.
+
 ## Next steps for a future session
 
-1. **Cheapest, do first:** Phase 4 (R5/A53 target firmware) — per section
-   10, this can now build directly on the already-working
-   `applications/rpu/hello_world` + `tooling/openocd/load_r5.tcl` boot
-   flow rather than inventing one from scratch. Remember section 10's
-   psu_init/A53-network gotcha before running any more RPU JTAG sessions.
-2. Before committing to Phase 4's R5/A53 firmware effort, it's worth
+1. **Cheapest, do first:** Phase 6 (first real ETM capture). This needs
+   two things `coresight::select()` doesn't do yet: (a) actually
+   programming the R5-0 ETM's own trace-enable/config registers (not just
+   unlocking components and wiring funnels — see section 11's "Not yet
+   done"), and (b) a capture attempt against `applications/rpu/
+   orbtrace_workload` mirroring `M3_TRACE_VERIFICATION_PLAN.md`'s Phase
+   E/F methodology (get a real capture first, verify content against the
+   known-reproducible `Workload` sequence before trusting anything
+   downstream). Remember section 10's psu_init/A53-network gotcha — an
+   R5 JTAG session and a live A53 Orbtrace capture can't coexist, so
+   deciding the capture-side workflow (does verifying an R5 capture need
+   JTAG at the same time as the A53's TCP trace stream, or can they be
+   sequenced?) is itself part of this phase's scoping.
+2. Before investing further in Phase 6-8's ambition level, it's worth
    doing the real UG1085/Cortex-A53 TRM check flagged in section 3, point
    5 — if this silicon's ETM genuinely has address/data comparators or an
-   ETR path, that changes how ambitious Phases 6-8 are worth being from
+   ETR path, that changes how ambitious those phases are worth being from
    the start.
-3. Everything from Phase 4 onward is new engineering, not just wiring —
+3. Everything from Phase 6 onward is new engineering, not just wiring —
    size it accordingly before starting, the same way
    `M3_TRACE_VERIFICATION_PLAN.md` Phase H sized the ETM-on-M3 path
    before recommending against starting it without a clear bandwidth case.

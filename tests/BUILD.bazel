@@ -91,6 +91,16 @@ firmware_elf_test(
 )
 
 firmware_elf_test(
+    name = "rpu_orbtrace_workload_elf_test",
+    expected_entry = "0xffff0738",
+    expected_machine = "arm",
+    expected_memory_range = "0xffff0000:0x100000000",
+    firmware = "//applications/rpu/orbtrace_workload:orbtrace_workload",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
+    required_symbols = ["reset_handler"],
+)
+
+firmware_elf_test(
     name = "rpu_bsp_test_elf_test",
     expected_entry = "0xffff0094",
     expected_machine = "arm",
@@ -125,6 +135,20 @@ onboard_firmware_test(
     firmware_platform = "//sdk/platforms:rpu_r5_0",
     tags = _HW_TAGS,
     test_script = "rpu_hello_world_test.sh",
+)
+
+onboard_firmware_test(
+    name = "rpu_orbtrace_workload_test",
+    data = [
+        "//tooling/openocd:aes_zub_cfg",
+        "//tooling/openocd:all_scripts",
+        "//tooling/openocd:load_r5",
+        "//tooling/zub_ctl",
+    ],
+    firmware = "//applications/rpu/orbtrace_workload:orbtrace_workload",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
+    tags = _HW_TAGS,
+    test_script = "rpu_orbtrace_workload_test.sh",
 )
 
 sh_test(
@@ -224,6 +248,14 @@ firmware_size_test(
     name = "rpu_hello_world_size_test",
     bss_limit_bytes = 12288,  # 12 KB — ThreadX thread stacks + state
     firmware = "//applications/rpu/hello_world:hello_world",
+    firmware_platform = "//sdk/platforms:rpu_r5_0",
+    text_limit_bytes = 24576,  # 24 KB — ThreadX + RTOS + drivers
+)
+
+firmware_size_test(
+    name = "rpu_orbtrace_workload_size_test",
+    bss_limit_bytes = 12288,  # 12 KB — ThreadX thread stacks + state
+    firmware = "//applications/rpu/orbtrace_workload:orbtrace_workload",
     firmware_platform = "//sdk/platforms:rpu_r5_0",
     text_limit_bytes = 24576,  # 24 KB — ThreadX + RTOS + drivers
 )

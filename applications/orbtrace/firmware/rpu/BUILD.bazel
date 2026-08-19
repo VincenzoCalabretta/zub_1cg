@@ -1,0 +1,14 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "trace_workload",
+    srcs = ["src/lib.rs"],
+    crate_name = "orbtrace_rpu_workload",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "trace_workload_test",
+    crate = ":trace_workload",
+)
