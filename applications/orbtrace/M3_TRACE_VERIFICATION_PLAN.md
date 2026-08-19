@@ -19,6 +19,7 @@ testing capabilities" the M3 integration was built for.
 | E | Configure Orbtrace and start capture | **SUBSTANTIVELY DONE, 2026-08-19 — real, clean, channel-1-only CoreSight content decoded on real hardware for the first time in this entire investigation.** Root cause: `orbtrace_tpiu_demux.sv`'s sync-word search had the byte order backwards (searched for `0x7F` then three `0xFF`, when the real CoreSight Full Sync Packet is chronologically three `0xFF` then `0x7F` — confirmed against sigrok's independent reference decoder and real ILA capture data). Fixed (`32'hffffff7f`→`32'h7fffffff`), simulation-validated with a new dedicated testbench, then confirmed on real hardware: `orbtrace stats` shows `rx_bytes` genuinely and repeatably nonzero (11→173 over ~2 minutes) under the real (non-marker) firmware, and decoding the capture shows every byte is checksum-valid, exclusively on channel 1, zero garbage channels — a first. `dropped_bytes`/`sync_loss` remain huge (expected/correct: the false-lock-on-idle-alias problem the 2026-08-18 channel-plausibility gate handles is still active and doing its job). Remaining for a future session: Phase F's full byte-for-byte diff against the `Workload` reference (not required to call Phase E itself done) — see the 2026-08-19 section below for full detail |
 | F | Verify the captured trace is genuinely correct | **DONE, 2026-08-19 — genuine content recovery confirmed**, not just correct framing. A capture synchronized to a fresh `load-m3` reload (so the `Workload(seed=7)` reference's `sequence` starts near 0, unlike the previous unsynced attempt which could never find a contiguous match against an unknown, possibly-huge sequence offset) found 9 order-preserving, exact byte-string matches of width≥2 (3- or 5-byte) reference events in a 223-byte reconstructed stream, against an analytically-expected ~1.4 and empirically-observed 2-3 coincidental matches from shuffled/random controls. See the 2026-08-19 "Phase F" section below |
 | G | Verify the real JTAG debug path | **JTAG-DP fully alive and a working ADIv5 client built (2026-08-19), but real halting is likely blocked by a probable IP-level limitation, not a bug in this repo.** Root cause of the original "TDO stuck at 0" symptom: `model/src/main.rs`'s `remote_bitbang()` decoded OpenOCD's reset letters backwards (fixed, committed `1799849`), confirmed via the genuine ADIv5 IDCODE (`0x4ba00477`). A hand-rolled ADIv5 JTAG-DP DPACC/APACC client (bypassing OpenOCD's still-unresolved 1-cycle scan offset entirely) confirms DP/AP bring-up and real external-memory reads via the AP work correctly (AHB-AP IDR `0x24770011`, and the M3's real reset-vector word `0x00010000` read back through the AP — a second independent confirmation of Phase D's BRAM content). But every System Control Space address (`DHCSR`/`CPUID`/`ICTR`, `0xE000Exxx`) faults on both read and write, while non-SCS memory doesn't — strong, well-documented evidence (CM3 TRM + this IP's own component.xml) points to this specific DesignStart FPGA package's `DBGEN` master-debug-enable input being tied low/unavailable, not exposed for `create_bd.tcl` to control. Halt/PC-read/step/resume remain unverified; see the 2026-08-19 continuation section for the full evidence chain and next steps |
+| H | Assess ETM (full instruction trace) feasibility | **ANALYSIS DONE, 2026-08-19 — not attempted on hardware.** This board's M3 IP is licensed at `TRACE_LVL=1` (ITM+DWT, no ETM) today; a real attempt would need `TRACE_LVL=2` + a full rebuild + an all-new ETMv3.5 decoder, none of which happened this session. What this phase *did* establish, from the vendor's own `component.xml` plus a real on-hardware `TPIU_SSPSR=0x0000000b` readback: the M3 IP's trace port is hard-fixed at 4-bit width with `TRACECLK` locked 1:1 to `HCLK` (no width parameter, no `TRACECLKIN` input pin exist in this exact packaged IP) — a genuine IP ceiling, not a `create_bd.tcl` choice. Working through the resulting bandwidth math shows typical embedded C is right at the edge of fitting and branch-dense code will not fit, **independent of what HCLK is chosen** — raising the M3 clock scales trace-byte budget and instruction demand by the same factor, since they're tied 1:1, so it cannot change which code overflows the 24-byte FIFO, only how many wall-clock seconds of tracing happen before some other ceiling (e.g. the unrelated 400 Mbit/s downstream-pipeline capacity from `ORBTRACE_400MBPS_HANDOFF_2026-08-09.md`, itself proven with a synthetic PL source, not real M3 trace) is hit. See the 2026-08-19 "Phase H" section below for the full derivation and evidence |
 
 Phases 1 through D are all done and verified against real hardware, not
 just tooling or reasoning — this includes a full synth/impl/route cycle on
@@ -3336,3 +3337,170 @@ bare host `PATH`. `ORBTRACE_REG_M3_CONTROL` was cycled `0x0`→`0x3` several tim
 (to get a clean `STICKYERR` state for each probe) and was left at `0x3` at the end, matching
 every prior session's end-state convention — `orbtrace stats` confirmed the M3 still running
 and tracing (`sync_loss` climbing) after the final cycle.
+
+## 2026-08-19 continuation — Phase H: ETM (full instruction trace) feasibility, analysis only, no hardware touched
+
+Prompted by a user question after handing over a real ITM-decoded Perfetto trace
+(`M3_PERFETTO_VISUALIZATION_PLAN.md`): the delivered trace only contains ITM
+software-instrumentation events (explicit firmware `STIM` writes), not real CPU
+instruction execution — correctly so, since ITM has no visibility into instruction
+fetch/execute at all. The user asked what it would take to get real "all instructions
+executed" trace instead, and — after an initial pass at the general bandwidth math —
+specifically whether the resulting limitation is fundamental to the M3 IP or an
+artifact of this repo's own board integration (`create_bd.tcl`). **Answer, confirmed
+from primary sources (the vendor's real `component.xml`, a real on-hardware register
+readback, and this repo's own already-committed `ORBTRACE_400MBPS_HANDOFF` document —
+not assumptions): it is a genuine M3/TPIU IP ceiling, not a `create_bd.tcl` choice.**
+
+**Corrects an intermediate misstatement from earlier in this same session's
+conversation** (not previously written to this file, so nothing here supersedes a
+prior written claim): a first pass reasoned that `TRACECLK = HCLK` was "this design's
+own wiring choice" in `create_bd.tcl`. Re-checking against the vendor's own
+`component.xml` (not just `create_bd.tcl`) shows that's wrong — see below.
+
+**Why full instruction trace isn't available today, at all:** the M3 IP's
+`TRACE_LVL` parameter (`~/projects/arm_designstart_m3/vivado/Arm_ipi_repository/
+CM3DbgAXI/component.xml`) has three settings — `0` = no trace, `1` = "Standard
+trace. ITM & DWT. No ETM", `2` = "Full trace. ITM, DWT and ETM" — and `create_bd.tcl`
+never overrides the IP's default, which is `1`. So ETM hardware isn't merely unused,
+it isn't synthesized into the current bitstream at all. Separately, the firmware's own
+`m3_itm_init()` (`sdk/bsp/m3/itm.h`) only ever sets `DWT_CTRL`'s `CYCCNTENA` +
+`SYNCTAP` bits (for TPIU formatter sync, see the 2026-08-19 Phase-E section above) —
+never `PCSAMPLENA` (DWT's own lighter-weight periodic-PC-sample feature, which
+needs no ETM at all and would be a real, buildable middle ground if ever wanted).
+
+**Trace-port bandwidth math, worked from this board's real numbers:**
+`create_bd.tcl` (`m3_clk_10m`, lines ~133-137) pins `HCLK` to a genuine 10 MHz
+fabric clock, and — this is the IP fact, see below — `TRACECLK` is generated by the
+macrocell itself synchronous 1:1 with `HCLK`. Real RTL behavior already on record in
+this file's Phase E notes: in 4-bit mode, `orbtrace_ddr_capture` asserts `byte_valid`
+on *every* `trace_clk_m3` cycle — i.e. this port is DDR and produces exactly
+**1 byte per HCLK cycle**, continuously, whether or not there's real content
+(idle-filler otherwise). So the trace-port budget is always `1 byte × HCLK`, and
+since HCLK also sets the instruction rate (`HCLK / CPI`), the question of whether
+ETM output fits reduces to a clock-independent ratio:
+
+```
+fits  iff  bytes_per_instruction < CPI
+```
+
+Estimating `bytes_per_instruction` for ETMv3.5 (textbook packet-cost figures from
+the architecture — **not verified against this exact core, whose RTL, `cm3_etm.v`,
+is IEEE-P1735 encrypted, the same blocker Phase G already hit inspecting `DBGEN`**):
+non-branching instructions cost roughly 1 bit each (several "atoms" packed per
+P-header byte, ~0.25 bytes/instruction); each taken branch costs a full Branch
+Address Packet, roughly 2-3 bytes typical / up to 5 bytes worst-case. Blending by
+branch density `f`:
+
+| Code profile | `f` | typical (3B/branch) | worst-case (5B/branch) |
+|---|---|---|---|
+| Typical embedded C | 20% | 0.80 bytes/instr | 1.20 bytes/instr |
+| Branch-dense (loops/dispatch) | 50% | 1.63 bytes/instr | 2.63 bytes/instr |
+
+Cortex-M3 CPI for real (non-microbenchmark) firmware is typically ~1.0-2.0. So
+typical code is right at the edge (could go either way, needs real profiling data
+to call), and branch-dense code — often exactly the code someone wants full
+visibility into — exceeds any realistic CPI and will not fit, **regardless of
+HCLK**, for the structural reason below.
+
+**Is this an M3 IP limitation, or this repo's own architecture? Checked directly
+against the vendor's `component.xml`, not inferred:**
+
+1. **The port is hard-declared 4-bit wide in the netlist itself** — `component.xml`'s
+   `TRACEDATA` port is `spirit:vector` `[3:0]`, no width parameter anywhere in the
+   IP-XACT to widen it. Matches a real on-hardware readback already on record in
+   this file (Phase-E section, `2026-08-18`): `TPIU_SSPSR = 0x0000000b` — bits
+   0/1/3 set, meaning 1/2/4-bit are all silicon-supported and **nothing wider is**.
+   Two independent confirmations (IP-XACT declaration + real RO register readback),
+   not a guess.
+2. **`TRACECLK` has no input pin to drive independently — it is an IP *output*
+   only.** `component.xml` declares `TRACECLK` `spirit:direction` = `out`; there is
+   no `TRACECLKIN` pin on this exact packaged component for an integrator to feed a
+   separate, faster clock into. The CM3 TRM's own Cortex-M3 resource table (`10.2.3
+   Resources`, extracted this session as `trm.txt`) confirms this port mode has
+   exactly one clocking ratio available on ETM-M3: `Normal half-rate clocking, 1:1
+   — Yes`, `Demux half-rate clocking, 1:2 — No`. So `TRACECLK = HCLK`, always, is a
+   property of this exact packaged macrocell, not a `create_bd.tcl` wiring choice —
+   correcting this same session's own earlier, less-checked framing.
+3. **ETMv3.5's packet encoding, the 24-byte FIFO, and the FIFOFULL stall-or-drop
+   pair** are all fixed characteristics of the ETM-M3 macrocell as ARM packaged it
+   for this DesignStart edition (TRM `10.1.3`: the *only* configurable options are
+   external-input count and whether FIFOFULL is wired at all — never FIFO depth or
+   protocol version).
+
+**What genuinely is this repo's own architecture, separate from the IP ceiling
+above** — i.e. things a future session *could* change without a different
+Arm-licensed IP variant:
+1. The absolute HCLK frequency (currently 10 MHz, chosen for an earlier ITM
+   bandwidth A/B test per `create_bd.tcl`'s own comment, not an IP maximum).
+2. Whether ITM and ETM are both enabled and sharing the same fixed 1-byte/cycle
+   pipe simultaneously (`TRACE_LVL` + firmware `ITM_TER`/`DWT_CTRL` choices).
+3. Everything downstream of the TPIU pins (`orbtrace_ddr_capture`,
+   `orbtrace_tpiu_demux`, the DMA ring, the host TCP path) — this repo's own RTL,
+   a completely separate bottleneck layer from anything ARM packaged.
+
+**Directly answers a real follow-up question: raising HCLK to "exercise the full
+400 Mbit/s" would not avoid instruction loss, for two independent reasons.** First,
+400 Mbit/s (50 MB/s) is not even the right number to size ETM against — per
+`documentation/ORBTRACE_400MBPS_HANDOFF_2026-08-09.md`, that figure is this repo's
+*downstream* Orbflow-encoder/AXI-DMA/TCP pipeline capacity, proven with a
+**synthetic PL test source**, entirely unrelated to the M3 IP's own TRACEDATA
+ceiling. Second, even considered on its own terms: because `TRACECLK = HCLK`
+always (point 2 above), the trace-byte budget (`1 byte × HCLK`) and the
+instruction-execution demand (`bytes_per_instruction × HCLK / CPI`) both scale
+with HCLK identically — HCLK cancels out of the fit ratio entirely. A
+branch-dense loop that overflows the 24-byte FIFO at 10 MHz overflows identically
+at 50 MHz or 100 MHz; raising the clock only changes how many wall-clock seconds
+of real execution get traced before hitting some *other*, separate ceiling (like
+the unrelated downstream 50 MB/s figure above), never whether a given piece of
+code is traceable without loss.
+
+**Not done this session:** no hardware touched, no `TRACE_LVL=2` rebuild attempted,
+no ETMv3.5 decoder written. This is a decision-record for a future session
+considering that path, not a claim that ETM has been tried and found wanting on
+real hardware.
+
+**Addendum, same continuation: this generalizes well beyond this repo's soft
+core — confirmed against the real ORBTrace mini product (orbcode.org), the
+project this repo's own `orbtrace` application is explicitly modeled on/named
+after.** Its own spec page (`https://orbcode.org/orbtrace-mini/`, fetched this
+session) caps parallel Cortex-M trace at **"1-4 bit ... according to ARM
+ETMv3.5"** — the identical width ceiling found above, on a real commercial
+probe built to interoperate with real Cortex-M3/M4 silicon, not a probe-side
+restriction of its own invention. Almost no real Cortex-M-class MCU package
+breaks out a wider parallel trace port (pin-budget-constrained; many only
+expose 1-pin SWO), so the ceiling genuinely lives in the *target chip's* TPIU
+across the Cortex-M ecosystem generally, not uniquely in this repo's FPGA
+packaging — this repo's soft core is representative, not an outlier. The CM3
+TRM states the underlying design intent directly (`10.1`, "About the ETM"):
+"designed to be a high-speed, low-power debug tool that only supports
+instruction trace... to ensure area is minimized, and gate count is reduced"
+— M-class trace explicitly trades completeness for silicon cost, by design.
+Separately checked whether *this* IP package exposes the stall-vs-drop choice
+(`FIFOFULL`, TRM `11.3.9`'s "Stall processor" bit) as a `create_bd.tcl`-visible
+option: it does not appear anywhere in `component.xml` at all (unlike
+`TRACE_LVL`, which is a real user-facing parameter) — so whether this specific
+core would stall the CPU or silently drop trace on a real overflow is baked
+into the encrypted RTL with zero external visibility or control, the same
+"packaging-time decision, no visibility" pattern Phase G already hit with
+`DBGEN`. Genuinely unresolved without real-hardware testing at `TRACE_LVL=2`.
+
+### Next steps for a future session (Phase H specifically)
+
+1. **Cheap, real middle ground, no rebuild needed:** enable DWT `PCSAMPLENA` +
+   `POSTCNT` in `m3_itm_init()` for periodic PC-sample packets over the *existing*
+   ITM/DWT path (no `TRACE_LVL` change, no bitstream rebuild) — coarse
+   "where is the CPU spending time" visibility, a real, buildable next step using
+   the pipeline `M3_PERFETTO_VISUALIZATION_PLAN.md` already built, just a new
+   DWT packet-type case in that pipeline's decoder.
+2. **If genuinely pursuing full ETM instruction trace despite the above:** get a
+   real profile (branch density, actual CPI) of the *specific* code you want
+   traced before committing to the `TRACE_LVL=2` rebuild — the fit/no-fit
+   conclusion here used textbook ETMv3.5 packet-size estimates, not measured
+   numbers from this core (RTL is encrypted, can't be inspected directly).
+3. If pursuing it regardless of fit risk (e.g. accepting `FIFOFULL` core-stall
+   mode for guaranteed-complete but real-time-distorted trace): budget for a full
+   Vivado resynth/impl/route cycle (same class of cost as Phase C's original
+   build) plus an entirely new ETMv3.5 protocol decoder correlated against a
+   static ELF/DWARF disassembly — a substantially bigger undertaking than
+   anything built so far in this file or in `M3_PERFETTO_VISUALIZATION_PLAN.md`.

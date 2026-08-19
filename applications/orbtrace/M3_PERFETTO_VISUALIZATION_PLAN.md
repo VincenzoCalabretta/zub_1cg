@@ -67,7 +67,7 @@ and for any future living plan document in this repo.
 | 2 | ITM SWIT packet decoder | DONE (2026-08-19) — `decode_itm_stream`/`ItmPacket` in `model/src/lib.rs`, host-tested incl. garbage-resync |
 | 3 | Event → Perfetto track/slice semantic mapping | DONE (2026-08-19) — `classify_port0`/`build_perfetto_trace` in `model/src/lib.rs`, including the sync-gap counter track; classification is a documented best-effort heuristic, see the update below |
 | 4 | Perfetto trace file writer | DONE (2026-08-19) — JSON Chrome-trace format only, `perfetto_json` in `model/src/lib.rs`; protobuf v2 stretch goal still not started |
-| 5 | CLI wiring (`orbtrace decode-trace`) + end-to-end validation | DONE (2026-08-19) for host-only structural validation; **NOT DONE** for real-hardware capture and **NOT DONE** for the human-in-the-loop ui.perfetto.dev visual check — see the update below |
+| 5 | CLI wiring (`orbtrace decode-trace`) + end-to-end validation | DONE (2026-08-19) for host-only structural validation **and** a real-hardware capture run through `decode-trace` end-to-end; **NOT DONE** for the human-in-the-loop ui.perfetto.dev visual check — file handed to the user, see the update below |
 | 6 | Capture throughput / sync-loss improvement | **Not owned by this document** — this is `M3_TRACE_VERIFICATION_PLAN.md`'s existing Phase E open item; this pipeline works with however much real content a capture yields today, sparse or not |
 
 ## 2. What already exists to build on (confirmed 2026-08-19)
@@ -398,3 +398,90 @@ this one, for the current bitstream/flash state (section 0, item 5 of
 4. Protobuf `TrackEvent` v2 stretch goal (section 7): still not started;
    fetch the real current `.proto` definitions before attempting it, per
    the plan's original caution.
+
+### Update 2026-08-19 (continued): first real-hardware capture run through `decode-trace`
+
+**Board state at start:** already flashed with the real Orbtrace bitstream
+and running (`orbtrace info 192.168.1.50` → `ZUBoard-Orbtrace/1`
+immediately, no reflash needed — the board had been left running since a
+prior session). No `jtag_flash.sh`/reflash performed this session.
+
+**Procedure (Phase F's exact known-good recipe, all via the Bazel-built
+`orbtrace` binary, no JTAG/xsct involved):**
+```sh
+orbtrace configure 192.168.1.50 m3 tpiu4 2000000
+orbtrace start 192.168.1.50
+orbtrace capture 192.168.1.50 real_capture.bin 8388608 &   # backgrounded
+orbtrace load-m3 192.168.1.50 m3_app.bin   # immediately after, to pin sequence near 0
+# ~150s later:
+kill %1   # stop the capture
+orbtrace decode-trace real_capture.bin real_trace.json
+```
+`m3_app.bin` was rebuilt fresh this session
+(`bazel build //applications/orbtrace/firmware/m3_app:m3_app`, then
+`arm-none-eabi-objcopy -O binary` on the resulting `m3_app` symlink, per
+`M3_TRACE_VERIFICATION_PLAN.md`'s recipe) rather than reused from a stale
+artifact — see that document's own D2 "stale artifact" lesson for why
+that distinction matters.
+
+**Result:** `real_capture.bin` was 552 raw bytes. `decode-trace` printed:
+```
+channel 1: 76 valid frames
+channel 1: 248 raw bytes, 66/116 packets recognized as SWIT
+66 track events, 0 sequence-gap samples
+```
+— channel-1-only content, consistent with every prior session's finding
+(Phase E/F). `channel_histogram` saw no other channel at all in this
+capture (not just "channel 1 won", literally the only channel present).
+44% of decoded packets were `Unrecognized` (resync noise from the
+already-documented high false-lock rate) — expected, not a decoder bug.
+Of the 66 recognized `Swit` packets, **all 66 landed on ports 1 and 5**
+(40 and 26 respectively) — zero landed on port 0, so no `Timestamp`/
+`Idle`/`Malformed`/`Fault` events were recovered in this particular
+window, and the `sequence_gaps` counter's `0` is consequently not
+evidence of a clean run — it's undefined-by-absence (no `Timestamp` was
+recovered to compare against a next one), not "no gaps found". This is a
+sparse-and-random sample, exactly as Phase E/F predicted: which specific
+SWIT packets survive the sync-loss-heavy channel is close to random,
+not something a fixed short window is guaranteed to cover port 0 at all.
+A longer capture window (Phase E/F's own next-step item, not owned by
+this document) would raise the odds of catching port-0 content too.
+The output parses as valid JSON (`python3 -m json.tool`/`json.load`
+both round-tripped it cleanly) with 66 `"ph":"I"` events + 8 `"ph":"M"`
+track-name events, matching `decode-trace`'s own printed counts exactly.
+
+**Handed to the user via `SendUserFile`** for the actual ui.perfetto.dev
+visual check — see section 8, this is the one step this document has
+always said no agent session can complete alone. That check has not
+happened yet as of this update.
+
+**Committed vs. scratch.** Nothing new committed this session (Phases
+1-5's code was already committed as `2cf867a`/`2246009` in a prior
+session). Scratch-only, in the session scratchpad, not committed:
+`m3_app.bin` (rebuildable via the recipe above), `real_capture.bin`
+(552 bytes, the raw capture), `real_trace.json` (the decoded output,
+also the file sent to the user).
+
+**Hardware state left behind:** M3 running (freshly reloaded this
+session via `load-m3`), Orbtrace `start`ed with `source=m3 format=tpiu4
+swo_baud=2000000` still configured, capture process killed (not the
+board — `orbtrace stop` was **not** called, so the PL side is still
+actively trying to trace; only the host-side `capture` reader that was
+writing to `real_capture.bin` was stopped). `orbtrace stats` at the
+point of stopping: `rx_bytes=1056 dropped_bytes=75479316056
+sync_loss=3749455852 fifo_high_water=63 dma_faults=0` (the huge
+dropped/sync_loss counters are cumulative-since-boot, not a regression —
+consistent with every prior session's observation). No bitstream
+reflash, no `ORBTRACE_REG_M3_CONTROL` changes, no JTAG/DAP work this
+session — that register was untouched from whatever the last Phase-G
+session left it at.
+
+**Next steps for a future session:**
+1. Once the user reports back on the ui.perfetto.dev visual check, note
+   the outcome here — that closes out Phase 5's one remaining item.
+2. If a port-0 (`Timestamp`/`Idle`/`Malformed`/`Fault`) sample is
+   specifically wanted for a future check, either run a longer capture
+   window or run `decode-trace` repeatedly across several fresh captures
+   — no code change needed, this is purely a function of how much of the
+   sync-loss-heavy channel gets sampled, which is `M3_TRACE_VERIFICATION_PLAN.md`
+   Phase E's territory, not this document's.
