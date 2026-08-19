@@ -36,8 +36,8 @@ short:
 | Phase | What | Status |
 |---|---|---|
 | 1 | Confirm what already exists and what's actually reachable from real firmware | **DONE, 2026-08-19 — analysis only, no hardware touched.** See section 2 |
-| 2 | Wire `coresight::select()` into `a53_app`'s real `configure` command handler | NOT STARTED |
-| 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | NOT STARTED |
+| 2 | Wire `coresight::select()` into `a53_app`'s real `configure` command handler | **DONE, 2026-08-19 — host unit tests + real aarch64 cross-build only, no hardware touched.** See section 9 |
+| 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | NOT STARTED |
 | 5 | Boot/load path for that target firmware | NOT STARTED |
 | 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | NOT STARTED |
@@ -195,20 +195,112 @@ packet-format assumptions instead of real captured bytes has already
 bitten this project once (`M3_TRACE_VERIFICATION_PLAN.md`'s own early
 Phase E false-starts), worth not repeating.
 
+## 9. Phase 2 — real implementation (2026-08-19)
+
+Wired into `firmware/a53/src/lib.rs`'s `Controller::command`, not
+`a53_app/src/main.c` as originally scoped in section 4 — the `Configure`
+command is already fully handled in Rust (`main.c` only pumps bytes
+through `orbtrace_control_feed`), so the actual hook point is the opcode-2
+match arm in `Controller::command`, one level below where section 4
+guessed the C file would need to change.
+
+- Added `RegisterIo::select_coresight_source(&mut self, a53_1: bool)`,
+  default no-op (same pattern as `write_m3_bram`/`read_m3_bram`), so
+  existing register-level test mocks are unaffected unless they opt in.
+- `Controller::command`'s `Configure` handler (opcode 2) now matches
+  `request[3]` (the wire `Source` byte: `R5 = 1`, `A53 = 2`) and calls
+  `select_coresight_source(false)`/`(true)` **before** the existing
+  `REG_SOURCE_FORMAT`/`REG_SWO_BAUD` writes, so a real core is already
+  routed to `coresight_data` by the time the PL's `source_select` picks
+  it up. `Source::CortexM3`/`Source::Test` are untouched, matching the
+  RTL mux boundary described in section 2.
+- Real hardware path: `firmware/a53/src/ffi.rs`'s `Mmio` now also
+  implements `select_coresight_source` via a new `CoresightMmio` struct
+  (implements `coresight::Mmio`, raw `write_volatile` at the absolute
+  CoreSight physical addresses — deliberately a separate address space
+  from `RegisterIo`'s `ORBTRACE_AXI_BASE`-relative offsets).
+- Three new host unit tests in `firmware/a53/src/lib.rs`
+  (`configure_r5_selects_coresight_before_source_format`,
+  `configure_a53_selects_coresight_before_source_format`,
+  `configure_m3_does_not_touch_coresight`) confirm the dispatch and
+  ordering via a recording `RegisterIo` mock.
+- Verified: `bazel test //applications/orbtrace/firmware/a53:control_firmware_test`
+  passes (all tests, including the three new ones), and
+  `bazel build --config=apu //applications/orbtrace/firmware/a53:control_firmware_a53
+  //applications/orbtrace/firmware/a53_app:all` succeeds — the real
+  aarch64-none-elf firmware compiles with the new CoreSight write path.
+  **Not yet verified on real hardware** — no capture attempted, no
+  confirmation that the funnel-select writes actually produce ETM traffic
+  on `coresight_data` for either target. That's Phase 3 onward.
+
+Committed vs. scratch: all changes are in tracked source files (`lib.rs`,
+`ffi.rs`) plus this document; nothing left in a scratch/uncommitted state.
+Hardware state: untouched this session — no board interaction happened.
+
+## 10. Phase 3 — RPU availability confirmed (2026-08-19)
+
+Section 5's proposed checks (grep `create_bd.tcl`/`board_preset.tcl`, xsct
+target enumeration, or a hand-written R5 stub) turned out to already be
+answered by existing, unrelated project infrastructure this document's
+authors hadn't cross-referenced: `applications/rpu/hello_world` (a real
+ThreadX firmware target) plus `tests/rpu_hello_world_test.sh`, which
+drives `tooling/zub_ctl`'s `watch-r5` — OpenOCD (`tooling/openocd/aes_zub.cfg`
++ `psu_init_run.tcl` + `load_r5.tcl`) boots R5-0 directly via JTAG/CoreSight
+(module reset release, OCM ELF load, PC/CPSR redirect), no FSBL, no BOOT.BIN,
+independent of the PL bitstream entirely — confirming the RPU needs no
+`create_bd.tcl`/Vivado enable at all (it's PS hardened silicon, not a
+PL-instantiated block, unlike the M3 DesignStart soft core).
+
+**Ran for real** (`bazel test --config=host --config=onboard
+--test_env=ZUB1CG_PSINIT //tests:rpu_hello_world_test`, `ZUB1CG_PSINIT`
+pointed at `sdk/boards/zub_1cg/generated/psu_init.tcl`): R5-0 released from
+reset, ran real ThreadX, and printed over UART0
+(`/dev/ttyUSB1`) — `--- ThreadX Hello World (AES-ZUB R5F) ---`,
+`[TEST BEGIN] hello_world`, `Hello, World!`, `[TEST PASS] hello_world`.
+Test **PASSED**. RPU0 is confirmed real, usable, and already has a working
+boot flow — Phase 4/5 (R5 target firmware + boot path) can build directly
+on `applications/rpu/hello_world` and `tooling/openocd/load_r5.tcl` instead
+of inventing a new path from scratch, materially shrinking those phases'
+scope from what section 7 originally assumed.
+
+**Real gotcha, worth remembering:** `psu_init_run.tcl` (chained by
+`watch-r5` before `load_r5.tcl`) runs the **full** Vitis-generated
+`psu_init` — not an RPU-scoped subset — which reprograms system-wide PS
+PLLs/clock muxes. Running this JTAG sequence while the A53 Orbtrace
+service (this session's own freshly-flashed `a53_app`) was live and
+network-reachable **silently killed its network reachability**
+(`orbtrace info`/ARP both went dead immediately after, host-side USB link
+itself stayed up — ruled out re-enumeration) — almost certainly GEM2's
+clock tree glitching from the shared PLL reprogram, not anything specific
+to R5 or to this document's own firmware changes. `aes_zub.cfg` is
+carefully scoped to avoid examining A53 CoreSight (so the A53 core itself
+plausibly kept executing throughout — not confirmed either way), but
+**`psu_init` itself is not scoped to be side-effect-free against a
+concurrently-running A53** regardless. Recovered with the standard
+`tooling/xsct/jtag_flash.sh` reflash (bitstream
+`bazel-out/orbtrace-vivado-m3-10mhz-r4/zub_orbtrace.bit` — the last
+documented known-good production build per [[orbtrace_m3_integration]],
+paired with a freshly rebuilt `a53_app` carrying this session's Phase 2
+changes); `orbtrace info 192.168.1.50` confirmed responsive again
+afterward. **Do not run any R5/RPU JTAG flow (`watch-r5`,
+`rpu_hello_world_test`, or anything sourcing `psu_init_run.tcl`) while a
+network-dependent A53 test is in progress or being relied upon** — treat
+them as mutually exclusive board sessions, plan on a reflash after
+switching from RPU work back to A53 work.
+
 ## Next steps for a future session
 
-1. **Cheapest, do first:** Phase 2 (wire `coresight::select()` into
-   `main.c`) — small, mechanical, and everything else is untestable
-   without it.
-2. Phase 3 (confirm RPU availability) — cheap, real-hardware-only check,
-   no firmware build needed if a trivial existing readback can confirm
-   RPU presence.
-3. Before committing to Phase 4's R5/A53 firmware effort, it's worth
+1. **Cheapest, do first:** Phase 4 (R5/A53 target firmware) — per section
+   10, this can now build directly on the already-working
+   `applications/rpu/hello_world` + `tooling/openocd/load_r5.tcl` boot
+   flow rather than inventing one from scratch. Remember section 10's
+   psu_init/A53-network gotcha before running any more RPU JTAG sessions.
+2. Before committing to Phase 4's R5/A53 firmware effort, it's worth
    doing the real UG1085/Cortex-A53 TRM check flagged in section 3, point
    5 — if this silicon's ETM genuinely has address/data comparators or an
    ETR path, that changes how ambitious Phases 6-8 are worth being from
    the start.
-4. Everything from Phase 4 onward is new engineering, not just wiring —
+3. Everything from Phase 4 onward is new engineering, not just wiring —
    size it accordingly before starting, the same way
    `M3_TRACE_VERIFICATION_PLAN.md` Phase H sized the ETM-on-M3 path
    before recommending against starting it without a clear bandwidth case.

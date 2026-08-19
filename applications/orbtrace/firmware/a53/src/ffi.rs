@@ -6,11 +6,27 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
-    ControlConnection, Controller, DapConnection, DmaRegisterIo, RegisterIo, AXI_DMA_BASE,
-    M3_BRAM_BASE, ORBTRACE_AXI_BASE,
+    coresight, ControlConnection, Controller, DapConnection, DmaRegisterIo, RegisterIo,
+    AXI_DMA_BASE, M3_BRAM_BASE, ORBTRACE_AXI_BASE,
 };
 
 struct Mmio;
+
+/// Raw CoreSight physical-address writer for `coresight::select()`, distinct
+/// from `RegisterIo` above: the CoreSight system map (UG1085 Figure 39-8)
+/// lives at fixed absolute physical addresses, not offsets from
+/// `ORBTRACE_AXI_BASE`.
+struct CoresightMmio;
+
+impl coresight::Mmio for CoresightMmio {
+    unsafe fn write32(&mut self, address: usize, value: u32) {
+        // SAFETY: `address` is always one of the fixed CoreSight component
+        // registers `coresight::select` writes to; the vendor BSP page
+        // tables map that whole range as device-nGnRE (see that function's
+        // own safety comment).
+        unsafe { core::ptr::write_volatile(address as *mut u32, value) };
+    }
+}
 
 impl RegisterIo for Mmio {
     fn read(&self, offset: usize) -> u32 {
@@ -64,6 +80,12 @@ impl RegisterIo for Mmio {
             // SAFETY: see `write_m3_bram`.
             *byte = unsafe { core::ptr::read_volatile((address + index) as *const u8) };
         }
+    }
+
+    fn select_coresight_source(&mut self, a53_1: bool) {
+        let mut mmio = CoresightMmio;
+        // SAFETY: see `CoresightMmio::write32`.
+        unsafe { coresight::select(&mut mmio, a53_1) };
     }
 }
 

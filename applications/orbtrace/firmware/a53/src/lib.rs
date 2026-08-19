@@ -58,6 +58,17 @@ pub trait RegisterIo {
     fn read_m3_bram(&self, _offset: usize, out: &mut [u8]) {
         out.fill(0);
     }
+
+    /// Unlock the chosen PS-side ETM (R5-0 when `a53_1` is false, A53-1 when
+    /// true) and route it through the CoreSight funnels to the TPIU, per
+    /// `coresight::select()`. Called from `Controller::command`'s `Configure`
+    /// handler (PS_CORESIGHT_TRACE_PLAN.md Phase 2) before the PL's own
+    /// `source_select` write, so a real core is already feeding
+    /// `coresight_data` by the time the PL starts routing it. Default no-op:
+    /// only the real hardware `Mmio` impl touches the fixed CoreSight
+    /// physical address range; existing register-level test mocks don't need
+    /// to exercise this path unless they opt in.
+    fn select_coresight_source(&mut self, _a53_1: bool) {}
 }
 
 pub struct Controller<IO> {
@@ -223,6 +234,15 @@ impl<IO: RegisterIo> Controller<IO> {
                 Ok(info.len())
             }
             2 if request.len() == 9 => {
+                // Source::R5 = 1, Source::A53 = 2 (model/src/lib.rs). Route
+                // the chosen PS-side ETM through the CoreSight funnels before
+                // the PL's own source_select below picks up coresight_data --
+                // PS_CORESIGHT_TRACE_PLAN.md Phase 2.
+                match request[3] {
+                    1 => self.io.select_coresight_source(false),
+                    2 => self.io.select_coresight_source(true),
+                    _ => {}
+                }
                 let baud = u32::from_le_bytes([request[5], request[6], request[7], request[8]]);
                 self.io.write(
                     REG_SOURCE_FORMAT,
@@ -638,6 +658,55 @@ mod tests {
         let offset = (M3_BRAM_SIZE as u32).to_le_bytes();
         let request = [1, 0, 7, offset[0], offset[1], offset[2], offset[3], 0xaa];
         assert_eq!(controller.command(&request, &mut response), Err(()));
+    }
+
+    #[derive(Default)]
+    struct CoresightSelectIo {
+        reg_writes: Vec<(usize, u32)>,
+        selects: Vec<bool>,
+    }
+    impl RegisterIo for CoresightSelectIo {
+        fn read(&self, _offset: usize) -> u32 {
+            0
+        }
+        fn write(&mut self, offset: usize, value: u32) {
+            self.reg_writes.push((offset, value));
+        }
+        fn select_coresight_source(&mut self, a53_1: bool) {
+            self.selects.push(a53_1);
+        }
+    }
+
+    #[test]
+    fn configure_r5_selects_coresight_before_source_format() {
+        let mut controller = Controller::new(CoresightSelectIo::default());
+        let mut response = [0; 8];
+        // [version_lo, version_hi, opcode=2, source=1 (R5), format=0, baud:u32 LE]
+        let request = [1, 0, 2, 1, 0, 0, 0, 0, 0];
+        assert_eq!(controller.command(&request, &mut response), Ok(1));
+        assert_eq!(controller.io.selects, [false]);
+        assert_eq!(controller.io.reg_writes[0], (REG_SOURCE_FORMAT, 1));
+    }
+
+    #[test]
+    fn configure_a53_selects_coresight_before_source_format() {
+        let mut controller = Controller::new(CoresightSelectIo::default());
+        let mut response = [0; 8];
+        // [version_lo, version_hi, opcode=2, source=2 (A53), format=0, baud:u32 LE]
+        let request = [1, 0, 2, 2, 0, 0, 0, 0, 0];
+        assert_eq!(controller.command(&request, &mut response), Ok(1));
+        assert_eq!(controller.io.selects, [true]);
+        assert_eq!(controller.io.reg_writes[0], (REG_SOURCE_FORMAT, 2));
+    }
+
+    #[test]
+    fn configure_m3_does_not_touch_coresight() {
+        let mut controller = Controller::new(CoresightSelectIo::default());
+        let mut response = [0; 8];
+        // [version_lo, version_hi, opcode=2, source=0 (CortexM3), format=0, baud:u32 LE]
+        let request = [1, 0, 2, 0, 0, 0, 0, 0, 0];
+        assert_eq!(controller.command(&request, &mut response), Ok(1));
+        assert!(controller.io.selects.is_empty());
     }
 
     #[test]
