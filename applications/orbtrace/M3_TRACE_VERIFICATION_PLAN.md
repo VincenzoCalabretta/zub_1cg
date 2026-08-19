@@ -6,6 +6,11 @@ TCP 3402, and (separately) that the CMSIS-DAP/JTAG debug path over TCP 3240
 reaches the same M3 for real. This is the concrete test of "the orbtrace
 testing capabilities" the M3 integration was built for.
 
+This document is scoped to the M3 soft core specifically. For the PS's own
+hardened R5/A53 cores as trace/debug targets — a different, structurally
+more capable path using the same `orbtrace` application's already-partially-built
+`Source::R5`/`Source::A53` support — see `PS_CORESIGHT_TRACE_PLAN.md`.
+
 ## Status (2026-08-17, updated)
 
 | Phase | What | Status |

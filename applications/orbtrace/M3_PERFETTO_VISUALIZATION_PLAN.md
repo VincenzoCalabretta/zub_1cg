@@ -10,7 +10,9 @@ Rust code in `applications/orbtrace/model`, no vendored C toolchain
 This document is the living plan for that work, in the same spirit as
 `M3_TRACE_VERIFICATION_PLAN.md`. See section 0 for how to use/extend it —
 that section is itself the deliverable the user asked for alongside the
-plan, and applies to both documents.
+plan, and applies to both documents (and to `PS_CORESIGHT_TRACE_PLAN.md`,
+which covers the PS's R5/A53 cores as trace targets and expects to reuse
+this document's Perfetto JSON writer rather than duplicate it).
 
 ## 0. How to hand off sessions on this document
 
