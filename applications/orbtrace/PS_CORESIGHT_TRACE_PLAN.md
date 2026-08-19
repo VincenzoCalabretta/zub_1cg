@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-19 — 3 real bugs found+fixed (2 addr/offset, 1 wrong psu_init.tcl); real bytes reach the PL FIFO but `rx_bytes` stays 0; `TRCAUXCTLR.SYNCDELAY` fix applied, not (yet confirmed) sufficient; ad hoc JTAG readback verification has hit real reliability limits.** See section 15 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 — real ILA capture on `trace_clk` is DECISIVE: the PS trace port outputs a clean, periodic 2-value idle pattern, not real ETM content. Previous "TPIU sync-packet" hypothesis is moot — the real question is why no genuine ATB traffic ever leaves the ETM/funnel chain.** See section 16 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -763,47 +763,166 @@ this session's own methodology, not a new hardware finding.** The
 firmware-level fix should be trusted based on correct write ordering
 (host-tested) rather than a post-hoc external read.
 
-**Session end state:** `AUXCTLR_SYNCDELAY` change committed (real,
-TRM-justified, worth keeping regardless of whether it alone is
-sufficient). Board left flashed with this firmware + the Orbtrace-specific
-`psu_init.tcl`; R5-0 running `orbtrace_workload`; `orbtrace info`
-confirmed responsive.
+**Session end state (superseded by section 16 below — kept for history):**
+`AUXCTLR_SYNCDELAY` change committed (real, TRM-justified, worth keeping
+regardless of whether it alone is sufficient). Board left flashed with
+this firmware + the Orbtrace-specific `psu_init.tcl`; R5-0 running
+`orbtrace_workload`; `orbtrace info` confirmed responsive.
+
+## 16. Phase 6 continued — real ILA capture, decisive: no genuine ETM content ever leaves the PS (2026-08-20)
+
+Section 15 recommended a real PL-side ILA capture over further JTAG
+register probing, since `TRCSTATR.PMSTABLE=0` makes live APB reads of ETM
+config registers architecturally unreliable while tracing. Did exactly
+that.
+
+**Built a diagnostic bitstream** (`bazel-out/orbtrace-vivado-ps-etm-ila-debug`,
+~17 minutes with the cached M3 EDIF — see below for tooling): a
+`system_ila` in NATIVE mode, clocked directly on `trace_clk` (i.e.
+`ps/trace_clk_out`, the PS trace port's own real clock, not `aclk` — one
+sample per real byte, no async-oversampling ambiguity, mirroring
+`M3_TRACE_VERIFICATION_PLAN.md`'s own proven preference for native-clock
+capture over its own earlier aclk-domain attempts). Four probes, all
+temporary combinational passthroughs added to `orbtrace_pl.v` (reverted
+after use, `git diff` clean): `dbg_trace_data_raw` (raw `trace_data[3:0]`
+pins, sampled once per `trace_clk` rising edge — inherently only sees half
+of what feeds the DDR reconstruction, which samples both edges, but still
+useful as a coarse check), `dbg_trace_byte`/`dbg_trace_valid` (the
+`orbtrace_ddr_capture` instance's own reconstructed byte output, the real
+signal of interest), `dbg_cdc_write_ready` (whether the CDC FIFO's write
+side is backpressured).
+
+**Tooling notes for next time (session scratch, not committed — recreate
+from this description, per `M3_TRACE_VERIFICATION_PLAN.md`'s own
+established convention):**
+- `create_bd_debug.tcl` = `source` the real `create_bd.tcl` verbatim, then
+  append one `system_ila` (`xilinx.com:ip:system_ila:1.1`, `C_MON_TYPE
+  {NATIVE}`, 4 probes matching the widths above, `C_DATA_DEPTH {4096}`),
+  wired via plain `connect_bd_net` calls (`debug_ila/clk` ←
+  `ps/trace_clk_out`; each probe ← the matching `trace_pl/dbg_*` pin). A
+  cheap `validate_bd_design`/`generate_target` sanity pass (~1 minute, no
+  synthesis) caught nothing wrong — the real build didn't need a second
+  attempt.
+- `build_debug.tcl` = `build.tcl` with three changes: source
+  `create_bd_debug.tcl` instead of `create_bd.tcl`; default P&R directives
+  instead of `AggressiveExplore` (this throwaway bitstream doesn't need
+  timing-closure effort); the CDC/methodology/timing `error` gates
+  downgraded to non-fatal `puts` (this build isn't meant to be a
+  production artifact) — same relaxed-gate pattern
+  `M3_TRACE_VERIFICATION_PLAN.md` used for its own diagnostic builds.
+  `M3_OOC_EDIF=bazel-out/m3-ooc-2019/m3_core.edf` (the cached pre-2019.1
+  M3 IP netlist, found via `find ~/.cache/bazel -iname "*.edf"` — real,
+  present, contrary to section 12's earlier "none found" note, which
+  evidently didn't search broadly enough) cut the build to ~17 minutes.
+  Result came back genuinely clean anyway: positive setup/hold slack
+  (1.805ns / 0.010ns), only the same known M3-related methodology
+  warnings this design always has.
+- Flashed via the normal `jtag_flash.sh` flow (never a raw
+  `program_hw_devices` reprogram), paired with *this build's own* exported
+  `psu_init.tcl` (same section-14 lesson: always use the build-specific
+  one).
+- Arming/capture via Vivado Hardware Manager Tcl batch mode:
+  `open_hw_manager`/`connect_hw_server`, **`set_property PARAM.FREQUENCY
+  1000000 [get_hw_targets]` before `open_hw_target`** (the
+  `M3_TRACE_VERIFICATION_PLAN.md`-documented fix for slow-clock JTAG scan
+  flakiness — default TCK violates the debug hub's `TCK ≤
+  clock/2.5` minimum ratio), then `PROBES.FILE` set on the `hw_device`
+  *before* `refresh_hw_device` (order matters). Triggered on
+  `dbg_trace_valid==1`; triggered essentially instantly, since the signal
+  had already been continuously asserted (matches `fifo_high_water`
+  staying pegged). `upload_hw_ila_data` + `write_hw_ila_data -csv_file`
+  for offline analysis — much easier to `awk`/`sort`/`uniq -c` a CSV than
+  to read a GUI waveform.
+
+**The capture is decisive, and overturns the section 14/15 framing.**
+4096 real samples, exactly **two** distinct byte values in
+`dbg_trace_byte`: `0xFF` (3072 samples, 75%) and `0xDF` (1024 samples,
+25%), in a perfectly regular period-4 pattern (`FF FF FF DF` repeating,
+without exception, for the entire ~40µs window).
+`dbg_trace_data_raw` read a constant `0xF` throughout (consistent with
+this being only a single-edge sample of a signal whose real variation
+happens to fall on the un-sampled edge — not itself informative beyond
+"nothing is obviously stuck at 0"). `dbg_cdc_write_ready` stayed `1`
+throughout this window.
+
+**This is a clean idle-pattern signature, not genuine ETM trace content.**
+Real instruction/branch trace, even for a small deterministic workload,
+would show far higher byte-value entropy than two values in a fixed
+period-4 cycle. **Conclusion: the PS trace port's physical output is
+alive and toggling (explaining `fifo_high_water>0` — the PL correctly
+captures *something* continuously), but no genuine ETM ATB traffic is
+reaching it at all** — despite `TRCSTATR` showing `IDLE=0` (the ETM
+believes it is not idle) in every JTAG readback taken this investigation.
+This makes section 14/15's entire "does the TPIU ever emit a Full Sync
+Packet" framing **premature** — there is no real trace content for it to
+frame *from* in the first place. `TRCAUXCTLR.SYNCDELAY` (section 15) may
+still be correct/worth keeping, but it was answering the wrong question.
+
+**Real, live power-domain check ruled out one candidate cause:** verified
+via `dap dpreg 0x4` (already done in section 15) that `CSYSPWRUPACK`/
+`CDBGPWRUPACK` are asserted — the FPD debug power domain is genuinely up,
+so power gating on the funnel/TPIU/ETM's *register* access isn't the
+explanation (consistent with every register read/write "working" all
+along). Checked `TRCPDCR`/`TRCPDSR` (DDI0500J 13.8.42/13.8.43, offsets
+`0x310`/`0x314`) — `TRCPDSR.POWER` must already be `1` for any of this
+investigation's register reads to have succeeded at all (`POWER=0` means
+"registers not accessible, error response"), so the ETM's own trace-unit
+power state isn't gating this either. Neither of these register-level
+theories explains a "believes it's tracing, produces nothing" ETM.
+
+**What remains unexplained, and is now the real open question:** why does
+genuine ATB traffic never leave the ETM (or never survive to the funnel/
+TPIU) despite every register this investigation has checked reading back
+consistent with "should be tracing"? Two live hypotheses, neither
+confirmed:
+1. A CoreSight Cross-Trigger Interface (CTI) "start trace" event is
+   required at the system level, distinct from any single component's own
+   enable bits — UG1085's Table 39-12 lists CTI 0/1/2 as real,
+   present components in this exact SoC, never touched by this
+   investigation at all. Many ARM reference CoreSight designs use CTI
+   channels to synchronize a trace-start pulse across multiple components;
+   if this SoC's funnel/ETM path structurally depends on one, no amount of
+   individual-register configuration would substitute for it.
+2. Some other funnel- or ATB-handshake-level configuration this
+   investigation hasn't found yet — the Arm CoreSight SoC-400 TRM (still
+   missing, see section 13) is the authoritative reference for exactly
+   this class of question (funnel behavior beyond the simple port-enable
+   bitmask already confirmed working via real Peripheral ID readback).
+
+**Session end state:** all temporary RTL debug ports reverted (`git diff`
+clean on `orbtrace_pl.v`). Board reflashed back to the last known-good
+*production* bitstream (`bazel-out/orbtrace-vivado-m3-10mhz-r4`) + its own
+correct `psu_init.tcl` + current `a53_app`; `orbtrace info` confirmed
+responsive. Diagnostic ILA bitstream still cached at
+`bazel-out/orbtrace-vivado-ps-etm-ila-debug` (bitstream + `.ltx` probes
+file) for a future session to re-arm/re-capture without another ~17-minute
+rebuild, if useful (e.g. probing CTI-adjacent signals instead, or the
+funnel's own ATB input/output directly, once temporary debug ports for
+those are threaded through). No destructive hardware state left behind.
 
 ## Next steps for a future session
 
-1. **Cheapest, do first, and don't lose the section 14 fix:** update the
-   *documented* Orbtrace hardware workflow (`AGENTS.md`'s "Flash over
-   JTAG" section — already updated this session, but re-verify a future
-   session actually follows it) to use the Orbtrace-specific
-   `psu_init.tcl` (`bazel-out/<build>/psu_init.tcl`, next to
-   `zub_orbtrace.bit`) instead of `sdk/boards/zub_1cg/generated/psu_init.tcl`
-   for *any* Orbtrace hardware session — this affects the M3 trace-clock
-   path too, potentially relevant to revisiting
-   `M3_TRACE_VERIFICATION_PLAN.md`'s own still-unresolved Parallel-mode
-   findings. `[[hardware_test_environment]]` and `[[board_bitstream_state]]`
-   are updated with this finding.
-2. **Given JTAG readback's now-demonstrated unreliability for this
-   specific question (section 15), a real PL-side ILA capture on
-   `coresight_data` at the `orbtrace_pl`/`orbtrace_tpiu_demux` boundary is
-   now the more trustworthy next step** — the same proven methodology
-   `M3_TRACE_VERIFICATION_PLAN.md` used repeatedly, and one that doesn't
-   depend on architecturally-unstable APB reads. With real bytes confirmed
-   reaching the FIFO (section 14), this would show their actual byte
-   pattern directly: does a genuine `0xFFFFFF7F` Full Sync Packet ever
-   appear (settling whether `SYNCDELAY` alone was sufficient, insufficient,
-   or irrelevant), or is the content some other framing entirely (e.g. a
-   capture-phase/bit-ordering issue specific to this never-before-exercised
-   PS-path `orbtrace_ddr_capture` instance, distinct from the M3 path's own
-   instance). Real cost: ~20-90 min Vivado build (faster with a cached
-   EDIF, though none was found for this exact build during this session's
-   feasibility check) — size accordingly before starting, per this
-   document's own recurring guidance.
+1. **Cheapest, do first:** the CTI hypothesis (section 16, item 1) is
+   concrete and checkable without another Vivado rebuild — read the CTI
+   components' registers via JTAG (Figure 39-8 gives their addresses:
+   `CTI 0/1/2` at `CORESIGHT_BASE + 0x0019_0000`/`0x001A_0000`/`0x001B_0000`)
+   to see their current state, and check whether UG1085 or DDI0500J's own
+   CTI-adjacent sections (not yet read closely this investigation) describe
+   a required trigger sequence. If a CTI trigger genuinely is required,
+   implementing it is real, scoped firmware work in `coresight::select()`/
+   `enable_trace()`, not another guess-and-check cycle.
+2. The diagnostic ILA bitstream is still cached
+   (`bazel-out/orbtrace-vivado-ps-etm-ila-debug`) — if the CTI check (item
+   1) doesn't resolve it, re-arming it (no rebuild needed, `PROBES.FILE`
+   + `refresh_hw_device` + `run_hw_ila`, see section 16's tooling notes)
+   with different trigger conditions or against the A53-1 target instead
+   of R5-0 (ruling in/out something RPU-specific vs. a structural gap
+   affecting both targets) is cheaper than a fresh build.
 3. Get the real **Arm CoreSight SoC-400 Technical Reference Manual**
-   (UG1085's own Ref 39 citation for Funnel/TPIU/DAP/Timestamp/CTI) — not
-   currently in the private reference-document archive; check there first
-   before searching further afield. Still useful even if the ILA capture
-   (item 2) runs first, e.g. to explain WHY a needed mechanism works once
-   the ILA shows WHAT'S happening.
+   (UG1085's own Ref 39 citation) — not in the private archive; check
+   there first before searching further afield. Now specifically targeted
+   at: does the funnel/ETM path on this SoC require a CTI-triggered start,
+   and if so, the exact register sequence.
 4. Once `rx_bytes` moves, mirror `M3_TRACE_VERIFICATION_PLAN.md`'s Phase
    E/F methodology exactly: confirm real content recovery against
    `applications/orbtrace/firmware/rpu`'s known-reproducible `Workload`
