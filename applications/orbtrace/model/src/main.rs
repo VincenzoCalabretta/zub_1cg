@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn usage() -> ! {
-    eprintln!("usage:\n  orbtrace info|stats|start|stop|reset HOST\n  orbtrace configure HOST SOURCE FORMAT SWO_BAUD\n  orbtrace capture HOST FILE [BYTES]\n  orbtrace replay FILE LISTEN_ADDR\n  orbtrace dap HOST HEX_PACKET\n  orbtrace remote-bitbang HOST LISTEN_ADDR\n  orbtrace load-m3 HOST FILE\n  orbtrace gen-registers");
+    eprintln!("usage:\n  orbtrace info|stats|start|stop|reset HOST\n  orbtrace configure HOST SOURCE FORMAT SWO_BAUD\n  orbtrace capture HOST FILE [BYTES]\n  orbtrace replay FILE LISTEN_ADDR\n  orbtrace dap HOST HEX_PACKET\n  orbtrace remote-bitbang HOST LISTEN_ADDR\n  orbtrace load-m3 HOST FILE\n  orbtrace m3-control HOST BITS\n  orbtrace gen-registers");
     std::process::exit(2)
 }
 
@@ -300,6 +300,19 @@ fn run() -> io::Result<()> {
         ),
         "replay" if args.len() == 3 => replay(Path::new(&args[1]), &args[2]),
         "load-m3" if args.len() == 3 => load_m3(&args[1], Path::new(&args[2])),
+        "m3-control" if args.len() == 3 => {
+            // Raw ORBTRACE_REG_M3_CONTROL write -- Phase G needs this to set
+            // M3_CONTROL_DAP_REAL (bit 1) alongside M3_CONTROL_RELEASE (bit
+            // 0) without re-asserting M3 reset. No prior CLI exposed this;
+            // load_m3() only ever calls Command::M3Control internally.
+            let bits: u8 = if let Some(hex) = args[2].strip_prefix("0x") {
+                u8::from_str_radix(hex, 16).map_err(invalid)?
+            } else {
+                args[2].parse().map_err(invalid)?
+            };
+            transact(&args[1], &Command::M3Control { bits })?;
+            Ok(())
+        }
         "remote-bitbang" if args.len() == 3 => remote_bitbang(&args[1], &args[2]),
         "configure" if args.len() == 5 => {
             let response = transact(

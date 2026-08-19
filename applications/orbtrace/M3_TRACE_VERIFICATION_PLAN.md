@@ -17,8 +17,8 @@ testing capabilities" the M3 integration was built for.
 | C | Build, flash, and bring up the board | DONE — hybrid build passes all gates (WNS=+0.071ns, CDC/methodology clean), flashed to real hardware, `orbtrace info` confirms `ZUBoard-Orbtrace/1` |
 | D | Load the M3 firmware image | **DONE — both D1 and D2 confirmed fully working**, 2026-08-17. Two hardware bugs fixed (dual-port tied-off BRAM port; a write-pacing 4:1 word-drop fixed by routing `m3_mem_ctrl` through a dedicated `axi_interconnect`) plus a real vendored NetX ARP-table race fixed (see below) — but D2's long "hang" this session turned out to be **two stacked build/flash mistakes, not a design bug**: `jtag_flash.sh` was repeatedly given a stale (`2026-08-09`) `a53_app_elf` artifact instead of the freshly-rebuilt `a53_app` symlink, so none of this session's firmware edits were ever actually running; independently, the board was flashed with `hybrid-fix2` (the *pre*-BRAM-fix bitstream) instead of `hybrid-fix3` during the whole D2 investigation. Once both were corrected, D2 completes cleanly and repeatably, including as the very first command after a fresh reflash. See the 2026-08-17 "stale artifact" correction below for the full account |
 | E | Configure Orbtrace and start capture | **SUBSTANTIVELY DONE, 2026-08-19 — real, clean, channel-1-only CoreSight content decoded on real hardware for the first time in this entire investigation.** Root cause: `orbtrace_tpiu_demux.sv`'s sync-word search had the byte order backwards (searched for `0x7F` then three `0xFF`, when the real CoreSight Full Sync Packet is chronologically three `0xFF` then `0x7F` — confirmed against sigrok's independent reference decoder and real ILA capture data). Fixed (`32'hffffff7f`→`32'h7fffffff`), simulation-validated with a new dedicated testbench, then confirmed on real hardware: `orbtrace stats` shows `rx_bytes` genuinely and repeatably nonzero (11→173 over ~2 minutes) under the real (non-marker) firmware, and decoding the capture shows every byte is checksum-valid, exclusively on channel 1, zero garbage channels — a first. `dropped_bytes`/`sync_loss` remain huge (expected/correct: the false-lock-on-idle-alias problem the 2026-08-18 channel-plausibility gate handles is still active and doing its job). Remaining for a future session: Phase F's full byte-for-byte diff against the `Workload` reference (not required to call Phase E itself done) — see the 2026-08-19 section below for full detail |
-| F | Verify the captured trace is genuinely correct | NOT STARTED — unblocked, follows E |
-| G | Verify the real JTAG debug path | NOT STARTED — unblocked (the JTAG-DAP bit-bang path to `m3_control` was previously confirmed working) |
+| F | Verify the captured trace is genuinely correct | **DONE, 2026-08-19 — genuine content recovery confirmed**, not just correct framing. A capture synchronized to a fresh `load-m3` reload (so the `Workload(seed=7)` reference's `sequence` starts near 0, unlike the previous unsynced attempt which could never find a contiguous match against an unknown, possibly-huge sequence offset) found 9 order-preserving, exact byte-string matches of width≥2 (3- or 5-byte) reference events in a 223-byte reconstructed stream, against an analytically-expected ~1.4 and empirically-observed 2-3 coincidental matches from shuffled/random controls. See the 2026-08-19 "Phase F" section below |
+| G | Verify the real JTAG debug path | **ATTEMPTED, 2026-08-19 — not working yet, real negative findings recorded.** `ORBTRACE_REG_M3_CONTROL=0x3` set, `orbtrace remote-bitbang` bridge confirmed live, but both OpenOCD's `scan_chain` and a raw hand-bitbanged probe (including the standard ARM SWD→JTAG switch sequence) read the JTAG-DP as permanently silent (TDO stuck at 0, IR capture `0x00` instead of the mandatory `0x01`) — see the 2026-08-19 "Phase G" section below for what was ruled out and what's still open |
 
 Phases 1 through D are all done and verified against real hardware, not
 just tooling or reasoning — this includes a full synth/impl/route cycle on
@@ -2919,3 +2919,143 @@ still responsive (`orbtrace info` → `ZUBoard-Orbtrace/1`) afterward.
 4. Commit the two real RTL fixes (channel-plausibility gate + sync byte-order) and the new
    `orbtrace_tpiu_demux_tb.sv` testbench once reviewed — both are working, verified changes
    sitting uncommitted in the working tree.
+
+**Update 2026-08-19 (later): items 1 and 4 above are done — commit `cbce37d` recorded this
+whole investigation, and the byte-order/plausibility-gate fixes are already committed
+(`abb1bf0`/`4e3afcf`). This continuation covers Phase F and a first real attempt at Phase G.**
+
+## 2026-08-19 continuation — Phase F: genuine content recovery confirmed
+
+**Board state at start:** still running `orbtrace-vivado-m3-sync-order-fix` with the real
+(non-marker) firmware, `orbtrace info` responsive, `orbtrace stats` showing leftover nonzero
+`rx_bytes` from the previous session (capture had been left configured/running).
+
+**First attempt (unsynced) — inconclusive, as the previous session's own note predicted.**
+A 240s capture (629 raw bytes, 285 bytes of reconstructed channel-1 ITM content after
+COBS/checksum unframing) tried against a `Workload(seed=7)` reference generated for
+200,000 iterations found only 4 order-preserving byte-string matches — LOWER than a
+shuffled-order control (6) and barely above a random-event control (2). Confirms the
+previous session's own diagnosis: the M3 had been running continuously since an earlier,
+unknown boot, so its real `sequence` counter at capture time was some large, unknown offset
+— matching against a reference that assumes `sequence` starts near 1 can't work regardless
+of how much real content is actually present.
+
+**Fix: synchronize the reference to a known start.** `orbtrace load-m3 HOST m3_app.bin`
+resets `state`/`sequence` to their static-initialized values (7/0) as a side effect of
+reloading the BRAM image — running this immediately after starting a fresh capture pins the
+real firmware's sequence to a known near-zero start, matching what the `Workload(seed=7)`
+reference already assumes. Re-ran: 200s capture, 503 raw bytes, 223 bytes reconstructed
+channel-1 content.
+
+**Result — real signal, not aliasing.** Matching methodology refined based on the first
+attempt's own noise floor: width-1 (2-byte: 1 header + 1 payload byte) events have a much
+higher baseline chance-collision rate (~1/65536 per byte position) than width≥2 events
+(3-byte/24-bit or 5-byte/40-bit needles, ~1/16.7M or ~1/4.3B per position) in a short
+haystack, so they were reported separately rather than lumped into one headline number (the
+lumped number is exactly what made the first, unsynced attempt look like pure noise). Of
+206,250 width≥2 reference events tried: **9 matched, in strictly increasing byte-stream
+order**, against an analytically-expected ~1.4 coincidental matches (223 haystack positions
+× ~1/16.7M chance × ~103k width-2 attempts) and empirically-observed 2-3 matches from a
+shuffled-order-of-the-same-bytes control and a random-unrelated-SWIT-packets control. 9 real
+vs. ~1-3 both controls, with the temporal-ordering constraint additionally ruling out
+independent chance alignment, is not plausible as coincidence.
+
+**Conclusion: Phase F's acceptance bar is met.** The channel-1 content Phase E found isn't
+just correctly-framed noise that happens to pass the checksum and channel-plausibility gate
+— specific, correctly-sequenced `Workload` reference events (port/width/value all matching)
+are genuinely present in the decoded stream. The very low absolute byte count (223 bytes
+recovered from 200s of continuous real STIM traffic) reflects the already-documented high
+false-lock/sync-loss rate, not a content-correctness problem — most real content is still
+lost between successful locks (see Phase E's already-noted future-throughput-improvement
+item), but what does get through is real.
+
+**Tooling (scratch-only, not committed — recreate from this description if reused):**
+`verify_phase_f.py` — decodes an `orbtrace capture` file (COBS/orbflow unframe per
+`model/src/lib.rs`'s exact algorithm, hand-ported to Python), reconstructs the raw ITM byte
+stream per orbflow channel, generates the `Workload(seed=7)` reference event sequence
+(direct port of `firmware/m3/src/lib.rs`/`firmware/m3_app/src/main.c`'s `emit_next()`),
+encodes each reference event as its expected ARMv7-M ITM SWIT header+payload byte string
+(`header = (port<<3)|size_code`, `size_code` 1/2/3 for 1/2/4-byte payloads), then does a
+greedy order-preserving subsequence search plus shuffled-order and random-event controls.
+Lives at `/tmp/.../scratchpad/verify_phase_f.py` this session — small and self-contained
+enough to regenerate from this description, or worth committing as a real diagnostic tool if
+a future session wants it kept.
+
+## 2026-08-19 continuation — Phase G: first real attempt, JTAG-DP not yet responding
+
+**Setup, all real, no RTL changes:** added a small CLI gap-fill —
+`orbtrace m3-control HOST BITS` (`model/src/main.rs`) — since no prior CLI command exposed a
+raw `Command::M3Control` write (the protocol opcode already existed, `load_m3()` just never
+exposed it standalone). Used it to set `ORBTRACE_REG_M3_CONTROL=0x3` (bit0 `m3_release` kept
+set so this doesn't re-assert CPU reset, bit1 `m3_dap_real` newly set to route the DAP
+bit-banger at the real M3 instead of the synthetic responder). `orbtrace remote-bitbang HOST
+127.0.0.1:9999` confirmed it accepts a client connection and bridges to TCP 3240 (CMSIS-DAP)
+without error.
+
+**OpenOCD attempt:** a probe-only config (`jtag newtap m3 tap -irlen 4 ...`, no
+`-expected-id` so as not to hard-fail on a guess, `remote_bitbang` transport at
+`127.0.0.1:9999`) run as `openocd -f ... -c "init; scan_chain; shutdown"`. Result: **`JTAG
+scan chain interrogation failed: all zeroes`**, then `IR capture error; saw 0x00 not 0x01` —
+the mandatory IEEE 1149.1 IR-capture LSB (always 1) never appears; TDO reads as a constant 0
+regardless of what's shifted in.
+
+**Hypothesis tested and ruled out: the M3's combined SWJ-DP (per `create_bd.tcl`'s own
+comment, "autodetects JTAG vs SWD from the standard switch sequence") might be latched into
+SWD mode, and OpenOCD's plain `remote_bitbang` JTAG transport never sends the ARM ADIv5
+§5.2.1 SWD→JTAG switch sequence (0xE73C, LSB-first) the way a real SWD-aware adapter would.**
+Wrote `swj_probe.py`, a raw remote-bitbang client (bypasses OpenOCD, talks the
+`orbtrace remote-bitbang` bridge's wire protocol directly per `model/src/main.rs`) that
+bit-bangs: ≥50-cycle line reset (TMS/SWDIO=1, safe in either protocol) → the 16-bit
+0xE73C switch sequence → ≥5-cycle JTAG Test-Logic-Reset → Run-Test/Idle → navigate to
+Shift-DR → shift 32 bits. **Still all-zero.** This doesn't rule out a JTAG/SWD mode-latch
+problem entirely (some SWJ-DP implementations only re-arm mode detection on an actual
+`nTRST` pulse, not a software-driven TMS sequence, which this probe didn't attempt — `nTRST`
+stayed at its RTL-default deasserted value throughout, since no `DAP_SWJ_Pins` command was
+ever sent to toggle it) but does rule out "just needed the standard software switch
+sequence" as a complete fix on its own.
+
+**Positive evidence `use_real_target` is genuinely active, not silently still-synthetic:**
+`orbtrace_dap_engine.sv`'s `use_real_target==0` path returns a deterministic synthetic echo
+(`response_mem[2] <= header_data ^ 8'h01`, i.e. TDO = NOT(TDI)) for every `DAP_JTAG_Sequence`
+call. Every bit sent by both the OpenOCD run and the raw probe used `TDI=0` throughout — if
+`use_real_target` were still 0, every response would read back as constant TDO=**1** (`0^1`),
+not constant 0. Getting constant 0 with `TDI=0` sent throughout is consistent with a real
+(non-synthetic) target that simply isn't driving TDO high, not with the synthetic path still
+being selected. The `M3_CONTROL` write took effect.
+
+**Positive evidence the M3 core itself is alive, and `DBGRESETn` is very likely deasserted:**
+`create_bd.tcl` ties `SYSRESETn` and `DBGRESETn` to the *same* net
+(`trace_pl/m3_reset_n_sync`) — see its own comment acknowledging this reuse. `orbtrace stats`
+taken immediately after the failed JTAG attempts still showed `dropped_bytes`/`sync_loss`
+climbing at tens of millions per second, meaning the M3 is actively executing and driving
+its TPIU continuously, which requires `SYSRESETn` (and therefore, on this design, also
+`DBGRESETn`) to be deasserted. This weighs against "debug logic held in reset" as the
+explanation, though it doesn't fully rule out some other reset/enable condition specific to
+the debug domain that isn't tied to this same net.
+
+**What's genuinely still unknown, ranked by how cheap the next check is:**
+1. Whether `TCK` is actually toggling at the M3's `SWCLKTCK` pin at all — everything above is
+   consistent with either "TCK reaches the pin but the DP doesn't respond" or "TCK never
+   reaches the pin" (e.g. an unnoticed `create_bd.tcl` wiring slip, despite the direct
+   `get_bd_pins`/connectivity read in this file looking correct). Cheapest next check with no
+   rebuild: `open_run impl_1` on the current build and `get_nets -of_objects` /
+   `get_pins` on `m3_core/SWCLKTCK`, mirroring the exact static-netlist-inspection technique
+   that found the Phase D BRAM bug — free, no hardware needed, should be tried before a new
+   ILA build.
+2. Whether this SWJ-DP's JTAG/SWD mode-latch specifically requires an `nTRST` pulse (not just
+   a TMS-driven software sequence) to re-arm — untested this session. Cheap-ish: issue a real
+   `DAP_SWJ_Pins` (`orbtrace dap` or extend `swj_probe.py`) to pulse `nTRST` low then high
+   around the switch sequence, still no rebuild required.
+3. If both of the above check out clean, this becomes a real ILA question (tap
+   `SWCLKTCK`/`SWDITMS`/`TDI`/`TDO` at the IP boundary, same proven methodology as every
+   previous real bug in this investigation) — the expensive (~20-90 min) option, not
+   attempted this session.
+
+**Housekeeping:** `orbtrace m3-control` (the new CLI subcommand) is a real, useful, working
+addition, currently uncommitted in `applications/orbtrace/model/src/main.rs`. No RTL changes
+were made this session. `verify_phase_f.py`, `swj_probe.py`, and the OpenOCD probe config are
+scratch-only (recreate from this section's description if resuming). `ORBTRACE_REG_M3_CONTROL`
+was left at `0x3` (real-DAP route selected) on the board; `orbtrace stop` was called at the
+end of this session but the DAP route was not reverted to synthetic — a future session
+picking this up should be aware `m3-control HOST 0x1` returns to the pre-Phase-G default
+(release asserted, synthetic DAP) if that matters for other testing.
