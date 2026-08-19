@@ -160,12 +160,24 @@ fn remote_bitbang(host: &str, listen: &str) -> io::Result<()> {
                 }
                 b'R' => client.write_all(if last_tdo { b"1" } else { b"0" })?,
                 b'r'..=b'u' => {
-                    // TRST/SRST combinations: DAP_SWJ_Pins
+                    // Real remote-bitbang protocol (OpenOCD's driver/remote_bitbang.c):
+                    // letters encode which of {SRST, TRST} the CLIENT is requesting
+                    // asserted, not the resulting pin level -- 'r' means neither
+                    // requested (both released), 'u' means both requested (both
+                    // asserted). Previously this match had the CMSIS-DAP pin_output
+                    // value backwards for every one of the four letters (confirmed
+                    // by tracing real OpenOCD traffic through a logging proxy: it
+                    // sends 'r' immediately after connecting, expecting a released
+                    // target, but the old mapping decoded 'r' as value 0 -- nTRST=0
+                    // and nRESET=0, i.e. BOTH asserted -- so every real OpenOCD
+                    // session held the M3's JTAG-DP in permanent TRST+SRST reset
+                    // from its very first byte. See M3_TRACE_VERIFICATION_PLAN.md's
+                    // Phase G section for the full diagnosis.
                     let value = match byte[0] {
-                        b'r' => 0,
-                        b's' => 0x80,
-                        b't' => 0x20,
-                        _ => 0xa0,
+                        b'r' => 0xa0, // neither asserted: nTRST=1, nRESET=1
+                        b's' => 0x20, // SRST asserted:    nTRST=1, nRESET=0
+                        b't' => 0x80, // TRST asserted:    nTRST=0, nRESET=1
+                        _ => 0,       // 'u', both asserted: nTRST=0, nRESET=0
                     };
                     let _ = dap_transaction(&mut dap, &[0x10, value, 0xa0, 0, 0, 0, 0])?;
                 }

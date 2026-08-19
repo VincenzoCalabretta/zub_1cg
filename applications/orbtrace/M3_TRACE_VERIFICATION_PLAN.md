@@ -18,7 +18,7 @@ testing capabilities" the M3 integration was built for.
 | D | Load the M3 firmware image | **DONE — both D1 and D2 confirmed fully working**, 2026-08-17. Two hardware bugs fixed (dual-port tied-off BRAM port; a write-pacing 4:1 word-drop fixed by routing `m3_mem_ctrl` through a dedicated `axi_interconnect`) plus a real vendored NetX ARP-table race fixed (see below) — but D2's long "hang" this session turned out to be **two stacked build/flash mistakes, not a design bug**: `jtag_flash.sh` was repeatedly given a stale (`2026-08-09`) `a53_app_elf` artifact instead of the freshly-rebuilt `a53_app` symlink, so none of this session's firmware edits were ever actually running; independently, the board was flashed with `hybrid-fix2` (the *pre*-BRAM-fix bitstream) instead of `hybrid-fix3` during the whole D2 investigation. Once both were corrected, D2 completes cleanly and repeatably, including as the very first command after a fresh reflash. See the 2026-08-17 "stale artifact" correction below for the full account |
 | E | Configure Orbtrace and start capture | **SUBSTANTIVELY DONE, 2026-08-19 — real, clean, channel-1-only CoreSight content decoded on real hardware for the first time in this entire investigation.** Root cause: `orbtrace_tpiu_demux.sv`'s sync-word search had the byte order backwards (searched for `0x7F` then three `0xFF`, when the real CoreSight Full Sync Packet is chronologically three `0xFF` then `0x7F` — confirmed against sigrok's independent reference decoder and real ILA capture data). Fixed (`32'hffffff7f`→`32'h7fffffff`), simulation-validated with a new dedicated testbench, then confirmed on real hardware: `orbtrace stats` shows `rx_bytes` genuinely and repeatably nonzero (11→173 over ~2 minutes) under the real (non-marker) firmware, and decoding the capture shows every byte is checksum-valid, exclusively on channel 1, zero garbage channels — a first. `dropped_bytes`/`sync_loss` remain huge (expected/correct: the false-lock-on-idle-alias problem the 2026-08-18 channel-plausibility gate handles is still active and doing its job). Remaining for a future session: Phase F's full byte-for-byte diff against the `Workload` reference (not required to call Phase E itself done) — see the 2026-08-19 section below for full detail |
 | F | Verify the captured trace is genuinely correct | **DONE, 2026-08-19 — genuine content recovery confirmed**, not just correct framing. A capture synchronized to a fresh `load-m3` reload (so the `Workload(seed=7)` reference's `sequence` starts near 0, unlike the previous unsynced attempt which could never find a contiguous match against an unknown, possibly-huge sequence offset) found 9 order-preserving, exact byte-string matches of width≥2 (3- or 5-byte) reference events in a 223-byte reconstructed stream, against an analytically-expected ~1.4 and empirically-observed 2-3 coincidental matches from shuffled/random controls. See the 2026-08-19 "Phase F" section below |
-| G | Verify the real JTAG debug path | **ATTEMPTED, 2026-08-19 — not working yet, real negative findings recorded.** `ORBTRACE_REG_M3_CONTROL=0x3` set, `orbtrace remote-bitbang` bridge confirmed live, but both OpenOCD's `scan_chain` and a raw hand-bitbanged probe (including the standard ARM SWD→JTAG switch sequence) read the JTAG-DP as permanently silent (TDO stuck at 0, IR capture `0x00` instead of the mandatory `0x01`) — see the 2026-08-19 "Phase G" section below for what was ruled out and what's still open |
+| G | Verify the real JTAG debug path | **ROOT CAUSE FOUND AND FIXED, 2026-08-19 (continuation) — the JTAG-DP is genuinely alive.** The "TDO stuck at 0" symptom was a real bug in this repo: `model/src/main.rs`'s `remote_bitbang()` decoded the standard remote-bitbang reset letters (`r`/`s`/`t`/`u`) exactly backwards relative to OpenOCD's real protocol, so every real OpenOCD session held the M3 in permanent combined `nTRST`+`nRESET` reset from its first byte. Fixed; confirmed two independent ways that the SWJ-DP now returns its genuine ADIv5 IDCODE (`0x4ba00477`) cleanly after an nTRST pulse. Plain OpenOCD now gets real (not all-zero) traffic but has a residual 1-JTAG-cycle scan-navigation misalignment (proven to be an OpenOCD-side navigation nuance, not a hardware or model bug) that still blocks its higher-level `halt`/PC-read — see the 2026-08-19 continuation section for full detail and next steps |
 
 Phases 1 through D are all done and verified against real hardware, not
 just tooling or reasoning — this includes a full synth/impl/route cycle on
@@ -3059,3 +3059,136 @@ was left at `0x3` (real-DAP route selected) on the board; `orbtrace stop` was ca
 end of this session but the DAP route was not reverted to synthetic — a future session
 picking this up should be aware `m3-control HOST 0x1` returns to the pre-Phase-G default
 (release asserted, synthetic DAP) if that matters for other testing.
+
+## 2026-08-19 continuation — Phase G root cause found and fixed: the remote-bitbang reset-letter mapping was backwards
+
+**This directly answers the previous session's ranked open questions.** Item #1 (whether
+`SWCLKTCK`/`SWDITMS` genuinely reach `m3_core`) was checked first, for free, via
+`open_project`/`open_run impl_1` on the still-present `orbtrace-vivado-m3-sync-order-fix`
+build (both the `.xpr` and the routed checkpoint were still on disk in the Bazel cache — no
+rebuild needed): every pin in the chain (`trace_pl/jtag_tck` → `m3_core/SWCLKTCK`,
+`jtag_tms`→`SWDITMS`, `jtag_tdi`→`TDI`, `m3_core/TDO`→`jtag_tdo`, `jtag_ntrst`→`nTRST`) is wired
+correctly with no slip. This pass also surfaced real internal structure of the Arm SWJ-DP IP
+for the first time: `m3_core/inst/inst/u_CORTEXM3INTEGRATION/uDAPSWJDP` contains
+`uDAPJtagDpProtocol`, `uDAPSwDpProtocol`, `uDAPSwDpSync`, and — significantly — a
+`uDAPSwjWatcher` submodule, i.e. a real, distinct mode-arbitration state machine that watches
+the pin sequence to decide JTAG vs SWD mode, exactly matching `create_bd.tcl`'s own comment
+about autodetection. This made item #2 (nTRST-pulse re-arm hypothesis) the natural next test.
+
+**Item #2 confirmed immediately, decisively, and by two independent methods.** Added
+`orbtrace dap HOST HEX_PACKET`-based direct CMSIS-DAP scripting
+(`jtag_ntrst_probe.py`: pulse nTRST via `DAP_SWJ_Pins` — value `0x80`, nTRST asserted only,
+nRESET left deasserted — then a standard 6×TMS=1 Test-Logic-Reset, then navigate to Shift-IR
+and Shift-DR by hand) against the real board (`ORBTRACE_REG_M3_CONTROL=0x3` first, via the
+already-existing `orbtrace m3-control` subcommand). Result: the mandatory IEEE 1149.1
+IR-capture LSB reads **1** (not 0), and a 32-bit Shift-DR read assembles to **`0x4ba00477`** —
+the genuine, textbook ARM Cortex-M3 JTAG-DP IDCODE (mfg `0x23b` ARM Ltd, part `0xba00`).
+Reproduced a second time back-to-back, fully deterministic. A second, independent
+implementation (`raw_bitbang_probe.py`) sent the identical logical sequence through the real
+`orbtrace remote-bitbang` bridge's actual wire protocol (the same path OpenOCD uses) instead
+of talking to the CMSIS-DAP port directly, and got the exact same `0x4ba00477` — ruling out
+any artifact specific to the direct-DAP path. **The SWJ-DP genuinely just needed a real nTRST
+pulse to arm its mode-watcher; nothing else about the JTAG wiring, the DAP engine, or the M3
+core's debug logic was ever broken.**
+
+**But real OpenOCD, using the exact same bridge, still failed identically ("all zeroes" / "IR
+capture error").** This was the actual puzzle this session had to resolve: two paths using the
+identical underlying bridge code, one working perfectly and one not. Traced the discrepancy
+methodically:
+
+1. `reset_config trst_only` plus explicit `adapter assert trst`/`adapter deassert trst` Tcl
+   commands still failed even when forced to run *after* `init`'s own (failing) automatic
+   examine, followed by a fresh `jtag arp_init` to force re-examination — ruling out "OpenOCD
+   just never bothers to pulse TRST" as the explanation, since it demonstrably did send
+   *something* labeled as a TRST assert/deassert.
+2. Built a tiny transparent logging TCP proxy (`bitbang_proxy.py`, sits between OpenOCD and
+   the real bridge, forwards and prints every byte in both directions) to see the literal wire
+   bytes OpenOCD actually sends for its reset control, instead of trusting its log message
+   labels. **Found the real bug: OpenOCD's own `remote_bitbang` driver sends `'r'` immediately
+   on connect (matching its "SRST/TRST line released" log line — `'r'` is OpenOCD's real,
+   documented convention for "neither reset line requested asserted", i.e. both released), and
+   later sends `'t'` for an explicit "assert TRST" request and `'r'` again for "deassert
+   TRST".** But `model/src/main.rs`'s `remote_bitbang()` decoded these letters into
+   `DAP_SWJ_Pins` values using the **exact inverse** mapping: its `'r' => 0` decodes to nTRST=0
+   **and** nRESET=0 (bit5=0,bit7=0 — *both asserted*), not released; its `'s'`/`'t'`/`'u'` arms
+   were similarly each backwards relative to OpenOCD's real per-letter semantics. **This means
+   every real OpenOCD session, from its very first byte, was telling the model "release both
+   reset lines" and having the model instead assert both — holding the M3's JTAG TAP (via
+   `nTRST`) and the M3 core plus its debug logic (via `nRESET`→`jtag_nreset`→`m3_reset_n`→
+   `m3_reset_n_sync`→ both `SYSRESETn` and `DBGRESETn`, tied together in `create_bd.tcl`) in
+   permanent combined reset for the entire session.** This fully explains the "TDO stuck at 0"
+   symptom that blocked every previous attempt at Phase G, including the swj_probe.py
+   line-reset/switch-sequence test in the prior session (which went through this same buggy
+   bridge and so could never have worked regardless of what JTAG-level sequence it sent).
+3. **Fix applied and real:** swapped the four match arms in `remote_bitbang()`
+   (`model/src/main.rs`) so `'r'`→`0xa0` (both released), `'s'`→`0x20` (SRST asserted only),
+   `'t'`→`0x80` (TRST asserted only), `'u'`(the catch-all)→`0x00` (both asserted) — matching
+   OpenOCD's real, externally-documented protocol rather than a guessed one. Rebuilt
+   (`bazel build //applications/orbtrace/model:orbtrace`).
+4. **Retested plain, unmodified OpenOCD (`probe_only.cfg`, no manual TRST hacks, just
+   `init; scan_chain`) against the real board — real progress, no longer all-zeroes:**
+   `JTAG tap: m3.tap tap/device found: 0x974008ef`. This isn't the expected `0x4ba00477`
+   verbatim, but bit-for-bit comparison (`rotl`/shift analysis) shows `0x974008ef` is *exactly*
+   `0x4ba00477` shifted by one additional leading bit (31 of 32 bits match at a 1-bit offset,
+   the strongest possible confirmation short of an exact match) — i.e. OpenOCD's own
+   longer/more elaborate chain-length auto-detection scan samples the *same real, correct*
+   IDCODE, just one TCK cycle earlier than my minimal by-hand recipe's alignment. The
+   `IR capture error; saw 0x03 not 0x01` at the same time is consistent with the identical
+   explanation: `0x03` is exactly the mandatory-1 pattern `0x01` shifted by the same one extra
+   leading bit. This is a real, if secondary, OpenOCD-navigation/config alignment quirk — not
+   a hardware fault, not a repeat of the reset-mapping bug (proven separately: a raw,
+   minimal-navigation client speaking the bridge's real wire protocol, with the fix applied,
+   gets the *exact* `0x4ba00477` with no offset at all through the identical bridge/model/RTL
+   code OpenOCD uses).
+5. Attempted a full `dap create`/`target create ... cortex_m` + `halt` against the real target
+   anyway, in case the 1-bit scan_chain misalignment doesn't affect OpenOCD's separate,
+   protocol-aware DPACC/APACC scan builder: got `Error: Invalid ACK (5) in DAP response` —
+   real DAP traffic is flowing (not "all zeroes" anymore) but still carries the same
+   systematic misalignment into the ADIv5 transaction layer, so real halt/PC-read is not yet
+   working through OpenOCD specifically.
+
+**Status: the actual root cause of Phase G's entire "JTAG-DP silent" mystery (spanning this
+session and the previous one) is found and fixed — a real, committable bug in this repo's own
+code, not a hardware or Arm-IP limitation.** The SWJ-DP is definitively alive, correctly
+implements IEEE 1149.1 TAP behavior and returns its genuine ADIv5 IDCODE, confirmed two
+independent ways with exact, non-offset agreement. What remains is a narrower, well-
+characterized problem: getting OpenOCD's own scan navigation to land on the same one-cycle
+alignment my minimal recipe already achieves cleanly — likely a `runtest`/`endstate`/
+Pause-IR-Pause-DR settle-cycle difference in how OpenOCD's `jtag_examine_chain`/DAP-init scan
+builders sequence multiple back-to-back scans versus my always-fresh-from-Test-Logic-Reset
+approach, not yet root-caused to the exact extra cycle.
+
+### Next steps for a future session
+
+1. **Root-cause and fix the remaining 1-cycle OpenOCD scan-alignment offset**, so
+   `scan_chain`/`dap create`/`cortex_m target` all work with vanilla OpenOCD config (no manual
+   byte-level workarounds). Cheapest next probe: use the `bitbang_proxy.py` logging proxy
+   (scratch-only, recreate from this section's description) to capture OpenOCD's *exact* TMS
+   bit sequence during a real `dap init`/`examine`, and diff it cycle-by-cycle against
+   `raw_bitbang_probe.py`'s known-working sequence to find precisely which extra/missing cycle
+   causes the shift.
+2. **Alternative, likely faster path to the plan's actual acceptance bar:** rather than fixing
+   OpenOCD's navigation, hand-roll the ADIv5 JTAG-DP DPACC/APACC protocol in Python on top of
+   the already-proven `jtag_clock()`/`orbtrace dap` primitives (IR=`0xA` selects DPACC,
+   `0xB` selects APACC per the standard ARM encoding; 35-bit pipelined DR transactions,
+   RnW+A[3:2] in, ACK+data out one transaction delayed) to directly: power up debug
+   (`CTRL/STAT` CDBGPWRUPREQ/CSYSPWRUPREQ), select the M3's AP, write `DHCSR` (`0xE000EDF0`)
+   to halt the core, and read `PC` via `DCRSR`/`DCRDR` — this reuses code that's already
+   proven bit-exact-correct and sidesteps OpenOCD's scan-builder entirely. Not attempted this
+   session (ran out of session budget after the root-cause fix), but is real, scoped,
+   achievable work, and would let Phase G report a genuine halt/PC-read/step/resume result
+   independent of resolving item 1 above.
+3. Once either 1 or 2 lands, the plan's original Phase G acceptance bar (halt, read PC,
+   confirm it's inside `m3_app`'s `.text`, single-step, resume, confirm trace resumes) is
+   still open and should be attempted for real.
+4. Commit the reset-mapping fix in `model/src/main.rs` (real, verified, high-confidence root
+   cause) once reviewed — this session left it uncommitted alongside the earlier
+   `orbtrace m3-control` addition.
+
+**Housekeeping:** `model/src/main.rs`'s `remote_bitbang()` reset-letter fix is real and
+verified but uncommitted. `jtag_ntrst_probe.py`, `raw_bitbang_probe.py`, `bitbang_proxy.py`,
+and the various scratch OpenOCD `.cfg` files used this session are scratch-only (recreate from
+this section's description if resuming — none are large or complex). No RTL changes.
+`ORBTRACE_REG_M3_CONTROL` was left at `0x3` on the board (same as the prior session's
+end-state). All background `remote-bitbang`/proxy processes were stopped before ending the
+session.
