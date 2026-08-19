@@ -4,7 +4,7 @@
 //! model can be used by host tests and by `no_std` firmware after replacing
 //! the allocation boundary.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 pub const CONTROL_PORT: u16 = 3401;
 pub const ORBFLOW_PORT: u16 = 3402;
@@ -598,6 +598,269 @@ pub fn stats_from_le(bytes: &[u8]) -> Result<Stats, ProtocolError> {
     })
 }
 
+// -- M3 trace -> Perfetto pipeline (see M3_PERFETTO_VISUALIZATION_PLAN.md) --
+
+/// Phase 1: recover one orbflow channel's raw byte stream from a capture
+/// file. Frame boundaries are `0x00` delimiters (COBS encoding never emits a
+/// literal `0x00` inside a frame, so splitting on it is exact); frames that
+/// fail `orbflow_unframe`'s checksum are counted-not-panicked-on, since a
+/// real capture's sync-loss rate makes partial/corrupt frames routine.
+pub fn reconstruct_channel_stream(capture: &[u8], channel: u8) -> Vec<u8> {
+    let mut stream = Vec::new();
+    for frame in capture.split(|&byte| byte == 0) {
+        if frame.is_empty() {
+            continue;
+        }
+        if let Ok((frame_channel, payload)) = orbflow_unframe(frame) {
+            if frame_channel == channel {
+                stream.extend(payload);
+            }
+        }
+    }
+    stream
+}
+
+/// How many valid orbflow frames were seen per channel, most-frequent
+/// first. Used to pick the real M3 channel empirically instead of assuming
+/// it (see the plan's Phase 1, item 3) rather than hardcoding a value.
+pub fn channel_histogram(capture: &[u8]) -> Vec<(u8, usize)> {
+    let mut counts = std::collections::BTreeMap::new();
+    for frame in capture.split(|&byte| byte == 0) {
+        if frame.is_empty() {
+            continue;
+        }
+        if let Ok((channel, _)) = orbflow_unframe(frame) {
+            *counts.entry(channel).or_insert(0usize) += 1;
+        }
+    }
+    let mut entries: Vec<(u8, usize)> = counts.into_iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    entries
+}
+
+/// Phase 2: one decoded ARMv7-M ITM packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ItmPacket {
+    /// Software Instrumentation Trace write: `header = (port << 3) |
+    /// size_code`, `size_code` 1/2/3 for a 1/2/4-byte little-endian payload.
+    Swit { port: u8, value: u32, width: u8 },
+    /// A header byte whose `size_code` isn't 1/2/3 (some other ITM packet
+    /// type, or resync noise) -- not a SWIT packet.
+    Unrecognized(u8),
+}
+
+/// Decode a raw ITM byte stream into packets. Tolerant of garbage: an
+/// unrecognized or truncated header advances exactly one byte and resumes,
+/// the same posture `orbtrace_tpiu_demux.sv`'s channel-plausibility gate
+/// takes at the framing layer, since real captures interleave resync noise
+/// with genuine SWIT packets.
+pub fn decode_itm_stream(bytes: &[u8]) -> Vec<ItmPacket> {
+    let mut packets = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let header = bytes[pos];
+        let width = match header & 0x7 {
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            _ => {
+                packets.push(ItmPacket::Unrecognized(header));
+                pos += 1;
+                continue;
+            }
+        };
+        if pos + 1 + width > bytes.len() {
+            packets.push(ItmPacket::Unrecognized(header));
+            pos += 1;
+            continue;
+        }
+        let mut value = 0u32;
+        for (index, byte) in bytes[pos + 1..pos + 1 + width].iter().enumerate() {
+            value |= (*byte as u32) << (8 * index);
+        }
+        packets.push(ItmPacket::Swit {
+            port: header >> 3,
+            value,
+            width: width as u8,
+        });
+        pos += 1 + width;
+    }
+    packets
+}
+
+/// Phase 3: the M3 firmware's `Workload` event kind recovered from a port-0
+/// SWIT's width/value shape (see M3_PERFETTO_VISUALIZATION_PLAN.md section
+/// 3). `Timestamp` values are `sequence`, a multiple of 16 by construction
+/// (it's only emitted when `sequence & 15 == 0`); `Fault` values always have
+/// the fixed `0xf001_0000` high half; `Malformed` is the only 1-byte-wide
+/// port-0 write; `Idle` is whatever 4-byte, non-fault, non-multiple-of-16
+/// value is left. This is a best-effort classification (a 1-in-16 `Idle`
+/// value can coincidentally be a multiple of 16 and get misread as a
+/// `Timestamp`) -- good enough to label a visualization, not a claim of
+/// exact semantic recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Port0Event {
+    Timestamp(u32),
+    Idle(u32),
+    Malformed(u8),
+    Fault(u32),
+    Unknown(u32),
+}
+
+pub fn classify_port0(value: u32, width: u8) -> Port0Event {
+    match width {
+        1 => Port0Event::Malformed(value as u8),
+        4 if value & 0xffff_0000 == 0xf001_0000 => Port0Event::Fault(value),
+        4 if value != 0 && value % 16 == 0 => Port0Event::Timestamp(value),
+        4 if (1..=1024).contains(&value) => Port0Event::Idle(value),
+        _ => Port0Event::Unknown(value),
+    }
+}
+
+fn event_name(port: u8, value: u32, width: u8) -> String {
+    if port == 0 {
+        match classify_port0(value, width) {
+            Port0Event::Timestamp(v) => format!("Timestamp({v})"),
+            Port0Event::Idle(v) => format!("Idle({v})"),
+            Port0Event::Malformed(v) => format!("Malformed({v:#04x})"),
+            Port0Event::Fault(v) => format!("Fault({v:#010x})"),
+            Port0Event::Unknown(v) => format!("Unknown({v:#x})"),
+        }
+    } else {
+        format!("port {port} = {value:#x}")
+    }
+}
+
+/// One instant event on a per-ITM-port Perfetto track. `ts` is a synthetic,
+/// monotonically increasing index over decoded SWIT packets (this pipeline
+/// has no real wall-clock time base), which is enough to preserve relative
+/// ordering in the viewer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PerfettoEvent {
+    pub port: u8,
+    pub ts: u64,
+    pub name: String,
+    pub value: u32,
+    pub width: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct PerfettoTrace {
+    pub events: Vec<PerfettoEvent>,
+    /// `(ts, cumulative_count)` samples for a `dropped_sequence_gap` counter
+    /// track, stepped once each time consecutive recovered port-0
+    /// `Timestamp` values don't differ by exactly 16 -- direct, visible
+    /// evidence of the sync-loss `M3_TRACE_VERIFICATION_PLAN.md` Phase E/F
+    /// already measured, rather than an external stat.
+    pub sequence_gaps: Vec<(u64, u64)>,
+}
+
+/// Phase 3: map decoded ITM packets to Perfetto track events.
+/// `Unrecognized` packets don't produce an event (see `decode_itm_stream`'s
+/// doc comment) and don't advance `ts`.
+pub fn build_perfetto_trace(packets: &[ItmPacket]) -> PerfettoTrace {
+    let mut trace = PerfettoTrace::default();
+    let mut last_timestamp: Option<u32> = None;
+    let mut gap_count = 0u64;
+    let mut ts = 0u64;
+    for packet in packets {
+        let ItmPacket::Swit { port, value, width } = *packet else {
+            continue;
+        };
+        if port == 0 {
+            if let Port0Event::Timestamp(v) = classify_port0(value, width) {
+                if let Some(previous) = last_timestamp {
+                    if v != previous.wrapping_add(16) {
+                        gap_count += 1;
+                        trace.sequence_gaps.push((ts, gap_count));
+                    }
+                }
+                last_timestamp = Some(v);
+            }
+        }
+        trace.events.push(PerfettoEvent {
+            port,
+            ts,
+            name: event_name(port, value, width),
+            value,
+            width,
+        });
+        ts += 1;
+    }
+    trace
+}
+
+fn json_escape(out: &mut String, value: &str) {
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if (c as u32) < 0x20 => {
+                write!(out, "\\u{:04x}", c as u32).unwrap();
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Phase 4: render a `PerfettoTrace` as a Chrome/Perfetto JSON trace
+/// (`{"traceEvents":[...]}`), viewable by dragging into ui.perfetto.dev.
+/// One thread (`tid`) per ITM port under `pid` 1, named via a `"ph":"M"`
+/// metadata event; each decoded SWIT is a `"ph":"I"` instant event on its
+/// port's thread. `sequence_gaps`, if non-empty, becomes a `"ph":"C"`
+/// counter track under a separate `pid` so it renders on its own row.
+pub fn perfetto_json(trace: &PerfettoTrace) -> String {
+    let mut out = String::from("{\"traceEvents\":[\n");
+    let mut first = true;
+    let mut item = |out: &mut String, s: &str| {
+        if !first {
+            out.push_str(",\n");
+        }
+        first = false;
+        out.push_str(s);
+    };
+    for port in 0u8..=7 {
+        let mut entry = format!("{{\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":1,\"tid\":{port},\"args\":{{\"name\":");
+        json_escape(&mut entry, &format!("ITM port {port}"));
+        entry.push_str("}}");
+        item(&mut out, &entry);
+    }
+    for event in &trace.events {
+        let mut entry = String::new();
+        write!(
+            entry,
+            "{{\"ph\":\"I\",\"ts\":{},\"pid\":1,\"tid\":{},\"s\":\"t\",\"name\":",
+            event.ts, event.port
+        )
+        .unwrap();
+        json_escape(&mut entry, &event.name);
+        write!(
+            entry,
+            ",\"args\":{{\"value\":{},\"width\":{}}}}}",
+            event.value, event.width
+        )
+        .unwrap();
+        item(&mut out, &entry);
+    }
+    if !trace.sequence_gaps.is_empty() {
+        item(
+            &mut out,
+            "{\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":2,\"tid\":0,\"args\":{\"name\":\"dropped_sequence_gap\"}}",
+        );
+        for (ts, value) in &trace.sequence_gaps {
+            let entry = format!(
+                "{{\"ph\":\"C\",\"name\":\"dropped_sequence_gap\",\"ts\":{ts},\"pid\":2,\"tid\":0,\"args\":{{\"dropped_sequence_gap\":{value}}}}}"
+            );
+            item(&mut out, &entry);
+        }
+    }
+    out.push_str("\n]}\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,5 +1041,133 @@ mod tests {
         assert!(output.iter().all(|b| b.channel == 2));
         decoder.reset_sync();
         assert_eq!(decoder.sync_losses, 1);
+    }
+
+    fn encode_swit(port: u8, value: u32, width: u8) -> Vec<u8> {
+        let size_code = match width {
+            1 => 1,
+            2 => 2,
+            4 => 3,
+            _ => panic!("bad width"),
+        };
+        let mut out = vec![(port << 3) | size_code];
+        out.extend(&value.to_le_bytes()[..width as usize]);
+        out
+    }
+
+    #[test]
+    fn reconstruct_channel_stream_filters_and_skips_corrupt_frames() {
+        let mut capture = Vec::new();
+        capture.extend(orbflow_frame(1, &[1, 2, 3]).unwrap());
+        capture.extend(orbflow_frame(2, &[9, 9]).unwrap());
+        let mut corrupt = orbflow_frame(3, &[7, 7, 7]).unwrap();
+        corrupt[1] ^= 1; // flip a payload byte inside the COBS-encoded frame
+        capture.extend(corrupt);
+        capture.extend(orbflow_frame(1, &[4, 5]).unwrap());
+
+        assert_eq!(
+            reconstruct_channel_stream(&capture, 1),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(reconstruct_channel_stream(&capture, 2), vec![9, 9]);
+        assert_eq!(reconstruct_channel_stream(&capture, 3), Vec::<u8>::new());
+
+        let histogram = channel_histogram(&capture);
+        assert_eq!(histogram, vec![(1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn decode_itm_stream_round_trips_and_resyncs_past_garbage() {
+        let events = [
+            (0u8, 32u32, 4u8),         // Timestamp
+            (0, 500, 4),               // Idle
+            (0, 0xab, 1),              // Malformed
+            (0, 0xf001_0007, 4),       // Fault
+            (5, 0x1234, 2),            // generic port
+        ];
+        let mut bytes = Vec::new();
+        for (port, value, width) in events {
+            bytes.push(0x00); // reserved size_code=0 header: garbage to resync past
+            bytes.extend(encode_swit(port, value, width));
+        }
+        bytes.push(0x06); // size_code=6, reserved: trailing garbage
+
+        let decoded: Vec<ItmPacket> = decode_itm_stream(&bytes)
+            .into_iter()
+            .filter(|packet| matches!(packet, ItmPacket::Swit { .. }))
+            .collect();
+        let expected: Vec<ItmPacket> = events
+            .iter()
+            .map(|&(port, value, width)| ItmPacket::Swit { port, value, width })
+            .collect();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn classify_port0_matches_value_shape() {
+        assert_eq!(classify_port0(32, 4), Port0Event::Timestamp(32));
+        assert_eq!(classify_port0(500, 4), Port0Event::Idle(500));
+        assert_eq!(classify_port0(0xab, 1), Port0Event::Malformed(0xab));
+        assert_eq!(
+            classify_port0(0xf001_0007, 4),
+            Port0Event::Fault(0xf001_0007)
+        );
+        assert_eq!(classify_port0(2001, 4), Port0Event::Unknown(2001));
+    }
+
+    #[test]
+    fn build_perfetto_trace_detects_sequence_gaps() {
+        let packets = vec![
+            ItmPacket::Swit {
+                port: 0,
+                value: 16,
+                width: 4,
+            },
+            ItmPacket::Swit {
+                port: 0,
+                value: 32,
+                width: 4,
+            },
+            ItmPacket::Swit {
+                port: 0,
+                value: 64, // skipped 48: a dropped Timestamp cycle
+                width: 4,
+            },
+        ];
+        let trace = build_perfetto_trace(&packets);
+        assert_eq!(trace.events.len(), 3);
+        assert_eq!(trace.sequence_gaps, vec![(2, 1)]);
+    }
+
+    #[test]
+    fn perfetto_json_has_one_instant_per_event_and_a_gap_counter() {
+        let packets = vec![
+            ItmPacket::Swit {
+                port: 0,
+                value: 16,
+                width: 4,
+            },
+            ItmPacket::Swit {
+                port: 0,
+                value: 64,
+                width: 4,
+            },
+            ItmPacket::Swit {
+                port: 3,
+                value: 0xdead,
+                width: 2,
+            },
+        ];
+        let trace = build_perfetto_trace(&packets);
+        let json = perfetto_json(&trace);
+        assert!(json.starts_with("{\"traceEvents\":["));
+        assert_eq!(json.matches("\"ph\":\"I\"").count(), trace.events.len());
+        assert_eq!(
+            json.matches("\"ph\":\"C\"").count(),
+            trace.sequence_gaps.len()
+        );
+        assert!(json.contains("Timestamp(16)"));
+        assert!(json.contains("port 3 = 0xdead"));
+        assert!(json.contains("dropped_sequence_gap"));
     }
 }

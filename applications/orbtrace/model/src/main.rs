@@ -1,6 +1,8 @@
 use orbtrace::{
-    length_frame, registers, stats_from_le, Command, Source, TraceFormat, CMSIS_DAP_PORT,
-    CONTROL_PORT, M3_BRAM_CHUNK, M3_BRAM_SIZE, MAX_CONTROL_PAYLOAD, MAX_DAP_PACKET, ORBFLOW_PORT,
+    build_perfetto_trace, channel_histogram, decode_itm_stream, length_frame, perfetto_json,
+    reconstruct_channel_stream, registers, stats_from_le, Command, ItmPacket, Source, TraceFormat,
+    CMSIS_DAP_PORT, CONTROL_PORT, M3_BRAM_CHUNK, M3_BRAM_SIZE, MAX_CONTROL_PAYLOAD,
+    MAX_DAP_PACKET, ORBFLOW_PORT,
 };
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -9,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn usage() -> ! {
-    eprintln!("usage:\n  orbtrace info|stats|start|stop|reset HOST\n  orbtrace configure HOST SOURCE FORMAT SWO_BAUD\n  orbtrace capture HOST FILE [BYTES]\n  orbtrace replay FILE LISTEN_ADDR\n  orbtrace dap HOST HEX_PACKET\n  orbtrace remote-bitbang HOST LISTEN_ADDR\n  orbtrace load-m3 HOST FILE\n  orbtrace m3-control HOST BITS\n  orbtrace gen-registers");
+    eprintln!("usage:\n  orbtrace info|stats|start|stop|reset HOST\n  orbtrace configure HOST SOURCE FORMAT SWO_BAUD\n  orbtrace capture HOST FILE [BYTES]\n  orbtrace replay FILE LISTEN_ADDR\n  orbtrace dap HOST HEX_PACKET\n  orbtrace remote-bitbang HOST LISTEN_ADDR\n  orbtrace load-m3 HOST FILE\n  orbtrace m3-control HOST BITS\n  orbtrace decode-trace CAPTURE_FILE OUTPUT.json [CHANNEL]\n  orbtrace gen-registers");
     std::process::exit(2)
 }
 
@@ -118,6 +120,47 @@ fn replay(path: &Path, listen: &str) -> io::Result<()> {
     eprintln!("client {peer}");
     stream.write_all(&payload)?;
     stream.shutdown(Shutdown::Write)
+}
+
+/// See applications/orbtrace/M3_PERFETTO_VISUALIZATION_PLAN.md. Turns a
+/// capture file (as written by `capture`) into a Perfetto-viewable JSON
+/// trace: reconstructs one orbflow channel's byte stream, decodes ITM SWIT
+/// packets, maps them to per-port tracks, and writes the result. `channel`
+/// defaults to whichever channel has the most valid frames in this capture
+/// (see `channel_histogram`'s doc comment) rather than a hardcoded value.
+fn decode_trace(capture_path: &Path, output_path: &Path, channel: Option<u8>) -> io::Result<()> {
+    let capture = std::fs::read(capture_path)?;
+    let histogram = channel_histogram(&capture);
+    for (seen_channel, count) in &histogram {
+        eprintln!("channel {seen_channel}: {count} valid frames");
+    }
+    let channel = match channel {
+        Some(channel) => channel,
+        None => histogram
+            .first()
+            .map(|(channel, _)| *channel)
+            .ok_or_else(|| invalid("capture has no valid orbflow frames"))?,
+    };
+
+    let stream = reconstruct_channel_stream(&capture, channel);
+    let packets = decode_itm_stream(&stream);
+    let recognized = packets
+        .iter()
+        .filter(|packet| matches!(packet, ItmPacket::Swit { .. }))
+        .count();
+    eprintln!(
+        "channel {channel}: {} raw bytes, {recognized}/{} packets recognized as SWIT",
+        stream.len(),
+        packets.len()
+    );
+
+    let trace = build_perfetto_trace(&packets);
+    eprintln!(
+        "{} track events, {} sequence-gap samples",
+        trace.events.len(),
+        trace.sequence_gaps.len()
+    );
+    std::fs::write(output_path, perfetto_json(&trace))
 }
 
 fn dap_transaction(stream: &mut TcpStream, packet: &[u8]) -> io::Result<Vec<u8>> {
@@ -311,6 +354,11 @@ fn run() -> io::Result<()> {
                 .map_err(invalid)?,
         ),
         "replay" if args.len() == 3 => replay(Path::new(&args[1]), &args[2]),
+        "decode-trace" if (3..=4).contains(&args.len()) => decode_trace(
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            args.get(3).map(|n| n.parse()).transpose().map_err(invalid)?,
+        ),
         "load-m3" if args.len() == 3 => load_m3(&args[1], Path::new(&args[2])),
         "m3-control" if args.len() == 3 => {
             // Raw ORBTRACE_REG_M3_CONTROL write -- Phase G needs this to set
