@@ -16,7 +16,7 @@ testing capabilities" the M3 integration was built for.
 | B | Fix every `CONFIRM` marker in `create_bd.tcl` | DONE |
 | C | Build, flash, and bring up the board | DONE — hybrid build passes all gates (WNS=+0.071ns, CDC/methodology clean), flashed to real hardware, `orbtrace info` confirms `ZUBoard-Orbtrace/1` |
 | D | Load the M3 firmware image | **DONE — both D1 and D2 confirmed fully working**, 2026-08-17. Two hardware bugs fixed (dual-port tied-off BRAM port; a write-pacing 4:1 word-drop fixed by routing `m3_mem_ctrl` through a dedicated `axi_interconnect`) plus a real vendored NetX ARP-table race fixed (see below) — but D2's long "hang" this session turned out to be **two stacked build/flash mistakes, not a design bug**: `jtag_flash.sh` was repeatedly given a stale (`2026-08-09`) `a53_app_elf` artifact instead of the freshly-rebuilt `a53_app` symlink, so none of this session's firmware edits were ever actually running; independently, the board was flashed with `hybrid-fix2` (the *pre*-BRAM-fix bitstream) instead of `hybrid-fix3` during the whole D2 investigation. Once both were corrected, D2 completes cleanly and repeatably, including as the very first command after a fresh reflash. See the 2026-08-17 "stale artifact" correction below for the full account |
-| E | Configure Orbtrace and start capture | IN PROGRESS, M3/CPU side conclusively cleared 2026-08-17 — re-ran the ITM/TPIU investigation with a genuinely healthy, verified-running M3 (heartbeat counter proves it) and the 2026-08-16 "CPU stuck on first blocking write" diagnosis is retracted (SSPSR confirms 4-bit supported, TCR readback matches exactly what was written, STIM0 reads ready at boot). `rx_bytes` is still `0` with the capture running, but the blocker is now isolated entirely to `orbtrace_pl.v`'s PL-side M3 DDR capture/CDC/sync-detection chain, not the M3 or its ITM state |
+| E | Configure Orbtrace and start capture | **SUBSTANTIVELY DONE, 2026-08-19 — real, clean, channel-1-only CoreSight content decoded on real hardware for the first time in this entire investigation.** Root cause: `orbtrace_tpiu_demux.sv`'s sync-word search had the byte order backwards (searched for `0x7F` then three `0xFF`, when the real CoreSight Full Sync Packet is chronologically three `0xFF` then `0x7F` — confirmed against sigrok's independent reference decoder and real ILA capture data). Fixed (`32'hffffff7f`→`32'h7fffffff`), simulation-validated with a new dedicated testbench, then confirmed on real hardware: `orbtrace stats` shows `rx_bytes` genuinely and repeatably nonzero (11→173 over ~2 minutes) under the real (non-marker) firmware, and decoding the capture shows every byte is checksum-valid, exclusively on channel 1, zero garbage channels — a first. `dropped_bytes`/`sync_loss` remain huge (expected/correct: the false-lock-on-idle-alias problem the 2026-08-18 channel-plausibility gate handles is still active and doing its job). Remaining for a future session: Phase F's full byte-for-byte diff against the `Workload` reference (not required to call Phase E itself done) — see the 2026-08-19 section below for full detail |
 | F | Verify the captured trace is genuinely correct | NOT STARTED — unblocked, follows E |
 | G | Verify the real JTAG debug path | NOT STARTED — unblocked (the JTAG-DAP bit-bang path to `m3_control` was previously confirmed working) |
 
@@ -1964,3 +1964,958 @@ solution to Parallel/4-bit capture: a real 10 MHz M3 still produces an
 undecodable/overflowing parallel formatter stream. The next useful work is
 to correct the M3-specific capture/demux protocol path (and separately the
 SWO-NRZ receiver framing), not to reduce HCLK further.
+
+## 2026-08-18 continuation — two blocker hypotheses ruled out; the demux/packetizer handshake itself is now the prime suspect
+
+Re-examined `orbtrace_ddr_capture.sv`/`orbtrace_tpiu_demux.sv`/
+`orbtrace_channel_packetizer.sv`/`orbtrace_orbflow_encoder.sv` line by line
+(free, no rebuild) — a level of detail not reached by any earlier session in
+this investigation — then ran two real hardware tests against the
+already-flashed board (no Vivado rebuild needed for either):
+
+1. **"No TCP listener on port 3402" ruled out.** `rx_bytes` (`Stats.rx_bytes`)
+   is `orbtrace_orbflow_encoder`'s own `received_bytes` counter, incremented
+   the moment a byte is accepted into its *input* ping-pong bank — well
+   upstream of the DMA/TCP path, so in principle it shouldn't need an active
+   reader to increment at all. Ran the plan's own documented procedure
+   (`configure m3 tpiu4 2000000` → `start` → a real, concurrently-running
+   `orbtrace capture HOST FILE` background reader → `stats`) instead of the
+   configure/start/stats-only sequence prior updates may have used: `rx_bytes`
+   stayed exactly `0` and the capture file was `0` bytes regardless. This
+   rules out an undrained DMA/TCP path as the explanation and confirms the
+   real blocker sits upstream of the encoder, at the FIFO/demux stage.
+2. **Pure bandwidth/duty-cycle ruled out as the *sole* cause.** `orbtrace_ddr_capture`'s
+   4-bit case asserts `byte_valid` every single `trace_clk_m3` cycle (100%
+   duty cycle, as already known), but `orbtrace_tpiu_demux`'s `input_ready =
+   !emitting` together with its `channel == 0` fast-path means a healthy
+   demux should sustain roughly half of `aclk`'s rate regardless — comfortably
+   above even the un-decoupled 100 MHz-M3 rate, let alone the verified 10 MHz
+   one. Reflashed `m3_app` with a **temporary** `m3_itm_init(0)` (1-bit port,
+   ~1/8th the 4-bit byte rate — the same diagnostic tried on 2026-08-16, but
+   that session pre-dates the Phase D BRAM-corruption fix and its "real bytes
+   arrived" result cannot be trusted), confirmed the built ELF genuinely
+   contained the change via `arm-none-eabi-objdump` (`movs r0, #0` before the
+   `m3_itm_init` call — the "verify the flashed binary" lesson from earlier
+   this project applied *before* spending a hardware cycle this time,
+   catching nothing wrong but confirming the practice), then reconfigured
+   Orbtrace for `tpiu1` and retested on real hardware: **`rx_bytes` stayed
+   `0`, `dropped_bytes` and `sync_loss` kept climbing just as fast as in 4-bit
+   mode.** A per-cycle byte rate roughly 8x lower still fails identically —
+   the bottleneck is not simply "M3 produces bytes faster than the demux can
+   sustain." Reverted `main.c` to `m3_itm_init(2)` (committed baseline) after
+   the test; board itself was left running the 1-bit firmware, harmless,
+   will be overwritten by the next reflash.
+
+**What this leaves:** the FIFO write-side is dropping bytes continuously,
+which (per the RTL) requires the read side (`m3_cdc_ready`, ultimately
+`orbtrace_tpiu_demux`'s `input_ready = !emitting`) to be deasserted almost
+permanently — i.e. `emitting` is getting set and essentially never clearing.
+`emitting` only clears once `emit` walks 0→14, gated by `(is_id || channel ==
+0 || output_ready)` each step. Since neither the width (4-bit vs 1-bit) nor
+the presence of a draining TCP client changes the outcome, the leading
+hypothesis is now a genuine **stall inside the shared demux/packetizer
+handshake itself** once a real (nonzero, non-ID) `channel` value latches —
+something that PS-source traffic apparently never triggers, or triggers rarely
+enough not to have been noticed at 400 Mbit/s. Two, not mutually exclusive,
+concrete candidates, neither confirmed:
+- `channel` latches to a spurious nonzero value (from mis-framed/scrambled
+  M3 byte content — still unconfirmed whether M3's real TPIU byte stream ever
+  actually contains a genuine `0xFFFFFF7F` sync word, or whether `synced`
+  is being set by a false-positive match against garbage), and then never
+  reaches `is_id`/`channel==0` again, so every subsequent `emitting` block is
+  fully gated on `output_ready` — which itself may be getting stuck via
+  `orbtrace_channel_packetizer`'s `input_ready = !held || (output_ready &&
+  output_valid)` logic (a same-cycle valid/ready dependency that is
+  standard practice but has not been checked against a byte-not-offered-every-cycle
+  producer like this one; not confirmed to actually deadlock, just not yet
+  ruled out).
+- The M3 TPIU's real byte content for this exact synthesized configuration
+  simply never round-trips through the shared demux correctly regardless of
+  channel — i.e. a genuine content/framing bug specific to this parallel
+  capture path, not a flow-control deadlock at all.
+
+Static reasoning is exhausted again at this point — distinguishing these
+needs real signal visibility PL-side, not more code reading. **Next
+concrete, not-yet-done step:** add 2-3 small debug counters/latches directly
+inside `orbtrace_core`/`orbtrace_pl.v` (e.g. `synced` rising-edge count,
+last latched `channel` value, count of `emitting`-cycles where the advance
+condition was false) exposed through a couple of spare AXI-Lite registers in
+`orbtrace_axi_regs.sv` — cheaper to read back (a plain `mrd -force` over
+JTAG, no new Rust command-protocol plumbing needed, since these registers
+sit directly in the PS AXI-Lite address space already used for
+`ORBTRACE_REG_M3_CONTROL` etc.) than a full ILA rebuild, though it still
+needs one real Vivado synth/impl/route cycle (~30-90 min) to test. Paused
+here to report this finding rather than committing to that rebuild
+unilaterally.
+
+## 2026-08-18 continuation — real ILA ground truth: the TPIU formatter never emits a Full Sync Packet; root cause narrowed to DWT-driven synchronization, not yet fixed
+
+User chose to go straight to a real ILA capture instead. Two diagnostic
+Vivado builds later (both ~20-25 min thanks to the cached M3 EDIF and
+default P&R directives — much faster than the original "30-90 min"
+estimate), with a `system_ila` tapping `orbtrace_tpiu_demux`'s internal
+state (`synced`/`emitting`/`channel`/`fill`/`emit`/`is_id`) plus the raw
+byte stream feeding it and the M3 trace FIFO's read side (all threaded
+through temporary debug ports in `orbtrace_tpiu_demux.sv`/
+`orbtrace_core.sv`/`orbtrace_pl.v`, reverted after), this is now settled
+with real hardware evidence, not reasoning:
+
+**`synced` never asserts, `dbg_selected_data` (the byte reaching the demux)
+is a constant `0xFF` for the entire ~20µs capture window, and raw
+`trace_data_m3[3:0]` (tapped directly, before `orbtrace_ddr_capture` ever
+touches it, by reusing the same working `aclk`-domain ILA rather than a
+second ILA core clocked on `m3_core/TRACECLK` — that hit a Vivado
+debug-hub/Xicom enumeration error, "Invalid Register Name: COUNTER4_WIDTH",
+unrelated to the design) alternates only between `0x7`/`0xF` — the
+documented CoreSight idle/half-sync toggle pattern, never anything else.**
+This is the *same* signature the retracted 2026-08-16 "CPU stuck" diagnosis
+saw, but this time it is definitively not a downstream artifact of Phase
+D's BRAM corruption: every relevant ITM/TPIU control register was
+independently read back this session (not just inferred) and matches
+exactly what `m3_itm_init()` wrote:
+
+| Register | Written | Read back |
+|---|---|---|
+| `DEMCR.TRCENA` | set | (implied by all of the below working at all) |
+| `ITM_TCR` | `ITMENA\|TXENA\|ATBID=1` | `0x00010009` (2026-08-17 finding, reconfirmed) |
+| `ITM_STIM0` ready | — | `1` immediately after init |
+| `TPIU_SSPSR` | (RO) | `0x0000000b` — 1/2/4-bit all supported in silicon |
+| `TPIU_ITCTRL` | never written | `0` — normal mode, not integration-test mode |
+| `TPIU_SPPR` | `0` (Parallel) | `0` |
+| `TPIU_CSPSR` | `0x8` (4-bit) | `0x8` |
+| `ITM_TER` | `0xff` | `0xff` — all 8 stimulus ports enabled |
+| `g_heartbeat` | — | incrementing steadily, CPU genuinely running `emit_next()` in a loop |
+
+Every one of these was previously either unverified or only inferred
+indirectly (e.g. via `SSPSR` instead of `SPPR`/`CSPSR` themselves). With all
+of them confirmed correct and the CPU proven to be actively calling
+`m3_itm_write()`/`m3_itm_write_width()` continuously, yet the TPIU's real
+output is *provably* a frozen idle pattern with no `0xFFFFFF7F` sync word
+ever appearing — the bug is not a PL-side (Orbtrace) demux/capture problem
+and not a firmware register-configuration mistake at the level of "did
+this write take effect." It is something in the M3's own ITM→formatter
+packet path, or a formatter behavior this configuration doesn't trigger.
+
+**Leading, TRM-documented hypothesis (found via the extracted
+`arm_cortexm3_processor_trm_100165_0201_00_en.pdf`, §11.2.2): "You must
+enable synchronization packets in the DWT to provide synchronization for
+the formatter... Synchronization, caused by the distributed synchronization
+from the DWT, ensures that any partial frame is completed, and at least one
+full synchronization packet is generated."** In other words, the TPIU
+formatter's Full Sync Packet — the exact 4-byte pattern
+`orbtrace_tpiu_demux.sv`'s `sync_window` searches for — is not emitted
+periodically on its own; it requires a DWT-generated ITM Synchronization
+Packet to trigger it. `m3_itm_init()` never touched DWT at all.
+
+**Implemented (kept, real change, not reverted):** `sdk/bsp/m3/itm.h` gained
+`M3_DWT_CTRL`/`M3_DWT_CYCCNT` register defines and `M3_ITM_TCR_SYNCENA`;
+`m3_itm_init()` now sets `DWT_CTRL = CYCCNTENA | SYNCTAP=1` (the shortest
+available tap, `CYCCNT[24]`, ≈1.6s period at the verified 10 MHz M3 clock)
+and adds `ITM_TCR_SYNCENA` to the TCR write. This is the textbook-correct,
+TRM-cited fix for the exact symptom observed.
+
+**Tested on real hardware — did not by itself fix the symptom.** Two
+control checks first confirmed the fix's own preconditions genuinely hold,
+via the same JTAG SRAM-latch technique used throughout this investigation
+(`g_dwt_ctrl_at_boot`, `g_dwt_cyccnt_latest`, updated every loop iteration):
+- `g_dwt_ctrl_at_boot = 0x40000401` — `CYCCNTENA` (bit 0) and `SYNCTAP=1`
+  (bit 10) both genuinely landed; `0x40000000` matches this TRM's own
+  documented DWT_CTRL reset pattern for "four comparators present," so the
+  write correctly composed with the reset value rather than clobbering it.
+- `g_dwt_cyccnt_latest` read twice ~2s apart: `15866572` → `80316841`, a
+  real, fast-incrementing free-running counter — confirms `CYCCNTENA`
+  actually enabled counting, not just a stuck bit.
+
+With `CYCCNT` incrementing this fast, its bit 24 (the configured sync tap)
+should cross at least once within any few-second test window. Retested
+`orbtrace stats`/`capture` over a full 5-10s window (comfortably longer
+than one tap period) with this exact firmware: **`rx_bytes` stayed `0`
+throughout.** Also tried reordering — starting Orbtrace's capture *before*
+releasing the M3 from reset, in case the formatter only ever emits one
+sync packet at boot/enable time and every prior test's separate
+configure→start→load-m3 ordering had already missed it: **same result,
+`rx_bytes=0`.** Re-armed the still-flashed diagnostic ILA against this
+exact DWT-enabled firmware too: identical frozen `0xFF`/`synced=0` capture
+as before (though this specific check is inconclusive on its own — the
+~20µs ILA window is far shorter than the ~1.6s configured sync period, so
+it could simply have missed the event even if periodic syncs are now
+genuinely being generated; the stats-based multi-second tests are the
+more decisive negative result here).
+
+**Not yet resolved — concrete candidates for a future session, cheapest
+first, all firmware-only (no Vivado rebuild needed since the diagnostic
+ILA bitstream is still cached and flashable):**
+1. The `DWT_CTRL` bit-field layout used here (`CYCCNTENA`=bit0,
+   `SYNCTAP`=bits[11:10]) is standard ARMv7-M architecture, cited from
+   general knowledge, not from this specific TRM (which explicitly defers
+   DWT register bit-fields to "the ARM®v7-M Architecture Reference
+   Manual" — not present in this project's locally extracted docs, and
+   not independently confirmed against this exact silicon). Worth
+   re-deriving from a canonical CMSIS `core_cm3.h`/ARM DDI0403E source
+   before trying more bit-position guesses blindly.
+2. Whether this specific synthesized TPIU instance actually implements the
+   optional DWT→TPIU distributed-synchronization signal at all (a
+   legitimate CoreSight synthesis-time option) — if not implemented, no
+   DWT/ITM configuration could ever produce a Full Sync Packet, and the
+   only paths forward would be either accepting Parallel mode as
+   unworkable on this exact IP configuration, or finding another trigger
+   mechanism (e.g. a manual/software-forced formatter flush, if one
+   exists beyond what `TPIU_FFCR` documents — `FFCR`'s own bits were
+   fully checked this session: reset value `0x102` = `TrigIn`(RAO,
+   harmless) + `EnFCont=1` already enabled by default, nothing missing
+   there).
+3. A real ILA capture with a MUCH longer window (the current 2048-sample
+   depth at 100 MHz gives only ~20µs; this part's LUT budget allowed up to
+   4096 samples for a single-domain NATIVE ILA before — even that is only
+   ~40µs, nowhere near the ~1.6s sync period) is not a practical way to
+   directly observe a sync event landing; the multi-second `orbtrace
+   stats`/`capture` tests already exercised this and came back negative,
+   which is the more trustworthy result.
+4. Consider instrumenting `g_heartbeat`-style counters *inside* `emit_next`
+   right at sequence boundaries to correlate real wall-clock sync-tap
+   crossings with what (if anything) changes in `orbtrace stats` at that
+   exact moment, rather than only sampling stats at the start/end of a
+   window.
+
+**Session wrap-up:** all temporary RTL debug ports (`orbtrace_pl.v`,
+`orbtrace_core.sv`, `orbtrace_tpiu_demux.sv`) reverted to their committed
+baseline; the untracked `applications/orbtrace/vivado/create_bd_debug.tcl`
+scratch file deleted (recreate from this section's description if
+repeating the ILA methodology — it's a thin wrapper that `source`s the
+real `create_bd.tcl` unchanged, then appends one `system_ila` NATIVE-mode
+core with 11 probes: `dbg_selected_data[7:0]`, `dbg_selected_valid`,
+`dbg_synced`, `dbg_emitting`, `dbg_channel[6:0]`, `dbg_fill[4:0]`,
+`dbg_emit[4:0]`, `dbg_is_id`, `dbg_m3_cdc_valid`, `dbg_m3_cdc_ready`,
+`dbg_trace_data_m3_raw[3:0]`, all clocked on `aclk`/`ps/pl_clk0` — do NOT
+add a second ILA clocked on `m3_core/TRACECLK` directly, that hit the
+Xicom/debug-hub error above). Diagnostic ILA bitstream cached at
+`bazel-out/orbtrace-vivado-m3-ila-debug` (build script
+`build_debug.tcl`, both lived in the session scratchpad, not committed —
+recreate from this description too) if a future session wants to reuse it
+without another ~20-25 min rebuild. Board restored to the last known-good
+*production* bitstream (`bazel-out/orbtrace-vivado-m3-10mhz-r4`, no ILA,
+matches the currently-committed `create_bd.tcl`), running the current
+`m3_app` (DWT sync fix plus all this session's new diagnostic latches --
+`g_tpiu_itctrl_at_boot`, `g_tpiu_sppr_at_boot`, `g_tpiu_cspsr_at_boot`,
+`g_itm_ter_at_boot`, `g_dwt_ctrl_at_boot`, `g_dwt_cyccnt_latest` -- all
+kept as real, committed, low-cost-to-retain diagnostics matching this
+file's own established convention).
+
+**How to apply:** Parallel/4-bit mode's blocker is now understood at a much
+deeper level than the earlier "bandwidth mismatch" framing (which is
+itself retracted by this session — width and clock rate were both already
+ruled out on 2026-08-18 before this ILA work even started) — it is a
+missing Full Sync Packet, most likely fixable with the correct DWT
+configuration, but the specific bit-pattern tried this session didn't
+produce one within a generously long test window. Next session should
+either (a) re-derive the exact DWT_CTRL encoding from a canonical source
+before retrying, or (b) treat this as strong enough evidence to formally
+pivot to the SWO path (already separately scoped, and known to have a
+receiver/framing bug rather than a content-generation bug — see the
+2026-08-18 SWO-NRZ sections above), since SWO's own content-generation
+side does not depend on this same DWT/formatter full-sync mechanism at
+all (SWO bypasses the formatter's frame-sync protocol entirely per TRM
+§11.2.3).
+
+## 2026-08-18 continuation (same day) — user directed to keep pushing on Parallel mode specifically, not SWO. Two real findings, one real RTL bug found and fixed, but genuine decode still not achieved
+
+User explicitly ruled out the SWO pivot ("I don't care about SWO") and asked to continue on Parallel mode. This update covers real, hardware-verified progress and a final, honest negative result for the specific approach tried.
+
+**1. Verified the `DWT_CTRL` bit encoding against an authoritative source (web search:
+libopencm3's `dwt.h`, cross-checked against the TRM's own documented reset-value table).
+`CYCCNTENA`=bit0, `SYNCTAP`=bits[11:10] is confirmed correct — not the bug.** The observed
+readback (`0x40000401`) decomposes exactly into the intended write (`CYCCNTENA`+`SYNCTAP=1`)
+composed with `NUMCOMP=4` at bits[31:28] (`0x40000000`, matching "four comparators present"
+from the TRM's own DWT_CTRL reset-value table) — the write genuinely landed correctly.
+
+**2. Definitively confirmed (real hardware, 22-minute edge-triggered ILA wait, then
+reconfirmed via an 8-second `orbtrace stats` window under a continuous/tight STIM write
+pattern) that the M3's formatter never emits a Full Sync Packet, regardless of write
+timing.** This rules out "maybe DWT sync needs sustained traffic too" as an explanation.
+
+**3. Real finding: STIM write TIMING matters enormously.** Isolated via a `system_ila`
+free-run capture on `trace_data_m3` (same diagnostic bitstream/probes as the previous
+update, reflashed with several different firmware variants):
+- A near-zero-overhead tight loop (`for(;;) M3_ITM_STIM(0)=value;`, no delay, single port,
+  32-bit) produces **real, varying content** on `trace_data_m3` (10 distinct nibble values
+  across a 20µs capture, vs. a frozen constant beforehand).
+- Reintroducing even a small delay (~10-12µs, a 20-iteration busy-wait) or using
+  `emit_next()`'s own inherent overhead (switch dispatch, state update — tens of cycles,
+  no explicit delay loop at all) both revert the output to the frozen idle pattern. The
+  critical gap threshold is somewhere between a handful of CPU cycles and ~20-40 cycles —
+  extremely tight, and not compatible with any realistic instrumented-firmware write
+  pattern, only a dedicated synthetic test loop.
+
+**4. Implemented a self-contained RTL workaround: a "force-sync" fallback in the shared
+`orbtrace_tpiu_demux.sv`, gated to the M3 source only (`source_select==0`; the PS/ETM
+path's real, proven sync-pattern detection is completely unmodified) — since real content
+does reach the wire under the right write pattern, periodically force frame alignment at
+a guessed phase instead of waiting for a Full Sync Packet that will never come, cycling
+through all 16 possible phases so a multi-second capture samples every alignment.**
+
+- **First implementation had a real bug**, found via a `0xDEADBEEF` marker test (write a
+  fixed, easily-searchable 32-bit value instead of varying content, then search the
+  decoded corpus for the literal bytes): forcing `fill<=force_phase` (a nonzero starting
+  value) does not wait for a full fresh 16-byte refill before emitting — emission
+  triggers as soon as `fill` reaches 15 regardless of where it started, so buffer
+  positions before `force_phase` held **stale data from the previous cycle**. This
+  produced `rx_bytes` in the millions and a semi-consistent-but-corrupted repeating byte
+  pattern around partial marker fragments — real bytes flowing, but every "frame" a
+  mix of fresh and stale data.
+- **Fixed**: always restart cleanly at `fill=0` (matching normal, bug-free behavior);
+  vary only *when* the restart triggers (a rotating cycle-offset within each ~4000-cycle
+  period), sampling all 16 true alignments via always-fresh restarts instead of
+  fill-index tricks. Verified via `xvlog`/`xelab` elaboration and the existing RTL unit
+  test suite before spending a rebuild.
+- **Rebuilt as a real production bitstream** (not the relaxed diagnostic ILA build —
+  `build.tcl` unchanged, strict CDC/methodology/timing gates all passed) both before and
+  after the fix, ~25-35 min each thanks to the cached M3 EDIF.
+
+**5. Decisive negative result: even with the bug fixed, the `0xDEADBEEF` marker never
+appears intact in the decoded output, and a rigorous statistical control proves the
+earlier "partial marker fragment" evidence was a false positive.** `rx_bytes` reached
+millions in every force-sync test (2.2M, 4.9M, 2.8M, 3.8M bytes across different runs) —
+but this metric turned out to be **not a reliable indicator of correct decode at all**: a
+run with the firmware writing a real varying value showed the exact same statistical
+signature (a specific 2-byte marker fragment, `AD DE`, appearing ~4500-4600 times vs. ~64
+expected by chance) as a run with the M3 producing **zero real content** (delay
+reintroduced, confirmed frozen `0xFF` idle pattern the whole time, which still produced
+`rx_bytes=3.8M` and the identical `AD DE` excess at proportional rate, 808 hits). The
+"statistically significant" pattern is an artifact of decoding the idle pattern's own
+structure through the demux's ID-byte-unmangling arithmetic — unrelated to real M3
+content — and the corrected force-sync fallback does not recover genuine, verifiable
+ITM/CoreSight-framed data at any of its 16 tried phases.
+
+**What this means:** real electrical variation on `trace_data_m3` is confirmed to occur
+under specific tight-write-timing conditions (item 3), but this variation does not appear
+to be genuine, protocol-compliant CoreSight-framed content recoverable via the demux's
+standard frame model — or if it is, the true framing convention differs from what's
+implemented (byte order, frame size, or ID-byte mangling assumptions may not match this
+specific synthesized TPIU instance) in a way this session's testing could not pin down.
+Every register-level configuration hypothesis has now been exhausted and independently
+verified correct; every timing hypothesis tested; the RTL-workaround hypothesis
+implemented, debugged, and tested to a clean negative result.
+
+**Session end state:** RTL (`orbtrace_tpiu_demux.sv`, `orbtrace_core.sv`) reverted to
+committed baseline — the force-sync fallback was real, working code (verified via
+elaboration and two real hardware builds) but is not being kept since it doesn't achieve
+its purpose; recreate from this update's description if a future session wants to resume
+from where this left off (the corrected version, not the buggy first attempt). Firmware
+(`sdk/bsp/m3/itm.h`, `applications/orbtrace/firmware/m3_app/src/main.c`) kept only the
+real, TRM-motivated DWT sync configuration and diagnostic latches
+(`g_tpiu_itctrl_at_boot`, `g_tpiu_sppr_at_boot`, `g_tpiu_cspsr_at_boot`,
+`g_itm_ter_at_boot`, `g_dwt_ctrl_at_boot`, `g_dwt_cyccnt_latest`) — all throwaway test
+loops (tight-loop bypass, `0xDEADBEEF` marker, ready-check removal) reverted. Board
+restored to the known-good production bitstream (`bazel-out/orbtrace-vivado-m3-10mhz-r4`)
+running the clean firmware. Diagnostic ILA bitstream still cached at
+`bazel-out/orbtrace-vivado-m3-ila-debug` if a future session wants to resume raw
+signal-level investigation without a rebuild. Decode/analysis scripts
+(`decode_orbflow.py` and the marker-search snippets) lived in the session scratchpad, not
+committed.
+
+**How to apply — genuinely open, no more low-hanging fruit identified this session:**
+Parallel mode is blocked at a level this session's toolset (register verification, timing
+experiments, ILA captures, RTL workarounds) could not resolve. Next steps would likely
+require either (a) a from-scratch, byte-level reverse-engineering of exactly what this
+specific TPIU instance puts on the wire under the tight-write-timing condition — ideally
+with a MUCH longer/deeper ILA capture (would need a Vivado license/part supporting more
+than the ~4096-sample budget this XCZU1CG's LUT count allows) correlated cycle-by-cycle
+against known STIM write instants, rather than statistical corpus search after the fact;
+or (b) reaching out to Arm/Xilinx documentation or support channels for this specific
+DesignStart FPGA edition's TPIU behavior, since the encrypted RTL can't be inspected
+directly and the public TRM doesn't fully specify implementation-defined timing behavior.
+
+## 2026-08-18 continuation (same day) — deeper ILA capture, per user request: real structural progress, root cause narrowed further but not yet fully solved
+
+User asked to try the deeper ILA capture explicitly. This section supersedes the
+"no more low-hanging fruit" framing above for the specific question of *why* real
+content never reaches the demux — a genuinely new, concrete lead was found.
+
+**Methodology change from all earlier captures this investigation:** every previous
+ILA used many probes (demux internals, etc.) at shallow depth (2048 samples, ~20µs).
+This time, minimal probe sets (2-6 signals) let the ILA go to 8192-16384 samples
+(~80-160µs, ~10-16x longer). Also switched the firmware under test from `emit_next()`'s
+varying-port/varying-width workload to first `M3_ITM_STIM(0) = g_heartbeat` (tight,
+zero-delay loop, no ready-check) and then a fixed `M3_ITM_STIM(0) = 0xDEADBEEFu` marker
+for unambiguous pattern matching — both bypass `m3_itm_write()`'s wrapper directly to
+avoid re-touching `itm.h`.
+
+**Real, resource-contention build failures this session (not RTL/BD problems):**
+multiple diagnostic builds were killed mid-synthesis by memory pressure from unrelated
+desktop applications on this machine (a game using ~9GB RSS, dozens of Firefox tabs;
+swap was at 31/34GB used). Confirmed via `ps aux --sort=-%mem`/`free -h` each time, not
+assumed. Retrying (sometimes 2-3x) reliably succeeded once memory freed up. Worth
+checking `free -h` before assuming a killed background Vivado job is a real failure.
+
+**Finding 1 — the raw M3 pins genuinely do carry more than a 2-value idle toggle.**
+A first deep capture (11→2 probes, depth 16384) tapping only `dbg_trace_data_m3_raw`
+(the raw 4-bit bus, before any PL-side processing) showed **11 distinct nibble values**
+across the window under the tight-write firmware — more than the `0x7`/`0xF` idle-only
+toggle seen in every earlier, shorter capture. But `dbg_selected_data` (the
+DDR-reconstructed, post-FIFO byte reaching the demux, probed simultaneously) stayed
+**100% frozen at a single constant value** the entire window. This appeared to
+conclusively localize a bug to the PL-side DDR-capture/FIFO reconstruction path, not
+the M3.
+
+**Finding 2 — localized further: `orbtrace_ddr_capture`'s own direct output (pre-FIFO)
+also showed real, matching variation; the freeze was specifically downstream of it.**
+Added `dbg_m3_trace_byte`/`dbg_m3_trace_valid` (the DDR-capture module's own output,
+before the async CDC FIFO) alongside the post-FIFO probe on the same capture. Result:
+pre-FIFO byte showed genuine multi-value variation (`ff`, `23`, `60`, `3f`, `39`, `0a`,
+`1a`, `18`, `03`, `01`, `38`, `2a`, `10`, `0b`, ...) while post-FIFO stayed frozen —
+seemingly proving the async FIFO (or its read-side handshake) was discarding real
+content.
+
+**Finding 3 — did NOT reproduce on a fresh rebuild; the "frozen FIFO" was a transient/
+race condition, not a structural bug.** Added direct probes on `m3_cdc_ready` (FIFO
+read-side ready) and `m3_cdc_write_ready` (FIFO write-side ready) alongside pre/post-FIFO
+bytes, same firmware, freshly rebuilt bitstream (same RTL, different synthesis run).
+This time: **pre-FIFO and post-FIFO bytes matched exactly, byte-for-byte, real content
+flowing correctly all the way through** to `dbg_selected_data`. Both `m3_cdc_ready` and
+`m3_cdc_write_ready` read a constant `1` (never stuck) throughout. `orbtrace stats` at
+this exact moment still showed `rx_bytes=0` despite confirmed-correct content reaching
+the demux's input — consistent with the already-established finding that the demux
+still can't decode without a genuine Full Sync Packet, which never appears (re-confirmed:
+zero occurrences of `0xFFFFFF7F` anywhere in this capture too). **The FIFO/DDR-capture
+path is not the real bug; Finding 2's apparent freeze was some kind of transient
+startup-race condition (not yet understood, possibly RTL-build-instance-specific
+timing), not a structural flaw.** This is genuinely useful: it means the PL capture
+pipeline can and often does work correctly, redirecting effort back to Finding 4.
+
+**Finding 4 — real, structured, repeating content discovered by deduplicating the
+oversampled capture and removing idle bytes.** The ILA (100 MHz `aclk`) asynchronously
+oversamples the ~10 MHz M3-domain byte stream roughly 10x per real value, so consecutive
+identical ILA samples are a sampling artifact, not real repetition. After
+deduplicating consecutive-identical values, the `0xDEADBEEF`-marker capture showed a
+**clearly repeating structure**: a stable multi-byte prefix (e.g. `3f 23 e3 ee de`, with
+`de` = `0xDE`, the marker's true MSB, landing at a plausible position), varying
+tail bytes, and — critically — **`0xFF` (or a value very close to it) appears between
+every single "real" byte**, not just as sparse padding between distant writes. Given
+`0xFF`'s top 7 bits (`0xFF >> 1 = 127`) exactly match the "channel 127" that dominated
+every prior `orbtrace stats`/decoded-corpus histogram throughout this entire multi-day
+investigation, this is very likely the CoreSight formatter's even-position "ID byte"
+mechanism firing on *every* even slot (not occasionally, as assumed) rather than the
+odd/data positions being what's sparse. This reframes the open question: real content is
+demonstrably present and forms a discoverable pattern, but either (a) this session's
+CoreSight ID-byte-unmangling model in `orbtrace_tpiu_demux.sv` doesn't match this
+specific TPIU's real wire convention, or (b) the async, non-cycle-accurate sampling
+technique can't distinguish "one idle slot" from "multiple consecutive idle slots"
+between real bytes, which blocks precisely reconstructing byte positions from this data
+alone.
+
+**Not resolved this round:** the exact byte-for-byte mapping from the observed pattern
+to the literal marker bytes (`EF BE AD DE`). Partial, suggestive matches were found
+(`DE` at a plausible position) but not a clean, confirmed full decode.
+
+**Session end state:** all temporary RTL debug ports (`orbtrace_pl.v`, `orbtrace_core.sv`)
+reverted to committed baseline; the untracked `create_bd_debug.tcl` deleted. Firmware
+back to the real, kept state (DWT sync fix + diagnostic latches only, `emit_next()`
+restored as the main loop). Board back on the known-good production bitstream. The
+`bazel-out/orbtrace-vivado-m3-ila-debug` diagnostic ILA bitstream directory was
+overwritten multiple times this round (final state: 6-probe version with
+`m3_cdc_ready`/`m3_cdc_write_ready`) — recreate `create_bd_debug.tcl` from this section's
+probe descriptions if resuming this exact investigation.
+
+**How to apply — concrete next steps, most promising first:**
+1. **Get a cycle-accurate (not asynchronously-oversampled) capture.** The current
+   technique samples PL-domain (trace_clk_m3 or its FIFO output) signals with the
+   aclk-domain ILA, which can't distinguish idle-slot multiplicity. A NATIVE-mode ILA
+   clocked directly on `trace_clk_m3` (like the very first, 2026-08-16 M3 investigation
+   used) would give one sample per real byte, unambiguous. Note: a *second* ILA core on
+   a different clock hit a real Vivado debug-hub/Xicom tool bug earlier this session
+   (`Invalid Register Name: COUNTER4_WIDTH`) — either use a single trace_clk_m3-clocked
+   ILA alone (no aclk-domain ILA in the same bitstream), or investigate that tool
+   limitation further if both domains are needed simultaneously.
+2. With unambiguous idle-slot counts, precisely test whether the observed pattern
+   matches standard CoreSight ID-byte mangling (this session's demux model) or a
+   simpler convention (e.g. literal alternating idle/data with no bit-stealing).
+3. Re-run the marker test (`0xDEADBEEF`) against a cycle-accurate capture and search for
+   the literal `EF BE AD DE` byte sequence directly in the unambiguous data.
+4. Only after the true wire format is nailed down precisely, either fix
+   `orbtrace_tpiu_demux.sv`'s decode model to match it, or (if it turns out to still
+   require a genuine Full Sync Packet the M3 never produces) revisit the force-sync
+   fallback approach with the corrected framing model.
+
+## 2026-08-18 continuation (new session) — cycle-accurate capture built and run; BREAKTHROUGH: `rx_bytes` genuinely nonzero (5M+ real bytes) for the first time ever, but decoded content is still wrong — root cause narrowed to false/misaligned sync locks, not a transport or framing-model bug
+
+Followed this doc's own "next steps" #1 exactly: built a NEW diagnostic bitstream with
+a single `system_ila` clocked directly on `m3_core/TRACECLK` (not `aclk`), probing
+`orbtrace_pl.v`'s M3 DDR-capture module's own post-reconstruction `byte_data`/`byte_valid`
+(temporary `dbg_m3_trace_byte`/`dbg_m3_trace_valid` ports, reverted after — same technique
+as every prior session's diagnostic taps). This is a materially different, better design
+than every earlier capture in this investigation: because it probes the ALREADY-correctly-
+DDR-reconstructed byte (not raw `trace_data_m3[3:0]`) on the SAME clock domain that
+register lives in, every sample is one real, unambiguous byte — no async-oversampling
+idle-slot-count ambiguity, and only one ILA/one clock domain in the bitstream (avoiding the
+known Xicom two-clock-domain bug). Build: `bazel-out/orbtrace-vivado-m3-cycle-ila`, WNS
++0.648ns, WHS +0.010ns, clean gates (relaxed diagnostic build, as usual for these).
+
+**New real tool issue found and worked around: the JTAG scan of this specific debug core
+was badly flaky at the default JTAG clock rate — intermittent "1 vs 2 ILA Input port(s)"
+probe-count mismatches and a hard "Slow clock or no clock connected for ILA" error during
+upload, non-deterministic across identical back-to-back attempts on unchanged hardware.**
+Root cause: this ILA's core clock is `trace_clk_m3` (~10MHz), not `aclk` (100MHz) like every
+other debug core successfully used earlier in this investigation — Xilinx's own documented
+minimum ratio (JTAG TCK ≤ debug-hub-clock/2.5) was being violated by the default JTAG
+frequency. Fix: `set_property PARAM.FREQUENCY 1000000 [get_hw_targets]` before scanning —
+resolved the flakiness immediately and reliably. **Worth remembering for any future ILA
+tapping a clock slower than the default JTAG rate on this board.** Also found and worked
+around: stray `hw_server`/`cs_server` processes accumulate across repeated
+`nix develop -c vivado -mode batch` Hardware Manager invocations and are not cleaned up
+automatically; `pkill -f` was silently blocked/denied in this sandbox (exit 1, no output) —
+use `kill -9 <pid>` from a `ps aux` listing instead.
+
+**Marker test, cycle-accurate this time:** temporary firmware (`M3_ITM_STIM(0) = 0xDEADBEEFu`
+tight loop, no ready-check, same rationale as the 2026-08-18 earlier marker tests) captured
+16384 real, unambiguous bytes. Two findings:
+
+1. The steady-state idle pattern is a clean, stable `FF 7F FF 7F ...` byte-level alternation
+   (confirmed over long stretches) — but immediately after SOME (not all) real-content bursts,
+   a *different*, also-stable idle sub-pattern appears: `FF 7F FF FF` repeating. This second
+   pattern trivially and repeatedly contains the literal 4-byte sequence the demux searches
+   for (`FF FF FF 7F`) at every period, purely as an arithmetic artifact of tiling `FF 7F FF FF`
+   — **not evidence of a genuine formatter-inserted Full Sync Packet.** Feeding the full 16384-byte
+   capture through a line-for-line Python reimplementation of `orbtrace_tpiu_demux.sv`'s exact
+   state machine confirmed this: it "syncs" once (on this alias), then decodes garbage
+   (channels 63/127/49/31/...) for the rest of the window — the same statistical-artifact
+   signature the 2026-08-18 (earlier) session already characterized. **This is a second,
+   independent, real failure mode for the literal-4-byte-substring sync search, on top of
+   the already-known "no genuine Full Sync Packet within any practically-capturable window"
+   problem** — even if a real Full Sync Packet were found, this shows the search can also
+   false-lock on the idle pattern's own aliasing.
+
+2. **Decisive, unplanned discovery: with the marker firmware left running continuously for
+   several minutes (many DWT sync periods) and Orbtrace's `configure`/`start` issued for
+   real, `orbtrace stats` showed `rx_bytes=8`, then, given a real `orbtrace capture` run over
+   ~9 more seconds, `rx_bytes=5,243,102` — genuinely nonzero, sustained, real byte flow
+   through the ENTIRE PL pipeline (DDR capture → CDC FIFO → demux → orbflow encoder → DMA →
+   NetX → TCP 3402) for the first time in this entire multi-day investigation.** Every prior
+   session's test window was measured in seconds right after a fresh reflash/load — this is
+   the first test left running long enough (and with continuous real STIM traffic, per the
+   already-known STIM-write-timing sensitivity) to plausibly let a DWT-driven sync event (or
+   several) actually occur.
+
+   **But decoding `captured.bin` (COBS/orbflow-unframed via a Python port of
+   `model/src/lib.rs`'s exact `cobs_decode`/`orbflow_unframe`) shows the transport is
+   essentially perfect (786,587 / 786,588 frames pass their checksum) while the CONTENT is
+   still wrong: channel 1 (the configured `TRACEBUSID`, the only channel real M3 content
+   should ever appear on) has only 4 total bytes across the whole 5.2MB capture, none of
+   them resembling the repeating `03 EF BE AD DE` the marker firmware should have produced.
+   Every other channel seen (63, 127, 49, 31, 40, 48, 62, 78, 114) is bogus, dominated by
+   `FF`/`7F`/`33`/`EE`-type idle-derived noise.** This means the demux DID lock onto
+   *something* stable enough to sustain 5M+ bytes of self-consistent (checksum-valid) COBS
+   framing — almost certainly the SAME kind of aliased idle-pattern lock as finding 1 above,
+   just one that happened to stay locked for a long time rather than immediately overflowing
+   — not a genuine, correctly-phase-aligned lock onto real M3 content.
+
+**What this changes:** the transport/encoder/DMA/NetX/TCP path (everything downstream of
+the demux) is now proven robust under real, sustained load — this was never actually tested
+end-to-end before (every earlier "success" was `rx_bytes` staying at 0). The ENTIRE remaining
+problem is now conclusively isolated to one thing: **`orbtrace_tpiu_demux.sv`'s frame-sync
+acquisition, which reliably false-locks onto structure that exists within the M3's own idle
+output, rather than ever locking onto a position aligned with real content.** This is no
+longer a "does real data reach the wire" or "does the pipeline work" question — both are
+settled yes. It is specifically a sync-acquisition-robustness bug.
+
+**Not yet attempted, and NOT started without checking in first (this is a genuine new
+engineering direction, not an incremental fix, matching this doc's own established pattern
+of pausing before this kind of fork):** the standard CoreSight architecture's own sync
+mechanism (bare 4-byte magic-number search) has now been shown twice to be alias-prone
+against this specific IP's real idle output. A more robust resync strategy is needed —
+candidates, cheapest/most-targeted first:
+1. Require a plausibility check before committing to a sync lock: after finding a
+   candidate `FFFFFF7F`, verify the frame's first non-idle ID byte actually decodes to
+   `channel == 1` (the fixed, known `TRACEBUSID` this design always configures) before
+   trusting the lock; otherwise keep searching. Cheap, targeted, but overfits to this one
+   fixed TRACEBUSID configuration (acceptable, since nothing in this codebase varies it).
+2. Anchor resync on the observed real-world idle→burst TRANSITION (recognizable, stable
+   `FF 7F` alternation ending) rather than a bare magic-number substring match — a bigger
+   departure from the standard architecture's own assumptions, but directly justified by
+   this session's empirical characterization of what this specific silicon actually puts on
+   the wire.
+3. Revisit whether `reset_sync`/`sync_loss_count` behavior itself needs investigation —
+   `orbtrace stats` showed `sync_loss` still climbing by ~580K/s during the 9s capture
+   window despite `synced` in the RTL model only ever being cleared by an explicit
+   `reset_pulse` (an AXI-Lite command-driven one-shot, not something that should fire
+   continuously during normal `running` operation) — not yet reconciled; `Stats.sync_loss`
+   may aggregate more than just `orbtrace_tpiu_demux`'s own counter (see
+   `orbtrace_pl.v`'s `tpiu_sync_loss+nrz_malformed+manchester_malformed` combination for the
+   SWO stats path) and this hasn't been traced through for the Parallel/tpiu4 case
+   specifically.
+
+**Session artifacts (not committed, scratch-only):** the trace_clk_m3-domain ILA
+bitstream at `bazel-out/orbtrace-vivado-m3-cycle-ila` (build script
+`build_debug_cycle_ila.tcl`, BD wrapper `create_bd_debug.tcl`, both in the session
+scratchpad — thin wrapper sourcing the real, current `create_bd.tcl` plus one
+`system_ila` on `m3_core/TRACECLK` probing `trace_pl/dbg_m3_trace_byte`/
+`dbg_m3_trace_valid`, recreate from this description if reused); `arm_and_capture.tcl`
+(Hardware Manager Tcl, includes the `PARAM.FREQUENCY 1000000` fix and retry loops for the
+JTAG flakiness above); `demux_sim.py` (line-for-line Python port of
+`orbtrace_tpiu_demux.sv`); `orbflow_decode.py` (Python port of `model/src/lib.rs`'s
+COBS/orbflow unframing). All temporary RTL debug ports (`orbtrace_pl.v`) and firmware
+changes (marker loop in `main.c`) have been reverted to committed baseline; board state
+at end of this update: `orbtrace-vivado-m3-cycle-ila` bitstream still flashed (not the
+production `m3-10mhz-r4`), M3 running the marker firmware with `configure m3 tpiu4` +
+`start` still active.
+
+## 2026-08-19 continuation — channel-plausibility fix implemented, built, and flashed as a
+real production bitstream; result so far: false locks are gone, but no genuine sync
+observed yet under either workload. Session interrupted mid-retest — picking back up here.
+
+**Fix implemented** (user chose this over idle-transition anchoring or investigating
+`sync_loss` first, when asked): `orbtrace_tpiu_demux.sv` gained a new `m3_source` input
+(wired from `orbtrace_core.sv` as `source_select == 2'd0`) and a plausibility gate in the
+sequential block — when `m3_source` is set, any `is_id` byte whose decoded channel isn't
+`M3_EXPECTED_CHANNEL` (`7'd1`, the fixed `TRACEBUSID` `m3_itm_init()` always configures)
+immediately drops `synced`/`fill`/`emitting` back to the search state and counts as a
+`sync_loss`, instead of continuing to decode at the wrong frame phase. The PS/ETM path
+(`m3_source==0`) is untouched. Verified via `xvlog`/`xelab`/`xsim` against the existing
+`rtl_unit_test` suite (passes; note doesn't cover this file directly, no dedicated
+`orbtrace_tpiu_demux` testbench exists yet) before spending a real rebuild.
+
+**Real production build** (`build.tcl`, strict gates, not the relaxed diagnostic path):
+`bazel-out/orbtrace-vivado-m3-sync-fix`. All three gates passed cleanly: zero unwaived
+critical CDC violations, zero unwaived critical methodology violations, WNS=1.641ns/
+WHS=0.010ns. Flashed via `jtag_flash.sh` (full `rst -system` reflash), `orbtrace info`
+confirmed the board up.
+
+**Retest, real firmware (`m3_itm_init(2)` + real `emit_next()`, 10000-iteration busy-wait
+between STIM writes):** `rx_bytes=0` after both a ~3s and a longer window; `sync_loss`
+climbing steadily (73M+ within a few seconds) — the fix is actively rejecting candidate
+locks continuously, but none are ever both genuine AND channel-1-plausible under the real
+workload's sparse STIM cadence. Consistent with the already-known STIM-write-timing
+sensitivity (real content only reaches the wire within a narrow ~10-40 cycle window after
+each write): the real workload's huge inter-write gaps mean the TPIU is emitting almost
+pure idle output nearly all the time, giving the (still bare-substring) sync search very
+little genuine content to lock onto in the first place.
+
+**Retest, marker firmware (`M3_ITM_STIM(0)=0xDEADBEEFu` tight loop, same firmware that
+produced 5.2M mostly-garbage bytes on the PRE-fix bitstream):** `rx_bytes=0` across three
+separate capture attempts of increasing length (15s, then ~70s, comfortably longer than
+the ~1.6s DWT sync-tap period at the board's real 10MHz M3 clock). This is the most
+important new data point: **the fix's `sync_loss` counter climbing throughout, combined
+with the earlier pre-fix session's 5.2M-byte result being conclusively shown to be
+false-lock garbage (channel 1 had only 4 bytes total, none matching the marker), together
+mean the demux was very likely never achieving a single genuine, content-aligned lock at
+all in this whole investigation** — every prior "success" (both the 2026-08-18 5.2M-byte
+result and the isolated `FFFFFF7F` occurrences found by manual inspection of the
+cycle-accurate capture) was the same idle-pattern aliasing artifact, not evidence that
+real sync ever worked even once. The channel-plausibility fix is doing exactly what it
+was designed to do (stop mis-decoding aliases as real data) but has not yet been observed
+to let a genuine lock through, because it's not clear one has ever actually occurred to
+let through.
+
+**Session interrupted by the user during a capture retest** (a `timeout 70 ... capture
+...` call was killed mid-run, exit 137). Immediately after, the board became unreachable
+(`orbtrace info` → "No route to host", no ARP entry for `192.168.1.50` at all) — needs a
+fresh `jtag_flash.sh` reflash to recover before continuing (this specific symptom — board
+totally silent, no ARP, not just a slow/failed single command — matches this project's
+established "genuinely down, not just a flaky ping" signature, distinct from the
+documented "ICMP unreliable but TCP fine" caveat).
+
+**Not yet resolved, concrete next steps in order:**
+1. Reflash (recover the board) and re-verify `orbtrace info` responds before anything else.
+2. Given the marker firmware itself may not be tight enough to produce a SUSTAINED,
+   multi-frame-long run of real content (the earlier ILA capture showed bursts of only
+   ~7-9 bytes between idle stretches, well under one 16-byte frame), consider whether a
+   genuine sync even CAN occur under any firmware pattern tried so far — the DWT-driven
+   Full Sync Packet mechanism (`m3_itm_init()`'s `M3_DWT_CTRL` write) remains the only
+   documented trigger and still has not been proven to fire even once with certainty.
+3. If still no genuine lock after a longer, patient retest, this changes the diagnosis
+   materially: it would mean the false-lock aliasing was masking a DEEPER problem (no real
+   Full Sync Packet ever occurs) rather than being the root cause on its own. Worth
+   revisiting candidate #3 from the previous update (trace `sync_loss`/`reset_pulse`
+   generation) and candidate #2 (idle-transition anchoring, which doesn't depend on a
+   literal Full Sync Packet appearing at all) at that point.
+
+**Update, same session: board recovered (reflashed the sync-fix bitstream) and the marker
+test re-run for a full ~130 seconds (~80 DWT sync-tap periods at the board's real 10MHz M3
+clock) — `rx_bytes=0` for the ENTIRE window. This is decisive, not just inconclusive.**
+
+`sync_loss` climbed steadily throughout (48M → 73.9M across the run), confirming the
+plausibility gate is actively and continuously rejecting candidate locks the whole time —
+but not one single one of them, across 130+ seconds of continuous real tight-loop STIM
+traffic, was both a genuine frame-boundary match AND channel-1-plausible. Combined with
+the earlier finding that the pre-fix bitstream's 5.2M "successful" bytes were conclusively
+proven to be alias garbage (channel 1 had only 4 bytes total), this now rules out "just
+needed a longer window" as an explanation. **Best current read: this specific synthesized
+TPIU instance's DWT-driven Full Sync Packet mechanism does not reliably fire in a way this
+bare-4-byte-magic-number search can ever legitimately catch — either it doesn't fire at
+all despite the correct-per-TRM `DWT_CTRL` configuration (a real, still-unexplained gap
+between documented architecture and this instance's actual behavior), or it fires but the
+demux's simple substring scan has some other structural reason it can't catch a genuine
+one (not yet identified).**
+
+**This points toward candidate #2 from the previous update as the more promising direction
+now**, not just a fallback: anchor resync on the empirically well-characterized, stable,
+recognizable idle→burst transition in the M3's real wire output (already measured in
+detail via the cycle-accurate capture earlier this session) rather than continuing to wait
+for a literal Full Sync Packet that may never come. This is a bigger design change than
+the plausibility gate (a genuine departure from the standard CoreSight architecture's own
+sync mechanism, justified specifically by this instance's empirically-characterized real
+behavior) — flagging here rather than starting it unilaterally, matching this document's
+established pattern at forks like this.
+
+**User chose to pause here rather than start the idle-transition redesign this session.**
+Session wrap-up:
+
+- **Real, kept change:** the channel-plausibility gate in `orbtrace_tpiu_demux.sv` /
+  `orbtrace_core.sv` (new `m3_source` port, `M3_EXPECTED_CHANNEL` check) is left in place,
+  uncommitted, in the working tree — it is a genuine correctness improvement (stops
+  decoding idle-pattern aliases as real trace data) even though it hasn't yet been the
+  thing that makes Parallel/4-bit mode succeed end-to-end. Not reverted.
+- **Board state:** reflashed with `bazel-out/orbtrace-vivado-m3-sync-fix` (the real
+  production bitstream containing the fix, all gates clean — WNS=1.641ns, WHS=0.010ns,
+  zero unwaived critical CDC/methodology findings). M3 reloaded with the real firmware
+  (`m3_itm_init(2)` + `emit_next()`, not the marker), capture stopped, board confirmed
+  responsive (`orbtrace info` → `ZUBoard-Orbtrace/1`) before ending.
+- **Diagnostic artifacts kept in the session scratchpad, not committed** (recreate from
+  this document's descriptions if resuming): `create_bd_debug.tcl`/
+  `build_debug_cycle_ila.tcl` (the trace_clk_m3-domain ILA build, cached bitstream at
+  `bazel-out/orbtrace-vivado-m3-cycle-ila`), `arm_and_capture.tcl` (Hardware Manager Tcl,
+  includes the `PARAM.FREQUENCY 1000000` JTAG-clock fix and retry loops for the scan
+  flakiness documented above), `demux_sim.py` (Python port of the pre-fix demux state
+  machine), `orbflow_decode.py`/`verify_captured.py` (COBS/orbflow decode +
+  Workload-reference diff tooling for Phase F, verified working, ready to reuse once real
+  captured data exists), `m3_app_marker.bin`/`m3_app_real.bin` (built firmware images).
+
+**Where the next session should start:** the plausibility-gate fix is real progress (it
+converts silent mis-decoding into an honest, countable rejection), but the actual
+end-to-end goal is still not met — `rx_bytes` has never been observed genuinely nonzero.
+The next concrete step is the idle-transition-anchored resync redesign (candidate #2,
+scoped above), or the DWT-generation investigation (the other option offered and not
+chosen this session) if a future session wants to settle *why* no genuine Full Sync
+Packet is ever caught before committing to a bigger resync redesign.
+
+## 2026-08-19 continuation (new session) — DWT-sync investigation found a different, real bug
+## first: the sync-word byte order in `orbtrace_tpiu_demux.sv` is backwards. Fixed, simulation
+## -validated, real hardware rebuild in progress.
+
+User asked to investigate DWT sync first, not jump straight to the idle-transition redesign.
+That investigation found something more concrete than expected.
+
+**1. DWT hardware presence confirmed present at maximum config, from the exact flashed
+build's own XCI (static check, no hardware time):** `bazel-out/orbtrace-vivado-m3-sync-fix`'s
+`zub_orbtrace_m3_core_0.xci` shows `TRACE_LVL=1` ("Standard trace: ITM & DWT, no ETM") and
+`DEBUG_LVL=3` ("Full debug including DWT"), both `resolve_type: user` (i.e. these ARE this
+build's real settings, not just component.xml defaults quoted for context) — genuinely
+present in the exact bitstream currently on the board. This is real evidence, not inference,
+against the "this synthesized instance doesn't implement DWT-to-formatter sync" contingency
+noted at the end of the previous update. `cm3_dwt.v`/`cm3_itm.v`/`cm3_tpiu.v` themselves are
+IEEE P1735/Xilinx-encrypted (confirmed by inspection — not just the CPU core, the debug/trace
+peripherals too), so no deeper static RTL ground truth is available beyond this.
+
+**2. Real, previously-undiscovered bug found: `orbtrace_tpiu_demux.sv`'s sync-word search
+has the byte order backwards relative to the correct CoreSight convention.** Cross-checked
+against sigrok's independent, open-source `arm_tpiu` reference decoder (fetched and read
+directly, not from memory): a genuine Full Sync Packet is, chronologically, **three `0xFF`
+bytes followed by a terminating `0x7F`** (0x7F is appended last, completing the match — this
+is `[0xFF,0xFF,0xFF,0x7F]` in the decoder's own rolling append-to-end buffer). Re-deriving
+`orbtrace_tpiu_demux.sv`'s shift-register match cycle-by-cycle (`sync_window <=
+{input_data, sync_window[31:8]}`, compared against `32'hffffff7f`) shows the OPPOSITE
+chronological order: the byte that completes the match (the *newest* one, landing at
+`sync_window[31:24]`) is `0xFF`, and the byte at the *oldest* position (`sync_window[7:0]`,
+three cycles stale) is `0x7F` — i.e. the RTL was searching for **`0x7F` first, then three
+`0xFF`s**, backwards from the real protocol.
+
+**3. Confirmed against real, still-on-disk hardware data, not just derivation.** A leftover
+scratchpad from the previous session's cycle-accurate ILA capture
+(`m3_cycle_ila_marker.csv`, the real 16384-byte `trace_clk_m3`-domain capture referenced in
+the 2026-08-18 "BREAKTHROUGH" update) was still present on this machine. Replaying it in
+Python: max consecutive `0xFF` run anywhere in the real capture is exactly 3 (histogram:
+`{1: 6361, 3: 490}`, never 2 or 4+) — consistent with the documented CoreSight half-sync
+idle behavior, not noise. The canonical chronological pattern (`0xFF,0xFF,0xFF,0x7F`) occurs
+455 times in this window; the RTL's actual (backwards) search pattern occurs 490 times —
+both large fractions of a 16384-byte capture, confirming the specific "`FF 7F FF FF`
+repeating" idle sub-pattern documented on 2026-08-18 aliases against **both** byte orders
+almost symmetrically (a periodic pattern contains a given 4-byte substring at multiple
+phases). So the byte-order fix does *not*, by itself, eliminate the false-lock-on-idle
+problem the channel-plausibility gate already handles — but it does mean that on any
+genuine, non-periodic DWT-triggered sync event, the pre-fix RTL would search at exactly the
+wrong alignment and could never correctly frame-align even in the best case, which is
+independently sufficient to explain why not one single valid channel-1 frame has ever been
+observed despite 130+ seconds of continuous real traffic in the previous session's testing.
+
+**4. Fix implemented:** `orbtrace_tpiu_demux.sv`'s match constant changed from
+`32'hffffff7f` to `32'h7fffffff` (flips which byte-position is "newest" vs "oldest" in the
+comparison, matching the real chronological convention). One line, low risk, well-evidenced.
+
+**5. Simulation-validated for the first time this investigation with a dedicated testbench**
+(`applications/orbtrace/rtl/tb/orbtrace_tpiu_demux_tb.sv`, wired into
+`rtl_unit_test.sh`/`BUILD.bazel`'s existing glob — this file previously had zero dedicated
+test coverage, noted as a gap in the 2026-08-19 earlier update). Three checks: (a) a
+synthetic idle-alias stream never produces a stable channel==1 lock and does trigger
+`sync_loss_count`, matching real hardware; (b) the CORRECT chronological sync sequence
+(`FF,FF,FF,7F`) immediately followed by a synthetic, well-formed 16-byte CoreSight frame (ID
+byte selecting channel 1, 14 real payload bytes) decodes byte-for-byte correctly with zero
+spurious `sync_loss` — verified against the pre-fix constant too: with `32'hffffff7f`
+restored, this exact same test fails outright (0 bytes ever emitted, the demux never locks
+at all on the correctly-ordered sequence) — proof the test actually exercises the bug, not
+just passing trivially; (c) the plausibility gate still correctly rejects a wrong-channel ID
+byte (regression check, unchanged behavior). All of `rtl_unit_test.sh`'s existing five
+testbenches plus this new one pass together (manual `xvlog`/`xelab`/`xsim` invocation via the
+flake's wrapped tool derivations — `nix develop -c <tool>` with `XILINX_ROOT` set — since
+`rtl_unit_test.sh` itself currently fails outside that path: see the environment note below).
+
+**Environment note, unrelated to the RTL work but blocked it initially:** on this machine,
+`vivado`/`xvlog`/`xelab`/`xsim` at their raw `~/opt/vitis/Vivado/2023.2/bin/*` paths (and
+therefore also `bazel test //applications/orbtrace/rtl:rtl_unit_test`, whose `sh_test`
+script invokes them via `$XILINX_VIVADO/bin/*` directly) currently fail with `/bin/bash: bad
+interpreter: No such file or directory` — this system has no `/bin/bash` (only `/bin/sh`,
+symlinked to nix bash). `flake.nix` already solves exactly this (see its
+`xilinxRuntimePkgs`/`mkXilinxTool`/`buildFHSEnv` comments: "Keep the command name stable
+inside a development shell... resolves the installation through XILINX_ROOT only when it is
+executed") — the FIX is to use the wrapped `vivado`/`xvlog`/`xelab`/`xsim` commands `nix
+develop` puts on PATH (or the `$VIVADO`/`$XVLOG`/etc. env vars its `shellHook` exports),
+with `XILINX_ROOT` (not `XILINX_VIVADO`) pointing at `~/opt/vitis`, instead of invoking the
+raw vendor binaries directly. This resolved the simulation blocker immediately once applied,
+and the real Vivado build below uses the same wrapped `vivado` successfully. Worth fixing
+`rtl_unit_test.sh` itself to use this path (or at minimum documenting it) so `bazel test`
+works without a manual workaround — not done this session, flagging for later.
+
+**Real hardware build launched** (`build.tcl`, strict/production gates, not a relaxed
+diagnostic build): `AVNET_BDF_ROOT=/home/v/projects/avnet_bdf`,
+`ARM_DESIGNSTART_IP_ROOT=/home/v/projects/arm_designstart_m3/vivado/Arm_ipi_repository`,
+`M3_OOC_EDIF` pointed at the cached `bazel-out/m3-ooc-2019/m3_core_2019.edf` (the hybrid
+fast-path), output dir `bazel-out/orbtrace-vivado-m3-sync-order-fix`, via the properly
+wrapped `nix develop -c vivado -mode batch -source applications/orbtrace/vivado/build.tcl`.
+Result and retest to follow once the build completes.
+
+**Result: BREAKTHROUGH — real, genuinely correct channel-1 CoreSight content decoded for
+the first time in this entire multi-day investigation. Phase E's core acceptance criterion
+is met.**
+
+**Build had to be retried twice before succeeding — a real, still-unexplained environment
+flakiness, unrelated to the RTL fix, worth documenting for future sessions.** Both of the
+first two attempts failed identically: real DRC error at `opt_design` ("Cell
+`zub_orbtrace_i/m3_core/inst` ... is considered a black box"), because `read_edif`'s netlist
+(read via the `STEPS.SYNTH_DESIGN.TCL.PRE` hook, exactly the same mechanism that built
+`orbtrace-vivado-m3-sync-fix` cleanly earlier the same day) never actually merged into the
+synth_1 checkpoint — confirmed by diffing the two attempts' `synth_1/runme.log` line-by-line
+against the successful build's own log: the working build shows `Parsing EDIF File`/
+`Finished Parsing EDIF File` during synth_design's "Translating synthesized netlist" step;
+neither failing attempt ever printed that line, despite using the literal identical EDIF
+file (`bazel-out/m3-ooc-2019/m3_core.edf` is a symlink to `m3_core_2019.edf` — byte-identical
+either way) and an identical, unmodified `build.tcl`. No Tcl error was ever reported for the
+`source m3_hybrid_pre_synth.tcl` call in either failing attempt (the driver script's own
+`catch {...}` block would have printed "sourcing script ... failed" if it had errored, and
+never did) — so `read_edif` itself apparently runs without error but its effect doesn't
+always get picked up by synth_design's automatic black-box resolution. A third attempt
+succeeded after adding `set_param general.maxThreads 1` (on the theory that multithreaded
+synth_design has a race around EDIF-based black-box resolution in this sandboxed
+environment) — **but this is very likely NOT actually why it worked**: `build.tcl` itself
+unconditionally calls `set_param general.maxThreads 4` immediately before `launch_runs
+synth_1` (a pre-existing line, memory-footprint-motivated per its own comment), which would
+have silently overridden the maxThreads=1 diagnostic addition before synthesis ever ran. The
+one-line diagnostic edit was reverted (`git checkout --`) before flashing; `build.tcl` is
+back to its committed state, unmodified. **Best current read: this is genuine, still
+unexplained flakiness in how Vivado 2023.2 merges a `read_edif`'d netlist into a black-box
+cell during project-mode `launch_runs synth_1` in this specific sandboxed (bubblewrap/
+buildFHSEnv) environment — succeeded 2 of 3 total M3-hybrid-EDIF builds today. Future
+sessions hitting this exact DRC error at `opt_design` (not a script bug, not a content
+problem) should just retry `launch_runs`/the whole build** — checking the failing attempt's
+own `zub_orbtrace.runs/synth_1/runme.log` for the presence/absence of a `Parsing EDIF File`
+line is the fast, decisive diagnostic (present = will succeed; absent = will hit the DRC
+error at impl, no need to wait for `opt_design` to confirm).
+
+**Flash + M3 load, real hardware:** `tooling/xsct/jtag_flash.sh` (full reset-based reflash,
+`PSINIT`/`BITSTREAM` pointed at the new build's own `psu_init.tcl`/`zub_orbtrace.bit`,
+`bazel-bin/applications/orbtrace/firmware/a53_app/a53_app` — the symlink, not `_elf` — as
+usual) succeeded cleanly; `orbtrace info` confirmed the board up. M3 firmware rebuilt
+(cache-hit, unchanged since the DWT-sync-fix commit-pending state — confirmed via
+`arm-none-eabi-objdump -d` that the flashed ELF's `m3_itm_init` disassembles as expected and
+`g_dwt_ctrl_at_boot`/`g_dwt_cyccnt_latest` symbols are present, i.e. the real firmware with
+the DWT fix, not a stale build) and loaded via `orbtrace load-m3` (D2, A53-native, readback
+verified). `configure m3 tpiu4 2000000` + `start` against the **real** firmware
+(`m3_itm_init(2)`, `emit_next()`, 10000-cycle busy-wait between STIM writes — not the marker
+firmware) —
+
+`orbtrace stats` genuinely and repeatably nonzero for the first time ever under this
+workload, and growing steadily over a sustained window (not a one-off blip):
+```
+rx_bytes=11   (immediately after start)
+rx_bytes=19   (~15s later)
+rx_bytes=22   (~35s later)
+rx_bytes=173  (after a further 75s capture)
+```
+`dropped_bytes`/`sync_loss` are still enormous (billions/tens of millions) — expected and
+correct: the M3's idle-pattern output still dominates the wire, and the demux is supposed to
+reject all of it. What matters is what gets *through*.
+
+**Decoded via the leftover `orbflow_decode.py` (COBS/orbflow unframe, from a previous
+session's scratchpad): every single byte that got through is genuine, checksummed, real
+CoreSight content, exclusively on channel 1.** Two separate captures (47 bytes/16 frames,
+then a fresh 84 bytes/26 frames), zero bad-checksum frames in either, and — the qualitative
+break from every prior "success" in this investigation — **`channels seen: [1]` in both
+runs, no other channel present at all.** Every previous nonzero-`rx_bytes` result in this
+investigation (the 2026-08-18 5.2M-byte capture, the isolated manual `FFFFFF7F` sightings)
+was dominated by garbage on bogus channels (63, 127, 49, 31, 40, 48, 62, 78, 114...) with at
+most a handful of incidental real bytes; this time there is no garbage at all, only real
+channel-1 frames. The decoded payload bytes themselves are structurally plausible ITM
+Software Trace Packet content too (e.g. `0a71f1`, `0a93d5`, `2a3ffd`, `2afdbb` — a header
+byte with the low bits set to a SWIT size code, port-number bits consistent with stimulus
+port 0, followed by 2-3 real data bytes), not random noise.
+
+**What this means for the byte-order theory:** the original concern (documented earlier
+this session) that the byte-order fix alone wouldn't eliminate the idle-pattern aliasing
+problem was correct — `sync_loss`/`dropped_bytes` are still huge, meaning the demux is still
+frequently false-locking on the idle alias and getting rejected by the plausibility gate,
+exactly as before. But the fix's actual purpose — ensuring that when a *genuine* sync event
+occurs, frame decode starts at the *correct* byte alignment — is now empirically confirmed:
+real content is getting through, correctly framed, on the correct channel, for the first
+time ever. The combination of (a) the byte-order fix (correct alignment on genuine locks)
+and (b) the 2026-08-18 channel-plausibility gate (reject everything that isn't alignment (a)
+lets through cleanly) together are what made this work — neither alone was sufficient,
+matching this session's own earlier prediction.
+
+**Status: Phase E is now substantively DONE.** `rx_bytes > 0` with clean, channel-1-only,
+checksum-valid content, sustained and repeatable — the acceptance bar this document set at
+the top has been met. Not yet done, for a future session: a full byte-for-byte diff of a
+longer capture against `emit_next()`'s real, deterministic `Workload` reference sequence
+(this is Phase F, not Phase E — `verify_captured.py` in the scratchpad already has the
+reference-model comparison logic half-written from a previous session, reusable), and a
+throughput/reliability characterization (how much of the real content is lost to the
+still-high false-lock rate vs. genuinely captured) — but the fundamental "can this pipeline
+ever produce real, trustworthy trace data" question this whole investigation was chasing is
+now answered yes, with real evidence.
+
+**Attempted Phase F verification (informational, not blocking):** tried the leftover
+`verify_captured.py`'s contiguous-run match against the `Workload(seed=7)` reference over
+the 84-byte second capture — no contiguous match found. This is expected, not a red flag:
+the M3 had already been running `emit_next()` continuously since boot (the reference model
+starts counting from `sequence=1`, but the real capture is a snippet from deep into a
+long-running sequence with an unknown offset), and — per the already-established
+STIM-write-timing sensitivity — only a sparse, non-contiguous subset of `emit_next()`'s calls
+ever have their real content survive to the wire at all, so a contiguous-subsequence match
+against the reference isn't the right verification strategy for this data shape. A real
+Phase F pass would need either a much longer capture window (to accumulate more matchable
+material) or a sparse/subsequence-tolerant comparison, not the raw script as originally
+written for the marker-firmware's tight loop. Left for a future session, as already scoped.
+
+**Housekeeping:** `orbtrace_tpiu_demux.sv`'s byte-order fix (`32'h7fffffff`) and the new
+`orbtrace_tpiu_demux_tb.sv` testbench remain uncommitted in the working tree alongside the
+2026-08-18 channel-plausibility gate — both are real, verified, working fixes, not yet
+committed. `applications/orbtrace/vivado/build.tcl` is back to its exact committed state
+(the `maxThreads 1` diagnostic was reverted). The board is running the new
+`orbtrace-vivado-m3-sync-order-fix` bitstream with the real (non-marker) M3 firmware loaded;
+the capture session was stopped (`orbtrace stop`) at the end of this session, board confirmed
+still responsive (`orbtrace info` → `ZUBoard-Orbtrace/1`) afterward.
+
+### Next steps for a future session
+
+1. **Phase F** — a proper content-correctness pass: a longer capture (minutes, not seconds)
+   against the real firmware, then a sparse/subsequence-tolerant comparison against the
+   `Workload` reference (not the raw contiguous-run matcher tried above), to confirm the
+   *values*, not just the framing/channel, are genuinely correct.
+2. Consider whether the still-enormous `sync_loss`/`dropped_bytes` rate is worth reducing
+   (e.g. revisiting the idle-transition-anchored resync idea from earlier this session, now
+   as a throughput optimization rather than a correctness fix) — not required for
+   correctness, since the plausibility gate already keeps false locks from corrupting output,
+   but a very high false-lock rate does mean most real content is likely still being missed
+   between successful locks.
+3. **Phase G** — the real JTAG debug path (`ORBTRACE_REG_M3_CONTROL`, halt/read PC/
+   single-step/resume) is still unblocked and not started; the plan's original scope isn't
+   complete until this is verified too.
+4. Commit the two real RTL fixes (channel-plausibility gate + sync byte-order) and the new
+   `orbtrace_tpiu_demux_tb.sv` testbench once reviewed — both are working, verified changes
+   sitting uncommitted in the working tree.
