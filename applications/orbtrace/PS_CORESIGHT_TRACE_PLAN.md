@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | NOT STARTED |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-19 — real capture attempted, zero bytes; root-caused to likely-wrong CoreSight funnel/TPIU addresses, not yet fixed.** See section 12 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -353,27 +353,131 @@ document; nothing left uncommitted. Hardware state: board left running the
 just-reflashed A53 Orbtrace service (confirmed responsive via
 `orbtrace info`), same production bitstream as every other recent session.
 
+## 12. Phase 6 — first real capture attempt (2026-08-19)
+
+**Resolved the section 11 open question first, and it changed the
+workflow for the better:** the A53-network-killing effect from sections
+10/11 is specifically caused by `psu_init_run.tcl`'s *full* Vitis
+`psu_init` re-run, not by an R5 JTAG session in general. Confirmed on
+real hardware: `openocd -f tooling/openocd/aes_zub.cfg -f
+tooling/openocd/load_r5.tcl` (booting `orbtrace_workload` on R5-0,
+*omitting* `psu_init_run.tcl` entirely — `load_r5.tcl` already has its
+own fallback R5-clock-enable path for exactly this case) left the A53
+Orbtrace service's network fully responsive throughout and after. **R5
+JTAG work and a live A53 network session are NOT mutually exclusive after
+all — only `psu_init_run.tcl` specifically is the thing to avoid
+alongside a live A53.** One real, minor side effect: R5-0 and the A53
+share the same physical UART0/`/dev/ttyUSB1` console (`load_r5.tcl`'s own
+`setup_uart` reprograms UART0 registers directly), so running both
+concurrently interleaves/occasionally garbles printed diagnostic text on
+that shared serial line — cosmetic only, not a functional problem, not
+worth fixing for a bring-up workload.
+
+**Implemented the ETM-enable step `coresight::select()` was always
+missing:** `firmware/a53/src/lib.rs`'s `coresight` module gained
+`enable_trace()`, alongside a full ETMv4 register-offset map
+(`TRCPRGCTLR`, `TRCCONFIGR`, `TRCSYNCPR`, `TRCTRACEIDR`, `TRCVICTLR`,
+`TRCOSLAR`, etc.) and a minimal "trace everything unconditionally, no
+branch broadcast/cycle-count/data-trace/address-filtering" configuration,
+with a distinct nonzero trace ID per target (R5-0 = `0x10`, A53-1 =
+`0x20`). **Explicitly best-effort**: these offsets/values are recalled
+from public ETMv4 reference material (the shape Linux's coresight-etm4x
+driver programs), not cross-checked against a local copy of the real
+Cortex-R5/A53 TRM — `internal/reference_docs/` intentionally doesn't
+carry those PDFs in this repo/sandbox. Wired into `RegisterIo` (new
+`enable_coresight_trace` method, same default-no-op pattern as
+`select_coresight_source`) and called right after `select_coresight_source`
+in the `Configure` opcode-2 handler. Two new host unit tests
+(`enable_trace_starts_the_selected_etm_with_a_unique_trace_id`, and the
+existing `configure_*` tests extended to check call *ordering* via a new
+`CoresightCall` enum). Verified: host tests pass, real aarch64 cross-build
+succeeds.
+
+**Real hardware capture attempt, real result: zero bytes, but a genuine,
+specific root cause found — not "trace doesn't work."** Sequence: reflashed
+A53 with the new firmware; booted R5-0 with `orbtrace_workload` via the
+now-known-safe JTAG-only flow above; ran `orbtrace configure 192.168.1.50
+r5 tpiu4 2000000` (real TCP, reaches the new `enable_trace()` code) then
+`orbtrace start` then `orbtrace capture ... ` for several seconds.
+**Result: 0 bytes captured.** `orbtrace stats` showed `rx_bytes=0
+dropped_bytes=0 fifo_high_water=0` but `sync_loss` climbing into the
+hundreds of millions — the demux/FIFO pipeline is running (searching for
+sync continuously) but never sees any real toggling data at all on
+`coresight_data`, a materially different signature from M3's earlier
+"real data but can't sync" symptom.
+
+**Root-caused via direct JTAG readback** (all these CoreSight system
+addresses are AXI-visible from the PS, confirmed already in section 2 —
+no new tooling needed, just ad hoc `openocd` + `read_memory`/`mww`, same
+technique this project has used throughout):
+- **R5-0's ETM registers are real and correctly programmable.** Read back
+  exactly what firmware wrote: `TRCPRGCTLR=0x1`, `TRCCONFIGR=0x0`,
+  `TRCSYNCPR=0x8`, `TRCTRACEIDR=0x10`, `TRCVICTLR=0x1`. This is strong,
+  direct evidence `R5_0_ETM = 0xfe3f_c000` (from Phase 1's original
+  analysis) is correct and that `enable_trace()`'s offsets are at least
+  self-consistent with a real, responsive register block at that address.
+- **`FUNNEL_RPU` (`0xfe11_0000`, from the same Phase 1 analysis) does
+  not behave like a real CoreSight component at all.** A raw JTAG write of
+  `1` to its control register (offset `0x000`), after unlocking its LAR,
+  read back `0` both immediately and 500ms later — the write never stuck.
+  Worse: its Peripheral/Component ID registers (offsets `0xfcc`-`0xfec`,
+  which are hardwired ROM values on any *real* CoreSight component,
+  architecturally never all-zero) read back `0x00000000` across the board.
+  `A53_1_ETM` (`0xfe54_0000`) was worse still — reading its own ID
+  registers hit a hard `JTAG-DP STICKY ERROR`, not just silent zeros.
+  **This means `coresight::select()`'s funnel-routing writes have likely
+  been going to wrong/unmapped addresses since Phase 1 — a real,
+  previously-uncaught bug in the addresses that analysis phase cited from
+  "UG1085 Figure 39-8"** (not independently verified against the real TRM
+  at the time, since it wasn't available in this sandbox then either).
+  This directly explains the zero-byte capture: even with the ETM itself
+  correctly configured and enabled, its output has nowhere real to go.
+- Checked whether the licensed Xilinx toolchain (`~/opt/vitis`) had any
+  authoritative header/XML with these addresses (a real, cheap thing to
+  try before concluding "no source available") — it doesn't; the bundled
+  SDK data is legacy Zynq-7000-era (2019.1), no ZynqMP-specific CoreSight
+  system map present.
+- Stopped probing further blind physical addresses at this point —
+  diminishing returns, and one probe already tripped a JTAG-DP STICKYERR
+  (harmless, self-recovering via `clear_stickyerr`, confirmed A53's TCP
+  session was unaffected afterward, but a real signal to stop guessing).
+
+**Session end state:** all code changes committed. Board left with A53
+Orbtrace service confirmed responsive (`orbtrace info`); R5-0 left
+running `orbtrace_workload` (harmless, JTAG-only boot, no `psu_init`
+side effects). No destructive hardware state left behind.
+
 ## Next steps for a future session
 
-1. **Cheapest, do first:** Phase 6 (first real ETM capture). This needs
-   two things `coresight::select()` doesn't do yet: (a) actually
-   programming the R5-0 ETM's own trace-enable/config registers (not just
-   unlocking components and wiring funnels — see section 11's "Not yet
-   done"), and (b) a capture attempt against `applications/rpu/
-   orbtrace_workload` mirroring `M3_TRACE_VERIFICATION_PLAN.md`'s Phase
-   E/F methodology (get a real capture first, verify content against the
-   known-reproducible `Workload` sequence before trusting anything
-   downstream). Remember section 10's psu_init/A53-network gotcha — an
-   R5 JTAG session and a live A53 Orbtrace capture can't coexist, so
-   deciding the capture-side workflow (does verifying an R5 capture need
-   JTAG at the same time as the A53's TCP trace stream, or can they be
-   sequenced?) is itself part of this phase's scoping.
-2. Before investing further in Phase 6-8's ambition level, it's worth
+1. **Cheapest, do first:** get the *real* UG1085 CoreSight system map
+   (Figure 39-8) — via the actual PDF (see `internal/reference_docs/README.md`
+   for where to obtain it; not present in this sandbox) or, if that's not
+   available, an architecturally-correct alternative that needs no
+   documentation: walk the CoreSight ROM table. ARM CoreSight designs
+   expose a top-level ROM table whose entries self-describe each real
+   component's actual base address — if a top-level ROM table base for
+   this SoC's LPD/FPD debug region can be found (even by scanning a
+   plausible range for the CoreSight/PrimeCell ID signature, `0xB105_100D`
+   read from a component's `CIDR`/`PIDR` registers), that's a
+   documentation-independent way to get real, correct funnel/TPIU
+   addresses instead of continuing to guess. Once corrected, redo section
+   12's exact capture attempt (`configure r5 tpiu4 ...` → `start` →
+   `capture`) — the ETM-enable code itself is already real, tested, and
+   confirmed working at the register level; only the funnel/TPIU routing
+   addresses need fixing.
+2. Once bytes start flowing, mirror `M3_TRACE_VERIFICATION_PLAN.md`'s
+   Phase E/F methodology exactly: confirm real content recovery against
+   `applications/orbtrace/firmware/rpu`'s known-reproducible `Workload`
+   sequence before trusting anything downstream (this project has been
+   burned before by declaring victory on `rx_bytes > 0` alone — see that
+   document's own Phase E cautionary history).
+3. Before investing further in Phase 6-8's ambition level, it's worth
    doing the real UG1085/Cortex-A53 TRM check flagged in section 3, point
    5 — if this silicon's ETM genuinely has address/data comparators or an
    ETR path, that changes how ambitious those phases are worth being from
-   the start.
-3. Everything from Phase 6 onward is new engineering, not just wiring —
+   the start. (This can likely be combined with item 1's TRM lookup, if
+   that document becomes available.)
+4. Everything from Phase 6 onward is new engineering, not just wiring —
    size it accordingly before starting, the same way
    `M3_TRACE_VERIFICATION_PLAN.md` Phase H sized the ETM-on-M3 path
    before recommending against starting it without a clear bandwidth case.

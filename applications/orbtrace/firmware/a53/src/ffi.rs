@@ -87,6 +87,12 @@ impl RegisterIo for Mmio {
         // SAFETY: see `CoresightMmio::write32`.
         unsafe { coresight::select(&mut mmio, a53_1) };
     }
+
+    fn enable_coresight_trace(&mut self, a53_1: bool) {
+        let mut mmio = CoresightMmio;
+        // SAFETY: see `CoresightMmio::write32`.
+        unsafe { coresight::enable_trace(&mut mmio, a53_1) };
+    }
 }
 
 impl DmaRegisterIo for Mmio {

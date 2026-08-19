@@ -69,6 +69,12 @@ pub trait RegisterIo {
     /// physical address range; existing register-level test mocks don't need
     /// to exercise this path unless they opt in.
     fn select_coresight_source(&mut self, _a53_1: bool) {}
+
+    /// Actually start the selected PS-side ETM tracing (PS_CORESIGHT_TRACE_PLAN.md
+    /// Phase 6) -- must be called after `select_coresight_source` has routed
+    /// this target through the funnels. Default no-op, same rationale as
+    /// `select_coresight_source`.
+    fn enable_coresight_trace(&mut self, _a53_1: bool) {}
 }
 
 pub struct Controller<IO> {
@@ -239,8 +245,14 @@ impl<IO: RegisterIo> Controller<IO> {
                 // the PL's own source_select below picks up coresight_data --
                 // PS_CORESIGHT_TRACE_PLAN.md Phase 2.
                 match request[3] {
-                    1 => self.io.select_coresight_source(false),
-                    2 => self.io.select_coresight_source(true),
+                    1 => {
+                        self.io.select_coresight_source(false);
+                        self.io.enable_coresight_trace(false);
+                    }
+                    2 => {
+                        self.io.select_coresight_source(true);
+                        self.io.enable_coresight_trace(true);
+                    }
                     _ => {}
                 }
                 let baud = u32::from_le_bytes([request[5], request[6], request[7], request[8]]);
@@ -660,10 +672,17 @@ mod tests {
         assert_eq!(controller.command(&request, &mut response), Err(()));
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CoresightCall {
+        Select(bool),
+        Enable(bool),
+    }
+
     #[derive(Default)]
     struct CoresightSelectIo {
         reg_writes: Vec<(usize, u32)>,
         selects: Vec<bool>,
+        calls: Vec<CoresightCall>,
     }
     impl RegisterIo for CoresightSelectIo {
         fn read(&self, _offset: usize) -> u32 {
@@ -674,6 +693,10 @@ mod tests {
         }
         fn select_coresight_source(&mut self, a53_1: bool) {
             self.selects.push(a53_1);
+            self.calls.push(CoresightCall::Select(a53_1));
+        }
+        fn enable_coresight_trace(&mut self, a53_1: bool) {
+            self.calls.push(CoresightCall::Enable(a53_1));
         }
     }
 
@@ -686,6 +709,13 @@ mod tests {
         assert_eq!(controller.command(&request, &mut response), Ok(1));
         assert_eq!(controller.io.selects, [false]);
         assert_eq!(controller.io.reg_writes[0], (REG_SOURCE_FORMAT, 1));
+        // select must happen before enable, which must happen before the PL's
+        // own source_select write, so a real core is already routed and
+        // tracing by the time the PL starts consuming coresight_data.
+        assert_eq!(
+            controller.io.calls,
+            [CoresightCall::Select(false), CoresightCall::Enable(false)]
+        );
     }
 
     #[test]
@@ -697,6 +727,10 @@ mod tests {
         assert_eq!(controller.command(&request, &mut response), Ok(1));
         assert_eq!(controller.io.selects, [true]);
         assert_eq!(controller.io.reg_writes[0], (REG_SOURCE_FORMAT, 2));
+        assert_eq!(
+            controller.io.calls,
+            [CoresightCall::Select(true), CoresightCall::Enable(true)]
+        );
     }
 
     #[test]
@@ -707,6 +741,7 @@ mod tests {
         let request = [1, 0, 2, 0, 0, 0, 0, 0, 0];
         assert_eq!(controller.command(&request, &mut response), Ok(1));
         assert!(controller.io.selects.is_empty());
+        assert!(controller.io.calls.is_empty());
     }
 
     #[test]
@@ -840,6 +875,60 @@ mod tests {
             (coresight::FUNNEL_SYSTEM + coresight::FUNNEL_CONTROL, 2)
         );
     }
+
+    #[test]
+    fn enable_trace_starts_the_selected_etm_with_a_unique_trace_id() {
+        let mut r5 = CoreSightWrites(Vec::new());
+        // SAFETY: this test records accesses without touching MMIO.
+        unsafe {
+            coresight::enable_trace(&mut r5, false);
+        }
+        assert_eq!(r5.0[0], (coresight::R5_0_ETM + coresight::TRCOSLAR, 0));
+        assert_eq!(
+            *r5.0
+                .iter()
+                .find(|(addr, _)| *addr == coresight::R5_0_ETM + coresight::TRCTRACEIDR)
+                .unwrap(),
+            (
+                coresight::R5_0_ETM + coresight::TRCTRACEIDR,
+                coresight::TRACE_ID_R5_0
+            )
+        );
+        // TRCPRGCTLR is written twice: once to force-disable before
+        // reconfiguring, once at the very end to actually enable tracing.
+        let prgctlr: Vec<u32> =
+            r5.0.iter()
+                .filter(|(addr, _)| *addr == coresight::R5_0_ETM + coresight::TRCPRGCTLR)
+                .map(|(_, v)| *v)
+                .collect();
+        assert_eq!(prgctlr, [0, coresight::PRGCTLR_EN]);
+        assert_eq!(
+            r5.0.last(),
+            Some(&(
+                coresight::R5_0_ETM + coresight::TRCPRGCTLR,
+                coresight::PRGCTLR_EN
+            ))
+        );
+
+        let mut a53 = CoreSightWrites(Vec::new());
+        // SAFETY: this test records accesses without touching MMIO.
+        unsafe {
+            coresight::enable_trace(&mut a53, true);
+        }
+        assert_eq!(
+            *a53.0
+                .iter()
+                .find(|(addr, _)| *addr == coresight::A53_1_ETM + coresight::TRCTRACEIDR)
+                .unwrap(),
+            (
+                coresight::A53_1_ETM + coresight::TRCTRACEIDR,
+                coresight::TRACE_ID_A53_1
+            )
+        );
+        // R5-0 and A53-1 must never share a trace ID -- otherwise a decoder
+        // can't tell their packets apart on the shared TPIU/formatter output.
+        assert_ne!(coresight::TRACE_ID_R5_0, coresight::TRACE_ID_A53_1);
+    }
 }
 
 pub mod coresight {
@@ -873,6 +962,84 @@ pub mod coresight {
             mmio.write32(FUNNEL_RPU + FUNNEL_CONTROL, if a53_1 { 0 } else { 1 });
             mmio.write32(FUNNEL_APU + FUNNEL_CONTROL, if a53_1 { 2 } else { 0 });
             mmio.write32(FUNNEL_SYSTEM + FUNNEL_CONTROL, if a53_1 { 2 } else { 1 });
+        }
+    }
+
+    // ETMv4 trace-unit register offsets (Arm ETM Architecture Specification,
+    // IHI 0064). PS_CORESIGHT_TRACE_PLAN.md Phase 6: `select()` above only
+    // unlocks components and wires funnels -- it never told the ETM itself
+    // to actually trace anything. These offsets are recalled from public
+    // ETMv4 reference material (the shape Linux's coresight-etm4x driver
+    // programs), not yet cross-checked against a local copy of the real
+    // Cortex-R5/A53 TRM in this sandbox (see internal/reference_docs/README.md
+    // -- those PDFs aren't available here). Treat as best-effort; confirm via
+    // real hardware readback (TRCPRGCTLR/TRCSTATR at minimum) before trusting.
+    pub const TRCPRGCTLR: usize = 0x000;
+    pub const TRCSTATR: usize = 0x008;
+    pub const TRCCONFIGR: usize = 0x00c;
+    pub const TRCEVENTCTL0R: usize = 0x018;
+    pub const TRCEVENTCTL1R: usize = 0x01c;
+    pub const TRCSTALLCTLR: usize = 0x020;
+    pub const TRCTSCTLR: usize = 0x024;
+    pub const TRCSYNCPR: usize = 0x028;
+    pub const TRCCCCTLR: usize = 0x02c;
+    pub const TRCBBCTLR: usize = 0x030;
+    pub const TRCTRACEIDR: usize = 0x034;
+    pub const TRCVICTLR: usize = 0x040;
+    pub const TRCVIIECTLR: usize = 0x044;
+    pub const TRCVISSCTLR: usize = 0x048;
+    pub const TRCVIPCSSCTLR: usize = 0x04c;
+    pub const TRCOSLAR: usize = 0x300;
+
+    pub const PRGCTLR_EN: u32 = 1 << 0;
+    /// "Trace unconditionally, no address filtering" idiom: ViewInst's
+    /// start/stop-controlling event (bits[7:0]) selects the architecturally
+    /// fixed always-true resource selector 0, with no include/exclude
+    /// address ranges configured below. Matches the value Linux's
+    /// coresight-etm4x driver programs as its own default (`vinst_ctrl =
+    /// BIT(0)` in `etm4_set_default_config`).
+    pub const VICTLR_ALWAYS_TRACE: u32 = 1 << 0;
+    /// Nonzero, unique-per-target CoreSight trace ID (TRCTRACEIDR bits[6:0])
+    /// -- required so the TPIU/formatter's ID byte identifies which source a
+    /// packet came from. 0x00 is invalid (means "no source") and 0x7f is
+    /// architecturally reserved.
+    pub const TRACE_ID_R5_0: u32 = 0x10;
+    pub const TRACE_ID_A53_1: u32 = 0x20;
+    /// Sync-packet period: 2^(SYNCPR+1) bytes between ETM sync packets
+    /// (`TRCSYNCPR` encodes the exponent). 0x8 -> every 512 bytes -- frequent
+    /// enough to make a first decode attempt tractable, not tuned for
+    /// production bandwidth.
+    pub const SYNCPR_512_BYTES: u32 = 0x8;
+
+    /// Actually starts the selected ETM tracing, after `select()` has
+    /// unlocked/routed it. Deliberately minimal: no branch broadcast, no
+    /// cycle counting, no data tracing, no address-range filtering -- trace
+    /// every instruction unconditionally. See this module's own doc comment
+    /// above for the real caveat: offsets/values here are best-effort,
+    /// unverified against the local TRM.
+    pub unsafe fn enable_trace<M: Mmio>(mmio: &mut M, a53_1: bool) {
+        let etm = if a53_1 { A53_1_ETM } else { R5_0_ETM };
+        let trace_id = if a53_1 { TRACE_ID_A53_1 } else { TRACE_ID_R5_0 };
+        // SAFETY: caller guarantees the fixed CoreSight range is mapped
+        // device-nGnRE, and that `select()` has already unlocked this ETM's
+        // software lock (LAR).
+        unsafe {
+            mmio.write32(etm + TRCOSLAR, 0); // unlock the OS lock (distinct from LAR)
+            mmio.write32(etm + TRCPRGCTLR, 0); // ensure disabled before reconfiguring
+            mmio.write32(etm + TRCCONFIGR, 0);
+            mmio.write32(etm + TRCEVENTCTL0R, 0);
+            mmio.write32(etm + TRCEVENTCTL1R, 0);
+            mmio.write32(etm + TRCSTALLCTLR, 0);
+            mmio.write32(etm + TRCTSCTLR, 0);
+            mmio.write32(etm + TRCSYNCPR, SYNCPR_512_BYTES);
+            mmio.write32(etm + TRCCCCTLR, 0);
+            mmio.write32(etm + TRCBBCTLR, 0);
+            mmio.write32(etm + TRCTRACEIDR, trace_id);
+            mmio.write32(etm + TRCVIIECTLR, 0); // no address-range filtering
+            mmio.write32(etm + TRCVISSCTLR, 0); // no start/stop address comparators
+            mmio.write32(etm + TRCVIPCSSCTLR, 0); // no start/stop PE comparators
+            mmio.write32(etm + TRCVICTLR, VICTLR_ALWAYS_TRACE);
+            mmio.write32(etm + TRCPRGCTLR, PRGCTLR_EN); // start tracing
         }
     }
 }
