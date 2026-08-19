@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-19 — 3 real bugs found+fixed (2 addr/offset, 1 wrong psu_init.tcl); real bytes now reach the PL FIFO for the first time (fifo_high_water=63); TPIU sync-packet emission still blocks `rx_bytes`.** See section 14 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-19 — 3 real bugs found+fixed (2 addr/offset, 1 wrong psu_init.tcl); real bytes reach the PL FIFO but `rx_bytes` stays 0; `TRCAUXCTLR.SYNCDELAY` fix applied, not (yet confirmed) sufficient; ad hoc JTAG readback verification has hit real reliability limits.** See section 15 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -701,39 +701,109 @@ current `a53_app`; R5-0 running `orbtrace_workload`; `orbtrace info`
 confirmed responsive. **This flash-time choice does not survive a future
 `jtag_flash.sh` call that reverts to the generic board-level
 `psu_init.tcl`** — a future session must deliberately keep using the
-Orbtrace-specific one (see next steps item 1) or this exact regression
+Orbtrace-specific one (see next steps below) or this exact regression
 will silently reappear.
+
+## 15. Phase 6 continued — `TRCAUXCTLR.SYNCDELAY` fix applied, JTAG readback hits real reliability limits (2026-08-19, same day)
+
+With section 14's `psu_init.tcl` fix landing real bytes in the PL FIFO
+(`fifo_high_water=63`, pegged at max) but `rx_bytes` staying `0`, the
+question became: why does `orbtrace_tpiu_demux.sv` never find a Full Sync
+Packet in a byte stream that's evidently real and flowing?
+
+**Found a genuinely strong, TRM-confirmed candidate: `TRCAUXCTLR` bit[3]
+`SYNCDELAY`.** DDI0500J Table 13-8: "Delay periodic synchronization if
+FIFO is more than half-full... `0` = SYNC packets are inserted into FIFO
+only when trace activity is LOW... `1` = SYNC packets are inserted into
+FIFO irrespective of trace activity." This project's own deterministic
+workloads (`applications/orbtrace/firmware/rpu`'s `Workload`, and
+`m3_app`'s equivalent) are designed to run continuously, essentially never
+idling at the timescale this bit cares about — under the default
+(`SYNCDELAY=0`), the ETM's `TRCSYNCPR`-driven periodic sync packet (the
+exact byte-level construct `orbtrace_tpiu_demux.sv` searches for) could be
+deferred forever, which would exactly explain "real trace bytes flowing,
+FIFO backed up, never a sync lock."
+
+**Implemented in firmware, not just tried ad hoc:** added
+`coresight::AUXCTLR_SYNCDELAY = 1 << 3` and wired it into `enable_trace()`
+(`mmio.write32(etm + TRCAUXCTLR, AUXCTLR_SYNCDELAY)`, in the existing
+disable→configure→enable sequence — `TRCAUXCTLR`, like `TRCCONFIGR`, "only
+accepts writes when the trace unit is disabled" per DDI0500J, and
+`enable_trace()` already writes `TRCPRGCTLR=0` before any static config
+and `TRCPRGCTLR=EN` last, so the ordering is correct by construction).
+Extended the existing `enable_trace_starts_the_selected_etm_with_a_unique_trace_id`
+host test to assert this write. Host tests pass, real aarch64 cross-build
+succeeds. Reflashed A53 (using the Orbtrace-specific `psu_init.tcl` from
+section 14, not the generic one) and re-ran R5-0's boot + `configure`/
+`start`/`capture` sequence.
+
+**Result: still `fifo_high_water=63`, `rx_bytes=0`.** Not conclusively
+disproven, though — see the reliability caveat below.
+
+**A real methodological problem surfaced while trying to verify this via
+JTAG readback, worth recording so a future session doesn't repeat the
+mistake:** `TRCSTATR` bit[1] `PMSTABLE` ("indicates whether the ETM trace
+unit registers are stable and can be read... 0 = The programmers model is
+not stable") reads `0` throughout active tracing (`TRCSTATR=0x0`,
+`IDLE=0` too — genuinely tracing). This means **every JTAG readback of
+`TRCCONFIGR`/`TRCAUXCTLR`/`TRCVICTLR`/`TRCTRACEIDR`/`TRCPRGCTLR` taken
+while the ETM is actively running is architecturally unreliable** — this
+session's own attempt to verify the `SYNCDELAY` write via a live re-read
+got back `TRCAUXCTLR=0x00800000` (not the `0x8` firmware wrote) and
+`TRCPRGCTLR=0x8d014024` (the exact same value seen in an *earlier*,
+unrelated readback in section 14 — too consistent to be live noise, more
+likely some other JTAG/APB artifact not yet understood). Notably, section
+13/14's own "confirmed via readback" claims for `TRCTRACEIDR`/`TRCVICTLR`
+earlier in this document were ALSO taken while actively tracing and got
+clean-looking values that time — the inconsistency between "clean
+readback" and "garbage readback" across sessions is itself unexplained.
+**Net effect: JTAG readback can no longer be trusted as a verification
+tool for ETM static config while tracing is active — a real limitation of
+this session's own methodology, not a new hardware finding.** The
+firmware-level fix should be trusted based on correct write ordering
+(host-tested) rather than a post-hoc external read.
+
+**Session end state:** `AUXCTLR_SYNCDELAY` change committed (real,
+TRM-justified, worth keeping regardless of whether it alone is
+sufficient). Board left flashed with this firmware + the Orbtrace-specific
+`psu_init.tcl`; R5-0 running `orbtrace_workload`; `orbtrace info`
+confirmed responsive.
 
 ## Next steps for a future session
 
-1. **Cheapest, do first, and don't lose this fix:** update the *documented*
-   Orbtrace hardware workflow (`AGENTS.md`'s "Flash over JTAG" section, and
-   any session muscle-memory) to use the Orbtrace-specific `psu_init.tcl`
-   (`bazel-out/<build>/psu_init.tcl`, sitting next to `zub_orbtrace.bit` in
-   the same Vivado build output — already exported by `build.tcl`, no new
-   tooling needed) instead of `sdk/boards/zub_1cg/generated/psu_init.tcl`,
-   for *any* Orbtrace hardware session, not just R5/A53 CoreSight work —
-   this affects the trace-clock path for the M3 path too, potentially
-   relevant to revisiting `M3_TRACE_VERIFICATION_PLAN.md`'s own
-   still-unresolved Parallel-mode findings. `[[hardware_test_environment]]`
-   and `[[board_bitstream_state]]` are updated with this finding — read
-   those before the next hardware session so this isn't silently lost
-   again.
-2. Get the real **Arm CoreSight SoC-400 Technical Reference Manual**
+1. **Cheapest, do first, and don't lose the section 14 fix:** update the
+   *documented* Orbtrace hardware workflow (`AGENTS.md`'s "Flash over
+   JTAG" section — already updated this session, but re-verify a future
+   session actually follows it) to use the Orbtrace-specific
+   `psu_init.tcl` (`bazel-out/<build>/psu_init.tcl`, next to
+   `zub_orbtrace.bit`) instead of `sdk/boards/zub_1cg/generated/psu_init.tcl`
+   for *any* Orbtrace hardware session — this affects the M3 trace-clock
+   path too, potentially relevant to revisiting
+   `M3_TRACE_VERIFICATION_PLAN.md`'s own still-unresolved Parallel-mode
+   findings. `[[hardware_test_environment]]` and `[[board_bitstream_state]]`
+   are updated with this finding.
+2. **Given JTAG readback's now-demonstrated unreliability for this
+   specific question (section 15), a real PL-side ILA capture on
+   `coresight_data` at the `orbtrace_pl`/`orbtrace_tpiu_demux` boundary is
+   now the more trustworthy next step** — the same proven methodology
+   `M3_TRACE_VERIFICATION_PLAN.md` used repeatedly, and one that doesn't
+   depend on architecturally-unstable APB reads. With real bytes confirmed
+   reaching the FIFO (section 14), this would show their actual byte
+   pattern directly: does a genuine `0xFFFFFF7F` Full Sync Packet ever
+   appear (settling whether `SYNCDELAY` alone was sufficient, insufficient,
+   or irrelevant), or is the content some other framing entirely (e.g. a
+   capture-phase/bit-ordering issue specific to this never-before-exercised
+   PS-path `orbtrace_ddr_capture` instance, distinct from the M3 path's own
+   instance). Real cost: ~20-90 min Vivado build (faster with a cached
+   EDIF, though none was found for this exact build during this session's
+   feasibility check) — size accordingly before starting, per this
+   document's own recurring guidance.
+3. Get the real **Arm CoreSight SoC-400 Technical Reference Manual**
    (UG1085's own Ref 39 citation for Funnel/TPIU/DAP/Timestamp/CTI) — not
    currently in the private reference-document archive; check there first
-   (same place UG1085/DDI0500J were found this session) before searching
-   further afield. This is now specifically targeted at one question: what
-   (beyond `FFCR.EnFCont`) makes the system TPIU emit a genuine Full Sync
-   Packet.
-3. If that document remains unavailable, the fallback is a real PL-side
-   ILA capture on `coresight_data` at the `orbtrace_pl`/
-   `orbtrace_tpiu_demux` boundary — the same proven methodology
-   `M3_TRACE_VERIFICATION_PLAN.md` used repeatedly. With real bytes now
-   confirmed reaching the FIFO, this would show their actual byte pattern
-   directly, which might make the missing-sync-trigger question moot (or
-   reveal it's something else entirely) without needing the SoC-400 TRM at
-   all.
+   before searching further afield. Still useful even if the ILA capture
+   (item 2) runs first, e.g. to explain WHY a needed mechanism works once
+   the ILA shows WHAT'S happening.
 4. Once `rx_bytes` moves, mirror `M3_TRACE_VERIFICATION_PLAN.md`'s Phase
    E/F methodology exactly: confirm real content recovery against
    `applications/orbtrace/firmware/rpu`'s known-reproducible `Workload`
@@ -744,8 +814,7 @@ will silently reappear.
    doing the real UG1085/Cortex-A53 TRM check flagged in section 3, point
    5 — if this silicon's ETM genuinely has address/data comparators or an
    ETR path, that changes how ambitious those phases are worth being from
-   the start. (Easy to combine with item 2 — both documents are findable
-   via the same private archive this session used.)
+   the start.
 6. Everything from Phase 6 onward is new engineering, not just wiring —
    size it accordingly before starting, the same way
    `M3_TRACE_VERIFICATION_PLAN.md` Phase H sized the ETM-on-M3 path

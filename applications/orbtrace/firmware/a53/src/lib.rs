@@ -887,6 +887,16 @@ mod tests {
         assert_eq!(
             *r5.0
                 .iter()
+                .find(|(addr, _)| *addr == coresight::R5_0_ETM + coresight::TRCAUXCTLR)
+                .unwrap(),
+            (
+                coresight::R5_0_ETM + coresight::TRCAUXCTLR,
+                coresight::AUXCTLR_SYNCDELAY
+            )
+        );
+        assert_eq!(
+            *r5.0
+                .iter()
                 .find(|(addr, _)| *addr == coresight::R5_0_ETM + coresight::TRCTRACEIDR)
                 .unwrap(),
             (
@@ -1029,6 +1039,17 @@ pub mod coresight {
     /// enough to make a first decode attempt tractable, not tuned for
     /// production bandwidth.
     pub const SYNCPR_512_BYTES: u32 = 0x8;
+    /// TRCAUXCTLR bit[3] SYNCDELAY (DDI0500J Table 13-8): "Delay periodic
+    /// synchronization if FIFO is more than half-full... 0 = SYNC packets
+    /// are inserted into FIFO only when trace activity is LOW; 1 = SYNC
+    /// packets are inserted into FIFO irrespective of trace activity."
+    /// PS_CORESIGHT_TRACE_PLAN.md Phase 6 root cause: a continuously-busy
+    /// trace source (this project's own deterministic workloads never
+    /// truly idle) can defer TRCSYNCPR's periodic sync packet forever under
+    /// the default (0) -- exactly matching real trace bytes reaching the PL
+    /// FIFO but the TPIU demux never finding a Full Sync Packet to lock
+    /// onto. Set unconditionally so sync packets are never starved out.
+    pub const AUXCTLR_SYNCDELAY: u32 = 1 << 3;
 
     /// Actually starts the selected ETM tracing, after `select()` has
     /// unlocked/routed it. Deliberately minimal: no branch broadcast, no
@@ -1046,7 +1067,7 @@ pub mod coresight {
             mmio.write32(etm + TRCOSLAR, 0); // unlock the OS lock (distinct from LAR)
             mmio.write32(etm + TRCPRGCTLR, 0); // ensure disabled before reconfiguring
             mmio.write32(etm + TRCCONFIGR, 0);
-            mmio.write32(etm + TRCAUXCTLR, 0);
+            mmio.write32(etm + TRCAUXCTLR, AUXCTLR_SYNCDELAY);
             mmio.write32(etm + TRCEVENTCTL0R, 0);
             mmio.write32(etm + TRCEVENTCTL1R, 0);
             mmio.write32(etm + TRCSTALLCTLR, 0);
