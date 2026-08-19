@@ -18,7 +18,7 @@ testing capabilities" the M3 integration was built for.
 | D | Load the M3 firmware image | **DONE — both D1 and D2 confirmed fully working**, 2026-08-17. Two hardware bugs fixed (dual-port tied-off BRAM port; a write-pacing 4:1 word-drop fixed by routing `m3_mem_ctrl` through a dedicated `axi_interconnect`) plus a real vendored NetX ARP-table race fixed (see below) — but D2's long "hang" this session turned out to be **two stacked build/flash mistakes, not a design bug**: `jtag_flash.sh` was repeatedly given a stale (`2026-08-09`) `a53_app_elf` artifact instead of the freshly-rebuilt `a53_app` symlink, so none of this session's firmware edits were ever actually running; independently, the board was flashed with `hybrid-fix2` (the *pre*-BRAM-fix bitstream) instead of `hybrid-fix3` during the whole D2 investigation. Once both were corrected, D2 completes cleanly and repeatably, including as the very first command after a fresh reflash. See the 2026-08-17 "stale artifact" correction below for the full account |
 | E | Configure Orbtrace and start capture | **SUBSTANTIVELY DONE, 2026-08-19 — real, clean, channel-1-only CoreSight content decoded on real hardware for the first time in this entire investigation.** Root cause: `orbtrace_tpiu_demux.sv`'s sync-word search had the byte order backwards (searched for `0x7F` then three `0xFF`, when the real CoreSight Full Sync Packet is chronologically three `0xFF` then `0x7F` — confirmed against sigrok's independent reference decoder and real ILA capture data). Fixed (`32'hffffff7f`→`32'h7fffffff`), simulation-validated with a new dedicated testbench, then confirmed on real hardware: `orbtrace stats` shows `rx_bytes` genuinely and repeatably nonzero (11→173 over ~2 minutes) under the real (non-marker) firmware, and decoding the capture shows every byte is checksum-valid, exclusively on channel 1, zero garbage channels — a first. `dropped_bytes`/`sync_loss` remain huge (expected/correct: the false-lock-on-idle-alias problem the 2026-08-18 channel-plausibility gate handles is still active and doing its job). Remaining for a future session: Phase F's full byte-for-byte diff against the `Workload` reference (not required to call Phase E itself done) — see the 2026-08-19 section below for full detail |
 | F | Verify the captured trace is genuinely correct | **DONE, 2026-08-19 — genuine content recovery confirmed**, not just correct framing. A capture synchronized to a fresh `load-m3` reload (so the `Workload(seed=7)` reference's `sequence` starts near 0, unlike the previous unsynced attempt which could never find a contiguous match against an unknown, possibly-huge sequence offset) found 9 order-preserving, exact byte-string matches of width≥2 (3- or 5-byte) reference events in a 223-byte reconstructed stream, against an analytically-expected ~1.4 and empirically-observed 2-3 coincidental matches from shuffled/random controls. See the 2026-08-19 "Phase F" section below |
-| G | Verify the real JTAG debug path | **ROOT CAUSE FOUND AND FIXED, 2026-08-19 (continuation) — the JTAG-DP is genuinely alive.** The "TDO stuck at 0" symptom was a real bug in this repo: `model/src/main.rs`'s `remote_bitbang()` decoded the standard remote-bitbang reset letters (`r`/`s`/`t`/`u`) exactly backwards relative to OpenOCD's real protocol, so every real OpenOCD session held the M3 in permanent combined `nTRST`+`nRESET` reset from its first byte. Fixed; confirmed two independent ways that the SWJ-DP now returns its genuine ADIv5 IDCODE (`0x4ba00477`) cleanly after an nTRST pulse. Plain OpenOCD now gets real (not all-zero) traffic but has a residual 1-JTAG-cycle scan-navigation misalignment (proven to be an OpenOCD-side navigation nuance, not a hardware or model bug) that still blocks its higher-level `halt`/PC-read — see the 2026-08-19 continuation section for full detail and next steps |
+| G | Verify the real JTAG debug path | **JTAG-DP fully alive and a working ADIv5 client built (2026-08-19), but real halting is likely blocked by a probable IP-level limitation, not a bug in this repo.** Root cause of the original "TDO stuck at 0" symptom: `model/src/main.rs`'s `remote_bitbang()` decoded OpenOCD's reset letters backwards (fixed, committed `1799849`), confirmed via the genuine ADIv5 IDCODE (`0x4ba00477`). A hand-rolled ADIv5 JTAG-DP DPACC/APACC client (bypassing OpenOCD's still-unresolved 1-cycle scan offset entirely) confirms DP/AP bring-up and real external-memory reads via the AP work correctly (AHB-AP IDR `0x24770011`, and the M3's real reset-vector word `0x00010000` read back through the AP — a second independent confirmation of Phase D's BRAM content). But every System Control Space address (`DHCSR`/`CPUID`/`ICTR`, `0xE000Exxx`) faults on both read and write, while non-SCS memory doesn't — strong, well-documented evidence (CM3 TRM + this IP's own component.xml) points to this specific DesignStart FPGA package's `DBGEN` master-debug-enable input being tied low/unavailable, not exposed for `create_bd.tcl` to control. Halt/PC-read/step/resume remain unverified; see the 2026-08-19 continuation section for the full evidence chain and next steps |
 
 Phases 1 through D are all done and verified against real hardware, not
 just tooling or reasoning — this includes a full synth/impl/route cycle on
@@ -3192,3 +3192,147 @@ this section's description if resuming — none are large or complex). No RTL ch
 `ORBTRACE_REG_M3_CONTROL` was left at `0x3` on the board (same as the prior session's
 end-state). All background `remote-bitbang`/proxy processes were stopped before ending the
 session.
+
+**Update 2026-08-19 (continued further): the previous session's reset-mapping fix is now
+committed (`1799849`), and this continuation pursued Phase G's option 2 — hand-rolling ADIv5
+JTAG-DP DPACC/APACC directly over the CMSIS-DAP TCP port, sidestepping OpenOCD's still-open
+1-cycle scan offset entirely. Result: a working, hardware-validated ADIv5 client that
+successfully reads real external memory (BRAM/vector table) through the AP, but halting via
+DHCSR is blocked by what strong indirect evidence points to as this specific packaged IP's
+`DBGEN` input being tied low (or otherwise unavailable) — a probable hard limitation of the
+`AT426 DesignStart Cortex-M3 FPGA Xilinx Edition`, not a wiring or protocol bug in this repo.**
+
+**Confirmed `orbtrace_dap_engine.sv` has no real DPACC/APACC implementation at all** (re-read
+of the RTL this session, comment at the top of the file makes this explicit): `DAP_Transfer`
+(0x05) is *always* synthetic, regardless of `use_real_target`. Only `DAP_JTAG_Sequence` (0x14,
+one JTAG clock per CMSIS-DAP packet) and `DAP_SWJ_Pins` (0x10, for `nTRST`/`nRESET`) drive the
+real target. This makes Phase G's option 2 from the prior section not just "faster" but
+*necessary* for any ADIv5 register-level access — there is no path through this repo's own
+protocol layer that could ever support DPACC/APACC without bit-banging it by hand, independent
+of whatever OpenOCD's scan-navigation issue turns out to be.
+
+**Recreated `adiv5_jtag.py`** (scratch-only, lived in the session scratchpad; recreate from
+this description if resuming) as a from-scratch ADIv5 JTAG-DP client speaking directly to
+`CMSIS_DAP_PORT` (3240): the same length-framed wire protocol `dap_transaction()` in
+`model/src/main.rs` uses, `DAP_SWJ_Pins` for an `nTRST` pulse + Test-Logic-Reset, then hand-
+built TAP navigation (`goto_shift_ir`/`goto_shift_dr`/`shift_bits`, one `DAP_JTAG_Sequence`
+call per JTAG clock) implementing the standard IR=0xA (DPACC) / IR=0xB (APACC) / IR=0x8
+(ABORT) 4-bit instructions and the 35-bit pipelined DPACC/APACC DR scan (bit0=RnW,
+bits[2:1]=A[3:2], bits[34:3]=DATA; captured TDO on the same scan is the *previous*
+transaction's ACK+DATA, per the standard ADI pipeline — fetched via a DPACC RDBUFF scan).
+
+**Milestone 1: reproduced the known-good IDCODE recipe first, byte-for-byte, before building
+anything on top** — `nTRST` pulse (`DAP_SWJ_Pins` value `0x80` then `0xa0`) + 6×TMS=1 TLR +
+32-bit Shift-DR (default post-TLR instruction is IDCODE) read back the genuine `0x4ba00477`
+immediately, confirming the CMSIS-DAP-port-direct approach reaches the same real, working
+SWJ-DP as the previous session's raw-bitbang probes.
+
+**Milestone 2: full DP bring-up works cleanly.** `CTRL/STAT` power-up
+(`CDBGPWRUPREQ`/`CSYSPWRUPREQ` write, poll for both ACK bits) reliably reaches
+`0xf0000000`. `SELECT`, `AP_CSW`, `AP_TAR` all read/write correctly through the AP —
+confirmed two independent ways: (a) `MEM-AP0 IDR` reads the textbook real value
+`0x24770011` (the standard ARM AHB-AP identifier — not a guess, an exact match), and (b)
+reading real external memory through `AP_DRW` at address `0x00000000` (the M3's own reset
+vector, external Code-bus address, *not* an internal SCS/debug register) returns
+`0x00010000` — the exact stack-pointer reset-vector word Phase D already established this
+firmware's image contains. **This is a second, independent, real confirmation that the BRAM
+load and vector table are genuinely correct** (matching D1's own JTAG readback from
+2026-08-16), now reached via a completely different path (the debug AP, not `mwr`/`dow`).
+
+**A real, separate, worth-recording protocol quirk found along the way: this SWJ-DP's
+`STICKYERR` sticky-fault flag in `CTRL/STAT` is *not* clearable by the standard ABORT-register
+write (`STKERRCLR`, tried with every combination of ABORT bits including `DAPABORT`), and is
+*not* cleared by an `nTRST` pulse or by a `CTRL/STAT` power-down/power-up cycle either — all
+three are the textbook ways to clear it and none worked on this real hardware. What *does*
+clear it: cycling `ORBTRACE_REG_M3_CONTROL`'s bit 1 (`m3_dap_real`) off and back on via
+`orbtrace m3-control HOST 0x0` then `HOST 0x3` — i.e. toggling the shared
+`SYSRESETn`/`DBGRESETn` net (per `create_bd.tcl`'s own comment, these two are tied together in
+this design). This is now the known-good recovery procedure any future Phase G session needs:
+if `CTRL/STAT` ever reads with bit 5 set, don't fight it with ABORT — cycle M3 control 0x0→0x3
+and restart the JTAG-DP bring-up from `nTRST`.**
+
+**The real blocker: the entire System Control Space (`0xE000Exxx`) faults on every access,
+read or write alike, while everything else works.** With a *fresh* (post-DBGRESETn-cycle,
+`STICKYERR`-clear) DP/AP state: reading external memory (`0x00000000`, `0x00000040`) succeeds
+cleanly, no fault. But reading `DHCSR` (`0xE000EDF0`), the always-implemented read-only `CPUID`
+(`0xE000ED00`), or `ICTR` (`0xE000E004`) — and writing `DHCSR` with the halt request
+(`0xA05F0003`) — all immediately set `STICKYERR` and return `0x00000000` for the read value.
+This was tested systematically (multiple fresh DBGRESETn cycles, both read and write, three
+different SCS addresses) and is completely reproducible: **every single SCS address faults;
+every non-SCS address tested does not.**
+
+**Root-cause hypothesis, well-evidenced but not provable without RTL access (the core is
+IEEE-P1735-encrypted): this exact IP package's `DBGEN` input is tied low or otherwise
+unavailable, disabling CPU halting/SCS debug access while leaving plain AHB-AP bus-master
+reads/writes to external memory unaffected.** Evidence chain:
+1. The generic CM3 TRM (`arm_cortexm3_processor_trm_100165_0201_00_en.pdf`, extracted this
+   session via `nix develop -c pdftotext`, since a bare `pdftotext`/`pdftoppm` isn't on `PATH`
+   outside the dev shell) states plainly (§1.6.4): "DBGEN input added as master debug enable.
+   If de-asserted then debug is disabled" (added at r2p0→r2p1). It also confirms (§3.4,
+   §7.2) that SCS is reached via the **same internal bus matrix** the AHB-AP is a master on —
+   "the processor contains a bus matrix that arbitrates accesses to both the external memory
+   system and to the internal System Control Space (SCS) and debug components" — meaning SCS
+   access does *not* depend on `create_bd.tcl`'s external `CM3_CODE_AXI3`/`CM3_SYS_AXI3`
+   wiring at all (ruling out the initially-suspected "SCS routes out through the unconnected
+   `CM3_SYS_AXI3`" theory as the mechanism, even though that theory fit the read/write
+   asymmetry just as well on its face).
+2. `CM3DbgAXI/component.xml` (the real, Xilinx-packaged IP-XACT for this exact edition) has
+   **no `DBGEN` port anywhere** — confirmed with an exhaustive case-insensitive `dbg`-name
+   grep across the whole file, only turning up `DBGRESETn`, `DBGRESTART`, `DBGRESTARTED`,
+   `EDBGRQ` (all already accounted for in Phase B's tie-offs). If `DBGEN` isn't exposed as a
+   pin, `create_bd.tcl` has no way to drive it high even if that turns out to be the fix — the
+   Xilinx packaging step decided its value internally, invisibly to BD-level integration.
+3. The dedicated `arm_cortex_m3_designstart_fpga_xilinx_edition_ug_101483_0000_00_en.pdf`
+   (this specific FPGA edition's own user guide, also extracted this session) never mentions
+   `DBGEN` at all — consistent with (but not proof of) the vendor having made this decision
+   silently rather than documenting a user-facing option.
+4. Behaviorally, this exactly explains every observation: DBGEN gating (per the TRM's wording)
+   plausibly covers CPU halting and internal PPB-space (SCS/NVIC/ITM/DWT/FPB) access
+   specifically, while a plain AHB-AP bus-master transaction to external Code/SRAM space is
+   architecturally just a bus transaction and doesn't obviously need to consult DBGEN at all —
+   matching read/write to `0x0`/`0x40` working while every `0xE000Exxx` address faults, with
+   no exceptions found.
+
+**This was not chased further this session** — there is no additional free (no-rebuild)
+diagnostic available: the core RTL is encrypted so no netlist/ILA inspection of an internal
+`DBGEN` tie-off is possible the way the Phase D/Phase-G-reset-mapping bugs were root-caused,
+and no documentation found states the tie-off value explicitly one way or the other.
+
+### Next steps for a future session
+
+1. **If pursuing this further despite the above:** check whether `Arm_ipi_repository`
+   contains a *newer or alternate* CM3 DesignStart package/revision that *does* expose `DBGEN`
+   (the "FPGA Xilinx Edition" may not be the only packaging available from Arm DesignStart);
+   check `~/Downloads` and any other extracted DesignStart tarball for a `component.xml` that
+   differs from the one currently in use. This would need re-running Phase A/B/C's IP-swap and
+   full rebuild if a different package is found and does expose it — a real, multi-hour-cycle
+   commitment, not a quick check.
+2. **Cheaper alternative worth trying first:** contact/search Arm DesignStart community
+   resources (forums, errata) for whether "AT426-r0p1-00rel0-1" specifically is known to tie
+   `DBGEN` low — this is exactly the kind of detail a vendor errata or forum post might state
+   explicitly where the shipped docs don't. Not attempted this session (no web access from
+   this sandboxed environment during the session).
+3. **If `DBGEN` truly can't be un-gated in this IP package,** halting/stepping via the standard
+   ARMv7-M debug model (`DHCSR`/`DCRSR`/`DCRDR`) is not achievable with this exact IP, and
+   Phase G's original acceptance bar (halt, read PC, single-step, resume) would need to be
+   reconsidered as a documented, well-evidenced limitation of the chosen IP package rather than
+   pursued further — the trace side (Phases E/F) already fully stands on its own regardless,
+   and is unaffected by any of this (trace comes from the TPIU/formatter, not the AHB-AP).
+4. **Reusable, working code from this session, regardless of the DBGEN outcome:** the
+   `adiv5_jtag.py` bring-up sequence (nTRST pulse → TLR → IDCODE check → ABORT clear →
+   `CTRL/STAT` power-up → `SELECT`/`CSW`/`TAR`/`DRW` access) is a real, hardware-validated
+   ADIv5 JTAG-DP client good for *any* future real-target debug work on this board (reading
+   external BRAM/peripherals via the AP already works today, e.g. as an independent
+   cross-check tool for Phase D/F-style content verification) — worth committing as a real
+   tool (not scratch) if a future session wants a general-purpose "read real memory via JTAG-DP
+   without OpenOCD" utility, independent of whether SCS access is ever unblocked.
+
+**Housekeeping:** No RTL or `model/src/main.rs` changes this session (the reset-mapping fix
+from the prior continuation is already committed as `1799849`). `adiv5_jtag.py`, `trm.txt`,
+and `fpga_ug.txt` (the two `pdftotext`-extracted docs) are scratch-only in the session
+scratchpad — recreate from this section's description if resuming; the `pdftotext`/`pdftoppm`
+extraction specifically needs `nix develop -c pdftotext ...` since those tools aren't on the
+bare host `PATH`. `ORBTRACE_REG_M3_CONTROL` was cycled `0x0`→`0x3` several times this session
+(to get a clean `STICKYERR` state for each probe) and was left at `0x3` at the end, matching
+every prior session's end-state convention — `orbtrace stats` confirmed the M3 still running
+and tracing (`sync_loss` climbing) after the final cycle.
