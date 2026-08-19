@@ -24,7 +24,8 @@ module orbtrace_core #(
     orbtrace_source_mux mux(.*,.select(source_select),.output_data(selected_data),.output_valid(selected_valid),.output_ready(selected_ready));
     orbtrace_tpiu_demux demux(.clk,.reset_n,.reset_sync,.input_data(selected_data),
         .input_valid(selected_valid && !bypass_tpiu),.input_ready(tpiu_input_ready),.output_channel(demux_channel),
-        .output_data(demux_data),.output_valid(demux_valid),.output_ready(demux_ready),.sync_loss_count(sync_loss));
+        .output_data(demux_data),.output_valid(demux_valid),.output_ready(demux_ready),.sync_loss_count(sync_loss),
+        .m3_source(source_select == 2'd0));
     assign selected_ready = bypass_tpiu ? demux_ready : tpiu_input_ready;
     orbtrace_channel_packetizer #(
         .MAX_PACKET(ORBFLOW_PAYLOAD),

@@ -10,8 +10,18 @@ module orbtrace_tpiu_demux (
     output      logic [7:0] output_data,
     output      logic       output_valid,
     input  wire logic       output_ready,
-    output      logic [63:0] sync_loss_count
+    output      logic [63:0] sync_loss_count,
+    // M3-source-only sync-lock plausibility gate -- see the sequential
+    // block below. Leaves the PS/ETM path (m3_source==0) bit-for-bit
+    // unchanged.
+    input  wire logic       m3_source
 );
+    // TRACEBUSID the M3 always configures (sdk/bsp/m3/itm.h's
+    // m3_itm_init(), M3_ITM_TCR_TRACEBUSID_SHIFT) -- never varies in this
+    // codebase, so any is_id byte decoding to a different channel while
+    // m3_source is selected is conclusive evidence of a false sync lock,
+    // not a legitimate second trace source.
+    localparam logic [6:0] M3_EXPECTED_CHANNEL = 7'd1;
     logic synced;
     logic [31:0] sync_window;
     logic [7:0] frame [0:15];
@@ -56,11 +66,29 @@ module orbtrace_tpiu_demux (
                 end
             end
             if (emitting && (is_id || channel == 0 || output_ready)) begin
-                if (is_id) begin
-                    if (unmangled[0]) begin delayed_channel <= unmangled[7:1]; delayed_valid <= 1; end
-                    else channel <= unmangled[7:1];
-                end else if (delayed_valid) begin channel <= delayed_channel; delayed_valid <= 0; end
-                if (emit == 14) emitting <= 0; else emit <= emit + 1'b1;
+                // Plausibility gate (2026-08-18, M3 only): the bare
+                // FFFFFF7F substring search above can and does false-lock
+                // onto structure that occurs naturally within the M3's own
+                // idle output -- see M3_TRACE_VERIFICATION_PLAN.md's
+                // 2026-08-18 "cycle-accurate capture" finding (a stable
+                // `FF 7F FF FF` idle sub-pattern trivially contains
+                // FFFFFF7F at every period). A genuine lock's every ID byte
+                // must decode to M3_EXPECTED_CHANNEL; anything else is
+                // conclusive evidence of a false lock -- drop back to
+                // searching immediately rather than continuing to emit
+                // garbage at the wrong frame phase forever.
+                if (m3_source && is_id && unmangled[7:1] != M3_EXPECTED_CHANNEL) begin
+                    synced <= 0;
+                    fill <= 0;
+                    emitting <= 0;
+                    sync_loss_count <= sync_loss_count + 1'b1;
+                end else begin
+                    if (is_id) begin
+                        if (unmangled[0]) begin delayed_channel <= unmangled[7:1]; delayed_valid <= 1; end
+                        else channel <= unmangled[7:1];
+                    end else if (delayed_valid) begin channel <= delayed_channel; delayed_valid <= 0; end
+                    if (emit == 14) emitting <= 0; else emit <= emit + 1'b1;
+                end
             end
         end
     end
