@@ -58,7 +58,24 @@ module orbtrace_tpiu_demux (
             if (input_valid && input_ready) begin
                 sync_window <= {input_data, sync_window[31:8]};
                 if (!synced) begin
-                    if ({input_data, sync_window[31:8]} == 32'hffffff7f) begin synced <= 1; fill <= 0; end
+                    // Full Sync Packet is, chronologically, three 0xFF bytes
+                    // followed by a terminating 0x7F (confirmed against an
+                    // independent reference decoder -- sigrok's arm_tpiu
+                    // -- since the local TRM defers the exact wire format to
+                    // the CoreSight Architecture Specification, not present
+                    // in this project's docs). sync_window's shift-register
+                    // convention places the newest byte at [31:24] and the
+                    // oldest of the tracked 4 at [7:0], so the chronologically
+                    // -last byte (0x7F, which completes the match) belongs at
+                    // the top: 8'h7f (newest) ++ 8'hff ++ 8'hff ++ 8'hff
+                    // (oldest). The previous constant, 32'hffffff7f, put 0x7F
+                    // at the OLDEST position instead -- backwards -- so any
+                    // genuine sync event was searched for in the wrong byte
+                    // order and could never align frame decode correctly
+                    // even when real content followed it. See the
+                    // 2026-08-19 M3_TRACE_VERIFICATION_PLAN.md entry for the
+                    // real ILA capture that found this.
+                    if ({input_data, sync_window[31:8]} == 32'h7fffffff) begin synced <= 1; fill <= 0; end
                 end else begin
                     frame[fill] <= input_data;
                     if (fill == 15) begin fill <= 0; emit <= 0; emitting <= 1; end

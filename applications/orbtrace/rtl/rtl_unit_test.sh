@@ -34,11 +34,13 @@ run_xsim() {
   "${rtl_dir}/orbtrace_axis_packer.sv" \
   "${rtl_dir}/orbtrace_dap_engine.sv" \
   "${rtl_dir}/orbtrace_source_mux.sv" \
+  "${rtl_dir}/orbtrace_tpiu_demux.sv" \
   "${rtl_dir}/tb/orbtrace_capture_tb.sv" \
   "${rtl_dir}/tb/orbtrace_dap_tb.sv" \
   "${rtl_dir}/tb/orbtrace_axis_packer_tb.sv" \
   "${rtl_dir}/tb/orbtrace_pipeline_tb.sv" \
-  "${rtl_dir}/tb/orbtrace_m3_source_tb.sv"
+  "${rtl_dir}/tb/orbtrace_m3_source_tb.sv" \
+  "${rtl_dir}/tb/orbtrace_tpiu_demux_tb.sv"
 "${XELAB}" orbtrace_capture_tb -s orbtrace_capture_tb_snapshot
 run_xsim orbtrace_capture_tb_snapshot "orbtrace capture RTL tests passed"
 "${XELAB}" orbtrace_dap_tb -s orbtrace_dap_tb_snapshot
@@ -49,3 +51,5 @@ run_xsim orbtrace_axis_packer_tb_snapshot "orbtrace AXI stream packer RTL tests 
 run_xsim orbtrace_pipeline_tb_snapshot "orbtrace randomized pipeline RTL tests passed"
 "${XELAB}" orbtrace_m3_source_tb -s orbtrace_m3_source_tb_snapshot
 run_xsim orbtrace_m3_source_tb_snapshot "orbtrace M3 source mux RTL tests passed"
+"${XELAB}" orbtrace_tpiu_demux_tb -s orbtrace_tpiu_demux_tb_snapshot
+run_xsim orbtrace_tpiu_demux_tb_snapshot "orbtrace TPIU demux RTL tests passed"
