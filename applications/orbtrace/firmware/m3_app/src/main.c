@@ -32,6 +32,22 @@ volatile uint32_t g_itm_tcr_at_boot;
 volatile uint32_t g_itm_stim0_at_boot;
 volatile uint32_t g_tpiu_ffsr_at_boot;
 volatile uint32_t g_tpiu_ffcr_at_boot;
+/* 2026-08-18: a real ILA capture on the PL side shows trace_data_m3 frozen
+ * at a constant idle value for the entire capture regardless of real STIM
+ * traffic (see M3_TRACE_VERIFICATION_PLAN.md). ITCTRL != 0 (integration
+ * test mode) would produce exactly this symptom -- normal trace output
+ * disabled, pins driven from the integration data registers instead. */
+volatile uint32_t g_tpiu_itctrl_at_boot;
+/* Neither of these was ever independently read back before -- SSPSR only
+ * proves the silicon supports the widths, not that these two specific
+ * writes actually stuck. */
+volatile uint32_t g_tpiu_sppr_at_boot;
+volatile uint32_t g_tpiu_cspsr_at_boot;
+/* TER masks individual stimulus ports independently of TCR's master
+ * enable -- never independently verified before. If it reads back 0, every
+ * STIM write succeeds at the FIFO but is silently discarded by ITM before
+ * ever reaching the formatter, matching the frozen-output ILA finding. */
+volatile uint32_t g_itm_ter_at_boot;
 
 /* Decisive test, 2026-08-17: g_itm_stim0_at_boot reads ready(1) right
  * after init, contradicting the 2026-08-16 ILA finding that the CPU
@@ -41,6 +57,13 @@ volatile uint32_t g_tpiu_ffcr_at_boot;
  * emit_next() calls (including their STIM writes) in a normal loop, not
  * stuck at all. */
 volatile uint32_t g_heartbeat;
+/* Two JTAG reads of g_dwt_cyccnt_latest at different wall-clock times
+ * settle whether M3_DWT_CTRL's write actually enabled cycle counting (PPB
+ * registers, including DWT_CYCCNT itself, aren't reachable via the A53's
+ * AXI window -- same reason g_heartbeat exists instead of reading the real
+ * counter directly). */
+volatile uint32_t g_dwt_ctrl_at_boot;
+volatile uint32_t g_dwt_cyccnt_latest;
 
 static void emit_next(void) {
     state ^= state << 13;
@@ -79,12 +102,18 @@ int main(void) {
     g_tpiu_sspsr_at_boot = M3_TPIU_SSPSR; /* DEMCR.TRCENA must be set first (done above) */
     g_itm_tcr_at_boot = M3_ITM_TCR;
     g_itm_stim0_at_boot = M3_ITM_STIM(0);
+    g_tpiu_itctrl_at_boot = M3_TPIU_ITCTRL;
+    g_tpiu_sppr_at_boot = M3_TPIU_SPPR;
+    g_tpiu_cspsr_at_boot = M3_TPIU_CSPSR;
+    g_itm_ter_at_boot = M3_ITM_TER;
     g_tpiu_ffsr_at_boot = M3_TPIU_FFSR;
     g_tpiu_ffcr_at_boot = M3_TPIU_FFCR;
+    g_dwt_ctrl_at_boot = M3_DWT_CTRL;
 
     for (;;) {
         emit_next();
         g_heartbeat++;
+        g_dwt_cyccnt_latest = M3_DWT_CYCCNT;
         for (volatile uint32_t i = 0; i < 10000u; i++) {
         }
     }
