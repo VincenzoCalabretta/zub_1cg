@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-19 — real capture attempted, zero bytes; root-caused to likely-wrong CoreSight funnel/TPIU addresses, not yet fixed.** See section 12 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-19 — two real address/offset bugs found+fixed with real UG1085/DDI0500J documentation; ETM confirmed genuinely tracing; still 0 bytes reach the PL, TPIU formatter suspected next.** See section 13 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -442,42 +442,174 @@ technique this project has used throughout):
   (harmless, self-recovering via `clear_stickyerr`, confirmed A53's TCP
   session was unaffected afterward, but a real signal to stop guessing).
 
-**Session end state:** all code changes committed. Board left with A53
-Orbtrace service confirmed responsive (`orbtrace info`); R5-0 left
-running `orbtrace_workload` (harmless, JTAG-only boot, no `psu_init`
-side effects). No destructive hardware state left behind.
+**Session end state (superseded by section 13 below — kept for history,
+do not act on the "next steps" that followed it, which are replaced):**
+all code changes committed. Board left with A53 Orbtrace service
+confirmed responsive (`orbtrace info`); R5-0 left running
+`orbtrace_workload` (harmless, JTAG-only boot, no `psu_init` side
+effects). No destructive hardware state left behind.
+
+## 13. Phase 6 continued — two real bugs found and fixed using real documentation (2026-08-19, same day)
+
+Section 12 identified the funnel/TPIU addresses as the likely blocker but
+had no way to confirm the real values (Xilinx toolchain's bundled SDK data
+turned out to be legacy Zynq-7000-era, no ZynqMP CoreSight map). The user
+pointed at a private reference-document archive
+(`projects/zub_1cg_documentation_private`, sibling to this repo, gitignored
+from `zub_1cg` itself — see that archive's own `README.md`/`NOTICE.md` for
+provenance and handling terms) that turned out to already have exactly
+what was needed: the real `ug1085-zynq-ultrascale-trm.pdf` and
+`DDI0500J_cortex_a53_trm.pdf`, pre-extracted to searchable Markdown at
+`internal/documentation/pdf/<name>/document.md` inside that archive.
+
+**Bug 1, confirmed and fixed: `coresight::select()`'s funnel/TPIU/ETM base
+addresses were missing the CoreSight region's own base address.** UG1085's
+real Figure 39-8 ("CoreSight System Debug Address Map", source page 1196)
+gives offsets *relative to a 0xFE80_0000 base* (its own text: "CoreSight
+components are allocated 8 MB of address space from FE80_0000 to
+FEFF_FFFF"), e.g. Funnel 0 = offset `0011_0000`. The addresses in this
+codebase since Phase 1 had taken that raw offset and prefixed it with `FE`
+directly (`0011_0000` -> `0xfe11_0000`) instead of adding it to the real
+base (`0011_0000` -> `0xfe91_0000`) — a transcription bug, not a
+documentation error. Fixed in `firmware/a53/src/lib.rs`'s `coresight`
+module: added a `CORESIGHT_BASE = 0xfe80_0000` constant, every address now
+derived as `CORESIGHT_BASE + <Figure 39-8 offset>`.
+**Confirmed fixed via real JTAG readback**, not just plausible-looking
+math: with the corrected addresses, `FUNNEL_RPU`'s control register now
+holds exactly what `select()` wrote (`0x1`), and — the more decisive
+proof — its Peripheral/Component ID registers (architecturally hardwired,
+never all-zero on a real component) now read genuine CoreSight signatures:
+`CIDR0 = 0x0000000d` (the standard CoreSight preamble byte, part of the
+well-known `0xB105_100D` pattern), `PIDR0 = 0x00000008`, `PIDR4 =
+0x00000004`. Same confirmation for `FUNNEL_SYSTEM` and `TPIU`. Compare to
+section 12's old-address readback: all-zero IDs, or a hard JTAG-DP
+STICKYERR for `A53_1_ETM`.
+
+**Bug 2, confirmed and fixed: every ETMv4 register offset in
+`enable_trace()` except `TRCOSLAR` was wrong.** DDI0500J (Arm Cortex-A53
+MPCore TRM) Chapter 13 "Embedded Trace Macrocell", section 13.8, states
+each register's real offset explicitly (e.g. "The TRCPRGCTLR can be
+accessed through the external debug interface, offset 0x004"). The
+previous session's offsets (recalled from memory of generic ETMv4
+reference material, not a real TRM) were consistently wrong:
+
+| Register | Was | Real (DDI0500J 13.8) |
+|---|---|---|
+| TRCPRGCTLR | 0x000 | 0x004 |
+| TRCSTATR | 0x008 | 0x00C |
+| TRCCONFIGR | 0x00C | 0x010 |
+| TRCEVENTCTL0R | 0x018 | 0x020 |
+| TRCEVENTCTL1R | 0x01C | 0x024 |
+| TRCSTALLCTLR | 0x020 | 0x02C |
+| TRCTSCTLR | 0x024 | 0x030 |
+| TRCSYNCPR | 0x028 | 0x034 |
+| TRCCCCTLR | 0x02C | 0x038 |
+| TRCBBCTLR | 0x030 | 0x03C |
+| TRCTRACEIDR | 0x034 | 0x040 |
+| TRCVICTLR | 0x040 | 0x080 |
+| TRCVIIECTLR | 0x044 | 0x084 |
+| TRCVISSCTLR | 0x048 | 0x088 |
+| TRCOSLAR | 0x300 | 0x300 ✓ (only one already correct) |
+
+This explains section 12's misleading "confirmation" — writing to offset
+`0x000` (real: Reserved) and reading back exactly what was written wasn't
+proof of a working `TRCPRGCTLR`, just a Reserved register faithfully
+echoing whatever it's told (`TRCPRGCTLR.EN`, the real trace-enable bit at
+the real offset `0x004`, was never touched at all). Also dropped
+`TRCVIPCSSCTLR` (not a real register in DDI0500J's Table 13-3 — likely
+confused with a later ETMv4.x extension not present on this core) and
+added the real `TRCAUXCTLR` (offset `0x018`) to the write sequence in its
+place, matching the register summary table's actual layout. These are the
+ETMv4-architected registers (not Cortex-A53 IMPLEMENTATION DEFINED ones),
+so the same offsets apply to the R5-0 ETM too.
+
+**Confirmed fixed via real JTAG readback + register semantics, not just
+matching writes:** with corrected offsets, `TRCSTATR` (real offset
+`0x00C`) reads `0x00000000` — per DDI0500J Table 13-5, bit[0] `IDLE`: "0 =
+The ETM trace unit is not idle" — **meaning the ETM is now genuinely,
+actively tracing.** (The other "static config" registers read back
+values that don't match what firmware wrote, e.g. `TRCCONFIGR=0x2` for a
+written `0`; this is expected and documented, not a bug: `TRCSTATR` bit[1]
+`PMSTABLE` also read `0`, and DDI0500J's own text says the "programmers
+model is not stable" while running, i.e. these registers legitimately
+don't reflect clean static content while `EN=1`.)
+
+**Real hardware capture retried with both fixes: still 0 bytes.**
+`rx_bytes=0 dropped_bytes=0 fifo_high_water=0`, `sync_loss` still climbing
+into the hundreds of millions. So the ETM is genuinely tracing and the
+CoreSight fabric is genuinely routing (both confirmed above), but
+something further downstream still isn't delivering usable bytes to the
+PL's `coresight_data` input.
+
+**Third real lead investigated, inconclusive:** read the TPIU's own
+register state directly (`0xfe98_0000`, offsets reused from
+`sdk/bsp/m3/itm.h`'s already-hardware-proven M3 TPIU layout — `SSPSR
+0x000, CSPSR 0x004, SPPR 0x0F0, FFSR 0x300, FFCR 0x304, ITCTRL 0xF00`,
+the standard ARM CoreSight TPIU macrocell layout, plausible to carry over
+since it's the same component family). Findings: `CSPSR=0x9` (bit3 set =
+4-bit port, matching `create_bd.tcl`'s `PSU__TRACE__WIDTH {4Bit}` — looks
+already correctly configured, likely by hardware default), `SPPR=0x0`
+(Parallel mode, correct), `ITCTRL=0x0` (not in integration-test mode,
+good) -- but **`FFCR=0x0`** (Formatter and Flush Control, all zero — the
+formatter's continuous-output enable is off). Tried a live JTAG write of
+`FFCR=0x2` (`EnFCont`, a commonly-cited stable TPIU convention, though
+**not** confirmed against a real TPIU-specific TRM the way the two fixes
+above were) — **the write stuck, but a re-capture attempt still showed 0
+bytes.** Inconclusive: either `FFCR`'s `EnFCont` bit isn't actually at
+bit 1 for this specific SoC-400 TPIU instance, or the real blocker is
+elsewhere in the chain (a Funnel/Replicator stage between "Funnel 2 /
+SYSTEM" and TPIU that Figure 39-8 lists but this code never touches, or a
+genuine PL-side issue).
+
+**What's still missing:** UG1085's own citation table (source page 1195)
+names the authoritative document for Funnel/TPIU/DAP/Timestamp/CTI
+register-level behavior as the **"Arm CoreSight SoC-400 Technical
+Reference Manual" [Ref 39]** — a *different* document from both UG1085 and
+DDI0500J, and **not present** in the private reference-document archive
+checked this session. This is the single most valuable next document to
+obtain: it would give the real `TPIU_FFCR`/`FFSR` bit definitions (and
+confirm/deny whether a Replicator stage needs separate enabling) instead
+of the current best-effort carryover from the M3 macrocell's TRM-verified
+layout.
+
+**Session end state:** all code changes (both real fixes) committed. The
+one FFCR write this session was a live JTAG probe only, never added to
+firmware — nothing to revert. Board left with A53 Orbtrace service
+confirmed responsive (`orbtrace info`); R5-0 left running
+`orbtrace_workload`. No destructive hardware state left behind.
 
 ## Next steps for a future session
 
-1. **Cheapest, do first:** get the *real* UG1085 CoreSight system map
-   (Figure 39-8) — via the actual PDF (see `internal/reference_docs/README.md`
-   for where to obtain it; not present in this sandbox) or, if that's not
-   available, an architecturally-correct alternative that needs no
-   documentation: walk the CoreSight ROM table. ARM CoreSight designs
-   expose a top-level ROM table whose entries self-describe each real
-   component's actual base address — if a top-level ROM table base for
-   this SoC's LPD/FPD debug region can be found (even by scanning a
-   plausible range for the CoreSight/PrimeCell ID signature, `0xB105_100D`
-   read from a component's `CIDR`/`PIDR` registers), that's a
-   documentation-independent way to get real, correct funnel/TPIU
-   addresses instead of continuing to guess. Once corrected, redo section
-   12's exact capture attempt (`configure r5 tpiu4 ...` → `start` →
-   `capture`) — the ETM-enable code itself is already real, tested, and
-   confirmed working at the register level; only the funnel/TPIU routing
-   addresses need fixing.
-2. Once bytes start flowing, mirror `M3_TRACE_VERIFICATION_PLAN.md`'s
+1. **Cheapest, do first:** get the real **Arm CoreSight SoC-400 Technical
+   Reference Manual** (UG1085's own Ref 39 citation for Funnel/TPIU/DAP/
+   Timestamp/CTI) — not currently in the private reference-document
+   archive; check there first (same place UG1085/DDI0500J were found this
+   session) before searching further afield. This should resolve the
+   `TPIU_FFCR` bit-definition gap directly and confirm whether a
+   Funnel-2-to-TPIU Replicator stage (visible in Figure 39-8's map but
+   never touched by this code) needs its own explicit enable.
+2. If that document remains unavailable, the fallback is a real PL-side
+   ILA capture on `coresight_data`/`trace_data_m3`-equivalent signals at
+   the `orbtrace_pl`/`orbtrace_tpiu_demux` boundary — the same proven
+   methodology `M3_TRACE_VERIFICATION_PLAN.md` used repeatedly to
+   distinguish "PS-side CoreSight isn't producing anything real" from "PL
+   isn't receiving/decoding what's genuinely being sent." This session's
+   findings (ETM genuinely tracing, funnels genuinely routing) make "PS
+   config is still incomplete" the leading hypothesis over a PL/wiring
+   bug, but an ILA capture would settle it definitively either way.
+3. Once bytes start flowing, mirror `M3_TRACE_VERIFICATION_PLAN.md`'s
    Phase E/F methodology exactly: confirm real content recovery against
    `applications/orbtrace/firmware/rpu`'s known-reproducible `Workload`
    sequence before trusting anything downstream (this project has been
    burned before by declaring victory on `rx_bytes > 0` alone — see that
    document's own Phase E cautionary history).
-3. Before investing further in Phase 6-8's ambition level, it's worth
+4. Before investing further in Phase 6-8's ambition level, it's worth
    doing the real UG1085/Cortex-A53 TRM check flagged in section 3, point
    5 — if this silicon's ETM genuinely has address/data comparators or an
    ETR path, that changes how ambitious those phases are worth being from
-   the start. (This can likely be combined with item 1's TRM lookup, if
-   that document becomes available.)
-4. Everything from Phase 6 onward is new engineering, not just wiring —
+   the start. (Now easy to combine with item 1 — both documents are
+   findable via the same private archive this session used.)
+5. Everything from Phase 6 onward is new engineering, not just wiring —
    size it accordingly before starting, the same way
    `M3_TRACE_VERIFICATION_PLAN.md` Phase H sized the ETM-on-M3 path
    before recommending against starting it without a clear bandwidth case.

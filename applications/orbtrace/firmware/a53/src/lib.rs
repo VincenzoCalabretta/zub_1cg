@@ -935,13 +935,26 @@ pub mod coresight {
     // ZynqMP CoreSight addresses are intentionally centralized. Firmware must
     // unlock components and stop an ETM before changing its configuration.
     pub const CORESIGHT_UNLOCK: u32 = 0xc5ac_ce55;
-    // ZynqMP internal CoreSight system map (UG1085, Figure 39-8).
-    pub const R5_0_ETM: usize = 0xfe3f_c000;
-    pub const A53_1_ETM: usize = 0xfe54_0000;
-    pub const FUNNEL_RPU: usize = 0xfe11_0000;
-    pub const FUNNEL_APU: usize = 0xfe12_0000;
-    pub const FUNNEL_SYSTEM: usize = 0xfe13_0000;
-    pub const TPIU: usize = 0xfe18_0000;
+    // ZynqMP internal CoreSight system map (UG1085 v2.5, Figure 39-8,
+    // "CoreSight System Debug Address Map", source page 1196). Figure 39-8's
+    // own "Internal Access (RPU and APU)" column gives offsets *relative to
+    // the 8 MB CoreSight region base, 0xFE80_0000* (e.g. Funnel 0 =
+    // 0011_0000) -- these constants are that base plus each offset.
+    // PS_CORESIGHT_TRACE_PLAN.md Phase 6 root-caused the previous values
+    // here (verified wrong via real JTAG readback: FUNNEL_RPU's old address
+    // read back all-zero across both writable and hardwired Peripheral ID
+    // registers, and A53_1_ETM's old address hit a hard JTAG-DP STICKYERR)
+    // to a transcription bug -- the raw table offset had been prefixed with
+    // "FE" directly (e.g. 0011_0000 -> 0xfe11_0000) instead of added to the
+    // real 0xFE80_0000 base (0011_0000 -> 0xfe91_0000). Fixed against the
+    // real document this time, not re-guessed.
+    pub const CORESIGHT_BASE: usize = 0xfe80_0000;
+    pub const R5_0_ETM: usize = CORESIGHT_BASE + 0x003f_c000;
+    pub const A53_1_ETM: usize = CORESIGHT_BASE + 0x0054_0000;
+    pub const FUNNEL_RPU: usize = CORESIGHT_BASE + 0x0011_0000; // "Funnel 0" in Figure 39-8
+    pub const FUNNEL_APU: usize = CORESIGHT_BASE + 0x0012_0000; // "Funnel 1" in Figure 39-8
+    pub const FUNNEL_SYSTEM: usize = CORESIGHT_BASE + 0x0013_0000; // "Funnel 2" in Figure 39-8
+    pub const TPIU: usize = CORESIGHT_BASE + 0x0018_0000;
     pub const LAR: usize = 0xfb0;
     pub const FUNNEL_CONTROL: usize = 0x000;
 
@@ -965,30 +978,36 @@ pub mod coresight {
         }
     }
 
-    // ETMv4 trace-unit register offsets (Arm ETM Architecture Specification,
-    // IHI 0064). PS_CORESIGHT_TRACE_PLAN.md Phase 6: `select()` above only
-    // unlocks components and wires funnels -- it never told the ETM itself
-    // to actually trace anything. These offsets are recalled from public
-    // ETMv4 reference material (the shape Linux's coresight-etm4x driver
-    // programs), not yet cross-checked against a local copy of the real
-    // Cortex-R5/A53 TRM in this sandbox (see internal/reference_docs/README.md
-    // -- those PDFs aren't available here). Treat as best-effort; confirm via
-    // real hardware readback (TRCPRGCTLR/TRCSTATR at minimum) before trusting.
-    pub const TRCPRGCTLR: usize = 0x000;
-    pub const TRCSTATR: usize = 0x008;
-    pub const TRCCONFIGR: usize = 0x00c;
-    pub const TRCEVENTCTL0R: usize = 0x018;
-    pub const TRCEVENTCTL1R: usize = 0x01c;
-    pub const TRCSTALLCTLR: usize = 0x020;
-    pub const TRCTSCTLR: usize = 0x024;
-    pub const TRCSYNCPR: usize = 0x028;
-    pub const TRCCCCTLR: usize = 0x02c;
-    pub const TRCBBCTLR: usize = 0x030;
-    pub const TRCTRACEIDR: usize = 0x034;
-    pub const TRCVICTLR: usize = 0x040;
-    pub const TRCVIIECTLR: usize = 0x044;
-    pub const TRCVISSCTLR: usize = 0x048;
-    pub const TRCVIPCSSCTLR: usize = 0x04c;
+    // ETMv4 trace-unit register offsets. `select()` above only unlocks
+    // components and wires funnels -- it never told the ETM itself to
+    // actually trace anything (`enable_trace()` below does that). Offsets
+    // confirmed against DDI0500J (Arm Cortex-A53 MPCore TRM), Chapter 13
+    // "Embedded Trace Macrocell", 13.7 "ETM register summary" / 13.8 "ETM
+    // register descriptions" (each register's own "accessed through the
+    // external debug interface, offset 0x0xx" line). These are the
+    // ETMv4-architected registers (not Cortex-A53-IMPLEMENTATION DEFINED
+    // ones), so the same offsets apply to the R5-0 ETM too -- confirmed by
+    // PS_CORESIGHT_TRACE_PLAN.md Phase 6's real hardware readback matching
+    // this exact layout, not just by architecture-spec inference. An
+    // earlier version of these offsets (best-effort, from memory of
+    // generic ETMv4 reference material rather than a real TRM) was wrong
+    // for every register except TRCOSLAR -- see that phase's writeup for
+    // the full before/after comparison; do not reintroduce those values.
+    pub const TRCPRGCTLR: usize = 0x004;
+    pub const TRCSTATR: usize = 0x00c;
+    pub const TRCCONFIGR: usize = 0x010;
+    pub const TRCAUXCTLR: usize = 0x018;
+    pub const TRCEVENTCTL0R: usize = 0x020;
+    pub const TRCEVENTCTL1R: usize = 0x024;
+    pub const TRCSTALLCTLR: usize = 0x02c;
+    pub const TRCTSCTLR: usize = 0x030;
+    pub const TRCSYNCPR: usize = 0x034;
+    pub const TRCCCCTLR: usize = 0x038;
+    pub const TRCBBCTLR: usize = 0x03c;
+    pub const TRCTRACEIDR: usize = 0x040;
+    pub const TRCVICTLR: usize = 0x080;
+    pub const TRCVIIECTLR: usize = 0x084;
+    pub const TRCVISSCTLR: usize = 0x088;
     pub const TRCOSLAR: usize = 0x300;
 
     pub const PRGCTLR_EN: u32 = 1 << 0;
@@ -1014,9 +1033,9 @@ pub mod coresight {
     /// Actually starts the selected ETM tracing, after `select()` has
     /// unlocked/routed it. Deliberately minimal: no branch broadcast, no
     /// cycle counting, no data tracing, no address-range filtering -- trace
-    /// every instruction unconditionally. See this module's own doc comment
-    /// above for the real caveat: offsets/values here are best-effort,
-    /// unverified against the local TRM.
+    /// every instruction unconditionally. Register offsets are confirmed
+    /// against DDI0500J, not best-effort -- see this module's own doc
+    /// comment on the offset constants above.
     pub unsafe fn enable_trace<M: Mmio>(mmio: &mut M, a53_1: bool) {
         let etm = if a53_1 { A53_1_ETM } else { R5_0_ETM };
         let trace_id = if a53_1 { TRACE_ID_A53_1 } else { TRACE_ID_R5_0 };
@@ -1027,6 +1046,7 @@ pub mod coresight {
             mmio.write32(etm + TRCOSLAR, 0); // unlock the OS lock (distinct from LAR)
             mmio.write32(etm + TRCPRGCTLR, 0); // ensure disabled before reconfiguring
             mmio.write32(etm + TRCCONFIGR, 0);
+            mmio.write32(etm + TRCAUXCTLR, 0);
             mmio.write32(etm + TRCEVENTCTL0R, 0);
             mmio.write32(etm + TRCEVENTCTL1R, 0);
             mmio.write32(etm + TRCSTALLCTLR, 0);
@@ -1037,7 +1057,6 @@ pub mod coresight {
             mmio.write32(etm + TRCTRACEIDR, trace_id);
             mmio.write32(etm + TRCVIIECTLR, 0); // no address-range filtering
             mmio.write32(etm + TRCVISSCTLR, 0); // no start/stop address comparators
-            mmio.write32(etm + TRCVIPCSSCTLR, 0); // no start/stop PE comparators
             mmio.write32(etm + TRCVICTLR, VICTLR_ALWAYS_TRACE);
             mmio.write32(etm + TRCPRGCTLR, PRGCTLR_EN); // start tracing
         }
