@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 — real ILA capture on `trace_clk` is DECISIVE: the PS trace port outputs a clean, periodic 2-value idle pattern, not real ETM content. Previous "TPIU sync-packet" hypothesis is moot — the real question is why no genuine ATB traffic ever leaves the ETM/funnel chain.** See section 16 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 — CTI hypothesis tested live on hardware and RULED OUT (system CTI 0 is real but disabled by default; unlocking/enabling it and pulsing its TPIU FLUSHIN/TRIGIN outputs produced no change in `rx_bytes`/`fifo_high_water`). Real root cause of the idle-pattern output (section 16) still open.** See section 17 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -900,29 +900,128 @@ rebuild, if useful (e.g. probing CTI-adjacent signals instead, or the
 funnel's own ATB input/output directly, once temporary debug ports for
 those are threaded through). No destructive hardware state left behind.
 
+## 17. Phase 6 continued — CTI hypothesis tested live on hardware, ruled out (2026-08-20)
+
+Picked up section 16's item 1 (cheapest next step: read the CTI
+components' state via JTAG). Board had been left powered off/idle since
+section 16; reflashed with the same known-good production bitstream
+(`bazel-out/orbtrace-vivado-m3-10mhz-r4`) + its own paired `psu_init.tcl`
+(both still cached, no rebuild needed) — `orbtrace info` confirmed
+responsive immediately after, same recovery flow as every prior session.
+
+**Read the real UG1085 CTI sections closely first (Chapter 39, "Embedded
+Cross Trigger" + Table 39-8 "CTI Connections"), not previously done in
+this investigation.** Two concrete, useful findings not in section 16's
+framing:
+
+1. **Table 39-8 explicitly wires system CTI 0 (`CORESIGHT_SOC_CTI_0`,
+   `CORESIGHT_BASE + 0x0019_0000`) to the TPIU's `FLUSHIN` (trigger output
+   6) and `TRIGIN` (trigger output 7)** — directly relevant to section
+   14's still-open "does the TPIU need an explicit trigger beyond
+   `FFCR.EnFCont`" question. CTI 0's *inputs* are ETF/ETR `FULL`/`ACQCOMP`
+   signals — components this Orbtrace design never configures (it bypasses
+   ETF/ETR/TMC entirely, straight from Funnel 2 to TPIU), so CTI 0's
+   *inputs* being unconfigured is expected, not a bug.
+2. **The per-core R5-0/R5-1 CTI (`CORESIGHT_BASE + 0x003F_8000`) is a
+   structurally different component** — its Table 39-8 connections are
+   `DBGTRIGGER`/`PMUIRQ`/`ETM EXTOUT[0:1]`/`COMMRX`/`COMMTX`/`ETM
+   TRIGGER`/`EDBGRQ`/`ETM EXTIN[0:1]`/`DBGRESTART` — nothing about
+   starting/flushing trace output. The system CTI 0, not the per-core CTI,
+   is the one architecturally tied to the TPIU.
+
+**Read CTI 0/1/2's real register state via JTAG** (`uscale.axi` mem_ap,
+same ad hoc `read_memory`/`mww` technique as every prior register probe
+this investigation has used — pure read-only, no R5/A53 CoreSight
+examine, confirmed safe to run against a live A53 network session):
+all three are genuine, correctly-addressed CoreSight components (real
+Peripheral/Component ID signatures, `DEVTYPE=0x14` — the standard
+CoreSight "Trigger, Cross Trigger" encoding, corroborating the address
+math independent of the ID-register check already used for funnel/TPIU
+in section 13). But **`CTICONTROL=0` (globally disabled) and every
+`CTIINEN`/`CTIOUTEN` register reads `0`** on all three — no channel
+routing has ever been configured, by any part of this system (not this
+firmware, not `psu_init`, not any Xilinx default). `CTIGATE=0xF` (all 4
+channels ungated — an unremarkable reset default, not itself evidence of
+anything).
+
+**Live-tested the hypothesis directly, not just inferred it from the
+register dump.** Booted R5-0 with `orbtrace_workload` via the known-safe
+JTAG-only flow (`load_r5.tcl`, omitting `psu_init_run.tcl` — confirmed
+again this session not to disturb the A53 network). Ran `configure r5
+tpiu4 2000000` → `start`, confirmed the section 14/15 baseline reproduces
+exactly (`fifo_high_water=63` pegged, `rx_bytes=0`). Then, via a second,
+separate JTAG connection (the first `load_r5.tcl` invocation exits after
+boot, freeing the bus): unlocked CTI 0 (`LAR`), set `CTIOUTEN6=1` and
+`CTIOUTEN7=1` (channel 0 → both `FLUSHIN` and `TRIGIN`), set
+`CTICONTROL=1` (global enable), then pulsed channel 0 via `CTIAPPPULSE`
+— both a single pulse and, in case a one-shot pulse arriving after the
+FIFO was already backed up wasn't enough, a 50-pulse burst spaced ~50
+JTAG clocks apart. All writes genuinely stuck (read back what was
+written, confirming CTI 0 is real and controllable). **Result: no change
+whatsoever.** `rx_bytes` stayed exactly `0` and `fifo_high_water` stayed
+pegged at exactly `63` before, between, and after every pulse attempt —
+confirmed via a real TCP round-trip each time (`orbtrace stats`'s
+`sync_loss`/`rx_bytes`/etc. are decoded live from each response, not
+client-cached — checked the model's own wire-decode code to be sure
+before trusting a negative result).
+
+**Conclusion: the CTI 0 → TPIU FLUSHIN/TRIGIN trigger, at least with this
+channel/output mapping, is not the missing piece.** This doesn't prove
+CTI involvement is impossible (a different channel, a different pulse
+timing relative to ETM start, or a requirement this investigation hasn't
+found without the SoC-400 TRM could still be real), but a direct,
+repeated, real-hardware test of the most natural reading of Table 39-8's
+own wiring diagram produced a clean negative — worth not re-trying the
+same shape of fix again without new information.
+
+**One unexplained anomaly noticed, not chased further this session:**
+`sync_loss` read back bit-for-bit identical (`562425449`) across every
+`stats` call this session, including across a `stop`/`start` cycle —
+contradicting section 12/14's description of it "climbing into the
+hundreds of millions" continuously. Confirmed this isn't a CLI-side
+caching artifact (real TCP round-trip, decoded fresh each time). Could be
+a saturated/latched sub-counter within the `tpiu_sync_loss +
+nrz_malformed + manchester_malformed` sum, or something genuinely
+different about this session's exact state — not resolved, flagged for
+whoever picks this up next. Doesn't undermine the CTI test's negative
+result: `rx_bytes` and `fifo_high_water` (the two metrics section 14
+already established as the trustworthy ones, specifically because
+`sync_loss` is noisy/misleading in TPIU4 mode) were unambiguous and
+consistent throughout.
+
+**Session end state:** no firmware/code changes — every action this
+session was either a flash-time tooling choice (same production
+bitstream + its own `psu_init.tcl`, both cached) or a live JTAG register
+probe (CTI 0 unlock/configure/pulse — read-only intent, no persistent
+hardware state; a CTI's enable bits don't survive a power cycle or
+reflash regardless). Board left flashed with the production Orbtrace
+bitstream + `a53_app`; R5-0 left running `orbtrace_workload` harmlessly
+(same JTAG-only boot as every prior session, no `psu_init_run.tcl` side
+effects); `orbtrace info` confirmed responsive. No destructive hardware
+state left behind.
+
 ## Next steps for a future session
 
-1. **Cheapest, do first:** the CTI hypothesis (section 16, item 1) is
-   concrete and checkable without another Vivado rebuild — read the CTI
-   components' registers via JTAG (Figure 39-8 gives their addresses:
-   `CTI 0/1/2` at `CORESIGHT_BASE + 0x0019_0000`/`0x001A_0000`/`0x001B_0000`)
-   to see their current state, and check whether UG1085 or DDI0500J's own
-   CTI-adjacent sections (not yet read closely this investigation) describe
-   a required trigger sequence. If a CTI trigger genuinely is required,
-   implementing it is real, scoped firmware work in `coresight::select()`/
-   `enable_trace()`, not another guess-and-check cycle.
-2. The diagnostic ILA bitstream is still cached
-   (`bazel-out/orbtrace-vivado-ps-etm-ila-debug`) — if the CTI check (item
-   1) doesn't resolve it, re-arming it (no rebuild needed, `PROBES.FILE`
-   + `refresh_hw_device` + `run_hw_ila`, see section 16's tooling notes)
-   with different trigger conditions or against the A53-1 target instead
-   of R5-0 (ruling in/out something RPU-specific vs. a structural gap
-   affecting both targets) is cheaper than a fresh build.
+1. **The CTI hypothesis (section 16's leading candidate) is now tested
+   and ruled out** for the specific channel/output mapping tried (section
+   17) — don't re-attempt the same fix without new information. The
+   remaining open question from section 16 (why no genuine ATB traffic
+   ever leaves the ETM/funnel chain, despite every register reading
+   "should be tracing") is still unresolved.
+2. **Cheapest remaining check:** the diagnostic ILA bitstream is still
+   cached (`bazel-out/orbtrace-vivado-ps-etm-ila-debug`) — re-arm it (no
+   rebuild needed, `PROBES.FILE` + `refresh_hw_device` + `run_hw_ila`, see
+   section 16's tooling notes) while live-pulsing CTI 0 (section 17's
+   exact sequence) *during* an active ILA capture, to see directly whether
+   the raw `dbg_trace_byte` pattern changes at all (even partially, even
+   without achieving TPIU demux sync) — a strictly more informative test
+   than `rx_bytes`/`fifo_high_water` alone, since it doesn't depend on the
+   demux's sync detection succeeding to show *some* effect.
 3. Get the real **Arm CoreSight SoC-400 Technical Reference Manual**
    (UG1085's own Ref 39 citation) — not in the private archive; check
-   there first before searching further afield. Now specifically targeted
-   at: does the funnel/ETM path on this SoC require a CTI-triggered start,
-   and if so, the exact register sequence.
+   there first before searching further afield. Still the authoritative
+   source for exact funnel/TPIU ATB-handshake behavior beyond the simple
+   port-select bitmask this investigation has already confirmed working.
 4. Once `rx_bytes` moves, mirror `M3_TRACE_VERIFICATION_PLAN.md`'s Phase
    E/F methodology exactly: confirm real content recovery against
    `applications/orbtrace/firmware/rpu`'s known-reproducible `Workload`
