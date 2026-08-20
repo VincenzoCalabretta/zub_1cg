@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 (continued further) — R5-0 genuinely boots and runs ThreadX (real, repeated UART evidence). The ThreadX tick bug from section 20 is now precisely characterized but not yet root-caused: `IRQHandler()` is genuinely, repeatedly entered by a real ARM IRQ exception at the TTC's own ~100 Hz cadence (proven via an unconditional entry counter), but `GICC_IAR` reads the architectural spurious sentinel (`0x3FF`) on literally every entry, and every other GIC structure checked (CPU interface `RPR`, TTC0's own distributor pending/active bits, the "Legacy IRQ from PL" PPI's pending/active bits) agrees nothing is outstanding. A real, repeated IRQ exception with no GIC-visible cause. Leading unconfirmed hypothesis: stale CoreSight debug-domain state from R5-0's own persistently-failing (`JTAG-DP STICKY ERROR`) examine attempts, accumulated across many soft-resets without a power cycle. An ETM tracing a CPU stuck in a tiny idle spin loop (which is what happens once this bug stalls a workload thread) would explain the low-entropy, tightly-periodic byte patterns sections 16/19 captured — the CoreSight/funnel/TPIU wiring itself may have been fine all along.** See sections 20-21 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 (continued further still) — R5-0 genuinely boots and runs ThreadX (real, repeated UART evidence). A real power cycle (not another JTAG soft-reset) ruled out section 21's leading hypothesis: both the CoreSight-examine `JTAG-DP STICKY ERROR` and the "IRQHandler() fires but GICC_IAR always reads spurious" symptom reproduce identically from a genuinely cold boot. Checked ThreadX's real vendored Cortex-R5/GNU port source: it doesn't touch GICC_IAR itself, ruling out a double-consuming-read theory. Added GICC_HPPIR (non-consuming) as a cross-check — agrees with IAR every time. Newest, most important finding: TTC0's own interval-interrupt status bit (`TTC_ISR`) never latches at all across a 20ms external JTAG-readback window, despite being enabled and the counter genuinely running — strong evidence TTC0 was likely never the actual source of these IRQ exceptions in the first place, an assumption this whole sub-investigation had been making implicitly. What's really generating the exceptions is open again. CoreSight/funnel/TPIU wiring itself is still believed fine — the idle-pattern captures are still best explained by *some* stalled/spinning CPU state, just not confirmed to be caused by TTC0 specifically anymore.** See sections 20-22 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -1493,33 +1493,138 @@ final instrumented `hello_world` build — harmless, but per the
 established convention, treat R5-0's state as unknown/unverified at the
 start of a future session.
 
+## 22. Phase 6 continued — real power cycle rules out the leading hypothesis, and a deeper check finds TTC0 was likely never the real IRQ source at all (2026-08-20, continued further still)
+
+The user physically power-cycled the board (unplug/replug, not another
+JTAG soft-reset) specifically to test section 21's leading hypothesis
+(stale CoreSight debug-domain state, accumulated across many
+`RST_LPD_TOP` soft-resets without a power cycle). Reflashed via the
+normal `jtag_flash.sh` flow, pairing the known-good production bitstream
+(`bazel-out/orbtrace-vivado-m3-10mhz-r4/zub_orbtrace.bit`) with *that
+build's own* `psu_init.tcl` (section 14's standing rule) and a freshly
+rebuilt `a53_app` (current HEAD, includes this session's `timer.c`
+instrumentation — irrelevant to A53 itself, just picked up incidentally
+by the rebuild). `orbtrace info` confirmed responsive immediately after.
+
+**Result: the hypothesis is wrong. Both symptoms reproduce identically
+from a genuine cold boot.** `load_r5.tcl` took "Path A: fresh reset" this
+time (confirms this really was a cold boot, not a soft-reset masquerading
+as one — `RST_LPD_TOP` read `0x547` before any write, matching a true
+power-on state, not the "already running" state Path B handles).
+CoreSight examine **still** failed with the exact same `JTAG-DP STICKY
+ERROR`, immediately, on the very first attempt after power-on. The IRQ
+diagnostics from section 21 (`g_irq_entries`, `g_irq_last_intid`, `RPR`,
+TTC0/PPI pending+active bits) reproduced bit-for-bit: entries climbing at
+the same steady rate, `intid` and `RPR` idle/spurious every time, all
+pending/active bits `0` every time. **This rules out "stale JTAG/debug
+state accumulated across soft-resets" as the cause of either symptom** —
+whatever this is, it's a deterministic property of this exact hardware/
+firmware/tooling combination, reproducible from a genuinely cold boot,
+not an artifact of this investigation's own repeated JTAG sessions.
+
+**Checked ThreadX's own vendored port source directly, rather than
+continuing to guess.** Located the real `tx_thread_context_save.S` for
+`ports/cortex_r5/gnu` (Eclipse ThreadX v6.4.3.202503_rel, the version
+this project's `MODULE.bazel` pins, fetched into Bazel's external repo
+cache) and read it in full: it does **not** touch `GICC_IAR` or any GIC
+register at all — pure generic register/stack-pointer save logic,
+dispatching to `__tx_irq_processing_return` afterward. **This rules out
+the "ThreadX's own port already consumed the interrupt via an earlier
+IAR read, and `IRQHandler()`'s own read is a second, necessarily-spurious
+read" theory** that had been an open possibility since section 20 — there
+is no earlier read to have consumed anything.
+
+**Added one more diagnostic, `GICC_HPPIR` (Highest Priority Pending
+Interrupt Register, CPU-interface offset `0x018`) — architecturally a
+*non-consuming* read, unlike `IAR`.** Read it first, before `IAR`, on
+every entry. **Result: `HPPIR` reads the same spurious `0x3FF` as `IAR`,
+every single time.** This rules out an `IAR`-specific read anomaly (some
+GIC implementations have known erratum around `IAR` under particular
+conditions) — the distributor's live, side-effect-free view agrees with
+the consuming read. Every angle this investigation can reach from
+software agrees: at the moment of exception entry, nothing is
+GIC-distributor-pending for this CPU.
+
+**The one genuinely new, decisive finding this session: TTC0's own
+interval-interrupt status bit never sets at all — checked directly via
+external JTAG readback of `TTC_ISR`, independent of anything the R5 core
+itself does.** `TTC_ISR` (`0xFF11_0054`, read-to-clear) read `0x0` on a
+first read, `0x0` again 5ms later, and **still `0x0` 20ms later** — a
+window comfortably longer than the interval period implied by
+`TTC_COUNT_VAL`'s own state at the time (`0x7D2B` = 32043, well under
+half of the 62500-count interval, meaning the counter should cross zero
+and reload at least once, plausibly twice, inside that 20 ms window).
+`TTC_IER` was confirmed `0x1` (interval interrupt enabled) at the same
+moment. Per UG1085's own description of the TTC interrupt module ("the
+interrupt register takes the interrupt signals from the timer-counter
+module and stores them until the register is read" — a genuine
+level-style latch, not a narrow pulse this session's own JTAG timing
+could plausibly miss three times in a row), **a real, enabled interval
+interrupt condition should have latched and stayed latched across at
+least one of these three reads. It never did, at any point this whole
+investigation has directly checked it from outside the ISR.**
+
+**This likely means TTC0 was never actually the source of the repeated
+IRQ exceptions sections 20-21 characterized at all — an assumption this
+whole sub-investigation had been making implicitly, now directly
+contradicted.** The apparent ~100 Hz correlation between `g_irq_entries`'
+climb rate and TTC0's configured interval was never independently
+verified against a real clock reference (only eyeballed from JTAG-session
+sample spacing, which has its own, substantial, uncharacterized
+round-trip latency) — it's now the leading suspect for having been a
+coincidental or mistaken correlation, not evidence TTC0 is driving these
+exceptions. What actually *is* generating a real, repeated ARM IRQ
+exception that enters `IRQHandler()` is, as of this session, genuinely
+open again — with TTC0 specifically now a *ruled-out* candidate rather
+than the leading one.
+
+**Session end state:** one more diagnostic global added and kept
+(`g_irq_last_hppir`, plus the `GICC_HPPIR` register definition) — same
+pure-addition, no-behavior-change category as section 21's instrumentation,
+not reverted. No other firmware changes. Board: reflashed once this
+session (production bitstream + its own `psu_init.tcl` + current
+`a53_app`, following the genuine power cycle); `orbtrace info
+192.168.1.50` reconfirmed responsive at session end. R5-0 left running
+the final instrumented `hello_world` build (harmless JTAG-only boot) —
+per the established convention, treat R5-0's state as unknown/unverified
+at the start of a future session.
+
 ## Next steps for a future session
 
-1. **Cheapest, do first: get R5-0's own CoreSight examine to actually
-   succeed, to test hypothesis 2 above directly.** Every session
-   including this one has treated `load_r5.tcl`'s `JTAG-DP STICKY ERROR`
-   on `examine_and_run` as a benign, ignorable failure — this session's
-   findings are the first real reason to suspect it might not be. A
-   genuine power cycle (not another `RST_LPD_TOP` software reset — this
-   board has been soft-reset via JTAG across many sessions without one)
-   is the cheapest way to rule out accumulated stale debug-domain state;
-   if examine then succeeds, halting R5-0 mid-`IRQHandler()` (or setting
-   a real hardware breakpoint at its entry) would show the actual saved
-   `LR_irq`/`SPSR_irq`/mode directly, far more decisively than any more
-   memory-mapped polling from `timer.c` can. If examine still fails after
-   a real power cycle, hypothesis 2 is likely wrong and the bug is
-   probably hypothesis 1's narrower timing race — the next place to look
-   is via a real ETM/ILA capture of the CPU's own instruction stream at
-   the exact moment of exception entry (ironic, since that's the exact
-   capability Phase 6 is trying to bring up — a chicken-and-egg worth
-   noting, not a reason to avoid trying).
-2. If examine still can't be gotten working, the next cheapest angle is
-   elimination by substitution: try a *different* interrupt source
-   entirely (e.g. a GPIO or SGI, both structurally simpler than TTC0's
-   level-triggered SPI path) to see whether the same "fires but reads
-   spurious" symptom reproduces — if it's source-independent, that
-   further supports hypothesis 2 (something CPU/debug-side, not
-   TTC/GIC-config-side).
+1. **Cheapest, do first: figure out what's actually generating these IRQ
+   exceptions, now that TTC0 is ruled out.** Concrete angles, cheapest
+   first:
+   - Temporarily disable TTC0 entirely (`timer_start()`'s
+     `TTC_CNT_CNTRL = CNT_INTERVAL` step skipped, or `TTC_IER` left `0`)
+     and see whether `g_irq_entries` still climbs. If it does, that's
+     final, direct proof TTC0 was never the source, and whatever remains
+     firing is active independent of anything this BSP explicitly
+     configures — point suspicion at an always-on peripheral this BSP
+     never touches (e.g. a watchdog, or a debug-domain event, tying back
+     into section 21's still-unretired CoreSight-examine-failure
+     hypothesis, which this session's power cycle ruled out as *caused by
+     stale state* but did not rule out as *causally related* to the IRQ
+     mystery through some other mechanism).
+   - Independently verify the actual entry rate against a real clock
+     (e.g. read `entries` at the start and end of a `sleep 10` wrapped
+     around two separate short JTAG sessions, rather than trusting
+     in-script `after` delays whose real wall-clock cost was never
+     measured) — settling whether it's really ~100 Hz or something else
+     entirely would itself narrow the source list a lot.
+   - If it's confirmed independent of TTC0, the `hello_world` binary
+     could be built with everything past `main()`'s `timer_init()` call
+     stripped (never call `timer_start()`/`tx_kernel_enter()` at all,
+     just spin) to see whether `IRQHandler()` is still entered — this
+     would show whether the exceptions start only once ThreadX's
+     scheduler/IRQ-enable machinery is live, or earlier.
+2. **Get R5-0's own CoreSight examine to actually succeed** — still
+   unresolved, and no longer explicable by "stale state from repeated
+   soft-resets" (this session's power cycle ruled that out directly).
+   Worth understanding on its own terms regardless of the IRQ mystery: a
+   working halt/register-dump capability would let a future session read
+   the real `LR_irq`/`SPSR_irq`/mode at the exact moment of one of these
+   mystery exceptions, which no amount of further memory-mapped polling
+   from inside `timer.c` can substitute for.
 3. **Once the tick is confirmed genuinely advancing (heartbeat or
    equivalent moving under JTAG readback across several seconds), redo
    the ETM capture from scratch** — both the plain `configure r5 tpiu4` →

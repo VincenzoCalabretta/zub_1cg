@@ -30,6 +30,7 @@
 #define GICC_IAR            REG32(GIC_CPU_BASE + 0x00C)  /* interrupt acknowledge */
 #define GICC_EOIR           REG32(GIC_CPU_BASE + 0x010)  /* end of interrupt */
 #define GICC_RPR            REG32(GIC_CPU_BASE + 0x014)  /* running priority (diag) */
+#define GICC_HPPIR          REG32(GIC_CPU_BASE + 0x018)  /* highest pending, no side effects (diag) */
 #define GICD_ISPENDR(n)     REG32(GIC_DIST_BASE + 0x200 + (n)*4)  /* set-pending (diag) */
 #define GICD_ISACTIVER(n)   REG32(GIC_DIST_BASE + 0x300 + (n)*4)  /* active bit (diag) */
 
@@ -162,12 +163,18 @@ volatile uint32_t g_irq_ttc_active_bit;
  * the interrupt controller"). */
 volatile uint32_t g_irq_ppi_pending_word0;
 volatile uint32_t g_irq_ppi_active_word0;
+/* HPPIR has no read side effects (unlike IAR, which acknowledges/consumes),
+ * so reading it first gives the cleanest possible snapshot of what the GIC
+ * believed was pending right as this exception was taken. */
+volatile uint32_t g_irq_last_hppir;
 
 void IRQHandler(void)
 {
+    uint32_t hppir = GICC_HPPIR & 0x3FFU; /* read before IAR: no side effects */
     uint32_t intid = GICC_IAR & 0x3FFU;   /* bottom 10 bits = INTID */
 
     g_irq_entries++;
+    g_irq_last_hppir = hppir;
     g_irq_last_intid = intid;
     g_irq_last_rpr = GICC_RPR;
     g_irq_ttc_pending_bit =
