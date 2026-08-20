@@ -33,6 +33,7 @@
 #define GICC_HPPIR          REG32(GIC_CPU_BASE + 0x018)  /* highest pending, no side effects (diag) */
 #define GICD_ISPENDR(n)     REG32(GIC_DIST_BASE + 0x200 + (n)*4)  /* set-pending (diag) */
 #define GICD_ISACTIVER(n)   REG32(GIC_DIST_BASE + 0x300 + (n)*4)  /* active bit (diag) */
+#define GICD_ICFGR(n)       REG32(GIC_DIST_BASE + 0xC00 + (n)*4)  /* edge/level config, 2 bits/id, 16 ids/reg (diag) */
 
 /*
  * ─── TTC0 channel 0 register map ────────────────────────────────────────────
@@ -167,6 +168,12 @@ volatile uint32_t g_irq_ppi_active_word0;
  * so reading it first gives the cleanest possible snapshot of what the GIC
  * believed was pending right as this exception was taken. */
 volatile uint32_t g_irq_last_hppir;
+/* PS_CORESIGHT_TRACE_PLAN.md section 23: edge (1) vs level (0) sensitivity
+ * for TTC0_CH0_INTID, 2 bits per interrupt ID, 16 IDs per ICFGR word --
+ * never configured by this BSP, a candidate explanation for why the
+ * distributor/CPU-interface never shows this interrupt as pending even
+ * though it's proven causally necessary (section 23's disable test). */
+volatile uint32_t g_irq_ttc_icfgr_bits;
 
 void IRQHandler(void)
 {
@@ -183,6 +190,11 @@ void IRQHandler(void)
         (GICD_ISACTIVER(GIC_ENABLE_WORD(TTC0_CH0_INTID)) & GIC_ENABLE_BIT(TTC0_CH0_INTID)) ? 1U : 0U;
     g_irq_ppi_pending_word0 = GICD_ISPENDR(0);
     g_irq_ppi_active_word0  = GICD_ISACTIVER(0);
+    {
+        uint32_t icfgr_word = GICD_ICFGR(TTC0_CH0_INTID / 16U);
+        uint32_t shift = 2U * (TTC0_CH0_INTID % 16U);
+        g_irq_ttc_icfgr_bits = (icfgr_word >> shift) & 0x3U;
+    }
 
     if (intid == TTC0_CH0_INTID) {
         (void)TTC_ISR;               /* clear TTC interrupt flag (read-to-clear) */

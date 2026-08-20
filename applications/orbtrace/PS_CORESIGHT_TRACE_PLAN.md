@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 (continued further still) — R5-0 genuinely boots and runs ThreadX (real, repeated UART evidence). A real power cycle ruled out "stale JTAG debug state" as the cause of both the persistent CoreSight-examine `JTAG-DP STICKY ERROR` and the "IRQHandler() fires but GICC_IAR always reads spurious" symptom — both reproduce identically from a genuinely cold boot. A clean disable A/B test then proved TTC0 *is* causally necessary for the IRQ exceptions (correcting an earlier same-session over-read of the TTC_ISR-never-latches finding as "TTC0 probably isn't the source"). Net position: TTC0 demonstrably drives the exceptions, yet its own `TTC_ISR` bit, `GICC_IAR`, and `GICC_HPPIR` (one consuming, one not) all agree, every time, that nothing is pending at read time — a genuine, unresolved contradiction. Leading hypothesis: `GICD_ICFGR` (edge- vs level-sensitivity), never configured by this BSP, checkable next via the same in-ISR diagnostic-global technique. CoreSight/funnel/TPIU wiring itself is still believed fine — the idle-pattern captures are still best explained by some stalled/spinning CPU state once this tick bug stalls a thread.** See sections 20-23 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 (continued further still) — R5-0 genuinely boots and runs ThreadX (real, repeated UART evidence). A real power cycle ruled out "stale JTAG debug state" as the cause of both the persistent CoreSight-examine `JTAG-DP STICKY ERROR` and the "IRQHandler() fires but GICC_IAR always reads spurious" symptom. A clean disable A/B test proved TTC0 *is* causally necessary for the IRQ exceptions. `GICD_ICFGR` checked next — TTC0's SPI is genuinely level-sensitive (not edge), ruling out the edge-triggered-narrow-pulse theory too. Net position: TTC0 demonstrably drives the exceptions, its SPI is level-sensitive, yet its own `TTC_ISR` bit, `GICC_IAR`, `GICC_HPPIR`, and the distributor's pending/active bits all agree, every time, that nothing is outstanding — checked from essentially every angle software alone can reach, still an open contradiction. CoreSight/funnel/TPIU wiring itself is still believed fine — the idle-pattern captures are still best explained by some stalled/spinning CPU state once this tick bug stalls a thread.** See sections 20-24 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -1651,42 +1651,76 @@ already-flashed, already-verified-responsive A53); R5-0 left running the
 final (reverted-to-normal) `hello_world` build. `orbtrace info` confirmed
 responsive. No destructive hardware state left behind.
 
+## 24. Phase 6 continued — GICD_ICFGR checked, edge-triggering hypothesis ruled out too (2026-08-20, continued yet further)
+
+Ran section 23's own recommended cheapest next step immediately, same
+session: added `GICD_ICFGR(n)` (offset `0xC00 + n*4`, 2 bits per
+interrupt ID, 16 IDs per register — `n = id/16`) and a diagnostic global
+reading TTC0's specific 2-bit field (`shift = 2*(id%16)`) from inside
+`IRQHandler()`, same technique as every other GIC diagnostic this
+investigation has added. Rebuilt, reflashed, booted, read via JTAG.
+
+**Result: `ttc_icfgr_bits = 0x1` on every sample.** Per the standard
+GICv1/v2 `ICFGR` bit layout, bit `2n` is the Model bit (fixed/
+implementation bit, not meaningful for sensitivity) and bit `2n+1` is the
+actual Int_config bit (`1` = edge-triggered, `0` = level-sensitive).
+`0x1` means bit `2n+1` reads `0` — **TTC0's SPI is configured
+level-sensitive, not edge-triggered.** This directly rules out section
+23's leading hypothesis: an edge-triggered narrow-pulse explanation
+doesn't apply here.
+
+**Net position, now checked from essentially every angle software alone
+can reach:** TTC0 is causally necessary for the IRQ exceptions (section
+23's disable test), its SPI is configured level-sensitive at the
+distributor (this section), yet `TTC_ISR`, `GICC_IAR` (consuming),
+`GICC_HPPIR` (non-consuming), and the distributor's own pending/active
+bits for that exact ID all agree, every time, that nothing is
+outstanding. For a level-sensitive interrupt, "pending" at the
+distributor is architecturally just a live mirror of the raw input line
+while not Active — so this observation is logically consistent with "the
+underlying `TTC_ISR` condition itself is only ever true for a window
+narrower than any read path (CPU-internal or external JTAG) has managed
+to catch," which pushes the real question back onto **why `TTC_ISR`
+would ever self-clear at all**, given nothing in this code path reads it
+outside the dead `if (intid == 68)` branch, and UG1085's own TTC chapter
+describes it as a genuine store-until-read latch, not a pulse. That
+specific contradiction remains the crux of the mystery and is not
+resolved by anything checked so far.
+
+**Session end state:** one more diagnostic global kept
+(`g_irq_ttc_icfgr_bits`, plus the `GICD_ICFGR` register macro) — same
+pure-addition, no-behavior-change category as every prior diagnostic in
+sections 20-23. Host ELF/size tests re-verified passing. Board: no
+reflash needed (reused section 23's already-flashed, already-verified
+A53); `orbtrace info` confirmed responsive. R5-0 left running the final
+instrumented `hello_world` build. No destructive hardware state left
+behind.
+
 ## Next steps for a future session
 
-1. **Cheapest, do first: read `GICD_ICFGR` for TTC0's INTID from inside
-   `IRQHandler()`** (same diagnostic-global technique as
-   `g_irq_ttc_pending_bit`/`g_irq_last_hppir` — `ICFGR` word index is
-   `id/16` with 2 bits per interrupt, offset `0xC00 + (id/16)*4`, bits
-   `[2n+1:2n]` for `n = id%16`; UG1085 lists this register's base at
-   `0xF900_0C08` under "PL390.spi_config" — double-check that offset
-   against the code's own `0xC00`-relative formula before trusting it)
-   to test section 23's edge-vs-level hypothesis directly. If it reads as
-   edge-sensitive, that's a strong, TRM-groundable explanation; if
-   level-sensitive, the mystery deepens further and the next angle is
-   checking `TTC_ISR`'s *other* bits (match/overflow/event, not just
-   interval) in case a different TTC0 condition — not the one this BSP
-   intends to use — is the actual trigger.
-2. Also cheap: extend the disable-test methodology one step further —
-   leave `TTC_IER` enabled but leave the counter in `CNT_DIS` (currently
-   this session's `#if 0` disabled both together) to isolate whether the
-   *counter running* specifically is what matters, versus just having
-   `IER` set with a static/non-running counter register state.
-3. **Once `GICD_ICFGR` is checked, keep narrowing what's actually
-   happening** — concrete angles, cheapest first:
-   - Independently verify the actual entry rate against a real clock
-     (e.g. read `entries` at the start and end of a `sleep 10` wrapped
-     around two separate short JTAG sessions, rather than trusting
-     in-script `after` delays whose real wall-clock cost was never
-     measured) — confirming it's genuinely ~100 Hz (matching TTC0's own
-     configured interval, now that TTC0 is confirmed causally involved)
-     versus something else would itself be informative.
-   - Check `TTC_ISR`'s other bits (match 1/2, overflow, event) in case a
-     *different* TTC0 condition than the interval interrupt this BSP
-     intends to use is the actual, real trigger — e.g. if the counter is
-     genuinely running in increment mode with `DEC` unset (see
-     `ttc0_init()` — `TTC_CNT_CNTRL = CNT_DIS` only sets `DIS`, `DEC` is
-     never explicitly set, so confirm which direction the counter is
-     really running in) and some other bit is what's actually firing.
+1. **Cheapest, do first: extend the disable-test methodology to isolate
+   TTC_IER from the running counter.** Section 23's disable test turned
+   off both `TTC_IER` and `TTC_CNT_CNTRL`'s interval-enable together;
+   leave `TTC_IER` enabled but leave the counter in `CNT_DIS` (static, not
+   running) to see whether entries still occur — this would show whether
+   merely having the interrupt-enable bit set (regardless of whether the
+   counter ever actually reaches its interval) is enough to trigger
+   something, versus needing a genuine counter-reaches-zero event.
+2. Check `TTC_ISR`'s other bits (match 1/2, overflow, event — not just
+   the interval bit this BSP intends to use) in case a *different* TTC0
+   condition is the actual real trigger — e.g. confirm which direction
+   the counter genuinely runs in (`ttc0_init()`'s `TTC_CNT_CNTRL =
+   CNT_DIS` only ever sets the `DIS` bit; `DEC` is never explicitly set,
+   so the counter may be running in increment mode despite this BSP's own
+   comments assuming decrement) and whether an overflow-type condition
+   (not interval) is what's really firing.
+3. Independently verify the actual entry rate against a real clock (e.g.
+   read `entries` at the start and end of a `sleep 10` wrapped around two
+   separate short JTAG sessions, rather than trusting in-script `after`
+   delays whose real wall-clock cost was never measured) — confirming
+   it's genuinely ~100 Hz would itself be informative, now that TTC0 is
+   confirmed causally involved (section 23) but every register-level
+   explanation checked so far (sections 20-24) has come back clean.
 4. **Get R5-0's own CoreSight examine to actually succeed** — still
    unresolved, and no longer explicable by "stale state from repeated
    soft-resets" (this session's power cycle ruled that out directly).
