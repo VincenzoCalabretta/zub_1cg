@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 (continued yet further still) — R5-0 genuinely boots and runs ThreadX (real, repeated UART evidence). A real power cycle ruled out "stale JTAG debug state." A clean disable A/B test proved TTC0 *is* causally necessary for the IRQ exceptions; `GICD_ICFGR` confirmed its SPI is level-sensitive, ruling out edge-triggered-narrow-pulse. A follow-up A/B test (IER enabled, counter statically disabled) proved IER alone is insufficient — the counter must genuinely be running. `TTC_ISR`/`TTC_COUNT_VAL` now read from *inside* `IRQHandler()` itself (earliest possible vantage point, not slow external JTAG): `TTC_ISR` still reads `0` every time, `TTC_COUNT_VAL` reads an identical small constant (13) every time. A wall-clock-bracketed measurement confirms the entry rate is genuinely ~105 Hz, not a sampling artifact. Four specific, TRM-motivated hypotheses for the persistent CoreSight-examine `JTAG-DP STICKY ERROR` (JTAG clock speed, LPD debug clock gating, RPU debug-logic reset, AP index/type) have all been tried and ruled out; that failure remains unexplained. Net position: a real, counter-driven hardware event reproducibly and immediately fires a genuine ARM IRQ into `IRQHandler()`, yet every status register this investigation can reach — including an in-ISR `TTC_ISR` read — agrees, every time, that nothing is outstanding. CoreSight/funnel/TPIU wiring itself is still believed fine — the idle-pattern captures are still best explained by some stalled/spinning CPU state once this tick bug stalls a thread.** See sections 20-26 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **MAJOR ADVANCE, 2026-08-20 (continued still further) — the CoreSight/funnel/TPIU pipeline is now confirmed structurally correct end-to-end for the first time: real ETM trace content reaches the host (`rx_bytes=201826785`, 116 MB in 8s from a clean boot with the ordinary `configure`/`start`/`capture` flow). Root cause, found using the newly-obtained Arm CoreSight SoC-400 TRM: the TPIU's `FFCR.EnFCont` bit was never actually latching (a documented `FtStopped`-HIGH precondition this investigation never knew about), so formatting was never really active despite registers reading back as configured — explaining every prior "real bytes toggle, nothing framed arrives" symptom since section 12. Fixed and committed in `firmware/a53/src/lib.rs` (`enable_tpiu_formatter()`, called at the end of `enable_trace()` — ordering matters: the fix only works once the ETM already has real ATB traffic flowing, confirmed by a real hardware A/B test). Remaining low content-diversity (~99.7% three byte values) is now attributed to the separate, already-tracked R5 ThreadX tick-stall bug (sections 20-26), not to CoreSight/TPIU wiring — that bug is the one remaining blocker before a real, high-diversity capture is possible.** See section 27 for the fix; sections 20-26 for the still-open, now-decoupled tick-stall bug |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -1934,6 +1934,159 @@ and after this session's R5 JTAG probing. R5-0 left running the same
 `hello_world` build section 25 ended with. No destructive hardware state
 left behind.
 
+## 27. Phase 6 — the real fix: `rx_bytes` moves for the first time, using the newly-obtained Arm CoreSight SoC-400 TRM (2026-08-20, continued still further)
+
+The user obtained the real, missing **Arm CoreSight SoC-400 Technical
+Reference Manual** (`100536_0302_09_en`, Arm's Ref 39 that UG1085 has cited
+throughout this document since section 13) and added it to the private
+reference archive. Ran it through `internal/docs_tool` (see that
+repository's own `regenerate_docs.sh`, added this session): 418 pages,
+465 register tables extracted, no missing-text-layer warning — a real,
+complete extraction, not a partial/OCR fallback.
+
+**Read the TPIU chapter (4.7) end to end for the first time against this
+project's actual open questions, not generic ETMv4/TPIU material.** Two
+findings, both decisive:
+
+1. **The TPIU register map is smaller than what this project's code has
+   been assuming.** `4.7.1 TPIU register summary` (Table 4-114) lists the
+   real, complete offset list for this exact TPIU. `SPPR` — a register
+   this investigation's section 13 live-probed at offset `0x0F0`,
+   "reused from `sdk/bsp/m3/itm.h`'s already-hardware-proven M3 TPIU
+   layout" under the assumption the M3's own (different, DesignStart-local)
+   TPIU macrocell shared a register layout with this PS SoC-400 TPIU —
+   **does not exist in this TPIU's real register map at all** (the
+   summary table jumps straight from `0x108 Trigger_multiplier` to
+   `0x200 Supported_test_pattern_modes`). That earlier `SPPR` probe was
+   never committed to firmware (section 13 already flagged it as
+   unconfirmed), so nothing needs reverting — just a confirmed dead end,
+   worth remembering so a future session doesn't reach for that offset
+   again.
+2. **`0x308 FSCR` (Formatter Synchronization Counter Register, reset
+   `0x00000040`) — a register this investigation had never read or
+   written at all, in any session.** Its own text: "If the formatter is
+   configured for continuous mode, full and half-word sync frames are
+   inserted during normal operation... The default is set up for a
+   synchronization packet every 1024 bytes." This directly answers
+   section 14's original open question ("does the TPIU need an
+   additional trigger/flush beyond `FFCR.EnFCont` to emit a Full Sync
+   Packet") — no, `FSCR` already has a sane default and needs no
+   firmware write, **provided continuous mode is genuinely, functionally
+   active**, which section 14 never actually achieved (see below).
+
+**The actual root cause, found in `4.7.11 Formatter and Flush Control
+Register, FFCR`:** `EnFCont` (bit 1, "continuous formatting enabled") —
+the exact bit section 13/14 tried writing directly via `mww FFCR 0x2` —
+carries a documented precondition never previously known to this
+investigation: *"This bit can only be changed when `FtStopped` is HIGH"*
+(`FFSR` bit 1). `FFSR` (`0x300`, read-only) resets to `0x00000000` —
+`FtStopped=0` at reset. **Section 13/14's raw `FFCR=0x2` write was
+attempted while `FtStopped` was still 0, silently violating this
+precondition** — the register's raw bit storage still accepted and
+echoed the write (explaining why it "stuck" on readback), but the
+formatter's internal state machine never actually latched continuous
+mode, so no real framing/sync ever happened. This is why sections 14-19's
+entire "does the TPIU need some additional trigger beyond `FFCR.EnFCont`"
+line of investigation (SYNCDELAY, CTI pulses, ILA captures) kept coming
+back with real toggling bytes on the wire but zero recovered content:
+**the formatter was never actually in continuous mode at all**, the whole
+time.
+
+**Confirmed live on real hardware, then implemented in firmware, then
+reconfirmed from a clean flash.** `FFCR.StopFl` (bit 12, "stop after
+completion of a flush") plus `FFCR.FOnMan` (bit 6, "initiate a manual
+flush," self-clearing) is the TRM's own documented two-write procedure
+(4.7.11's own text) for driving a stop-on-flush-completion sequence:
+
+- Live JTAG readback before touching anything: `FFSR=0x00000004`
+  (`TCPresent=1`, `FtStopped=0`), `FFCR=0x00000000` (bypass mode — i.e.
+  **formatting had never been turned on at all**, this whole
+  investigation, exactly matching every prior "real bytes toggle on the
+  wire but nothing framed ever arrives" symptom).
+- `mww FFCR 0x1000` (`StopFl`) → `FFSR` still `0x4` (nothing to flush
+  yet).
+- `mww FFCR 0x1040` (`StopFl | FOnMan`) → `FFSR` became `0x00000006`
+  (**`FtStopped=1`**) — the documented procedure worked exactly as
+  written.
+- `mww FFCR 0x2` (`EnFCont`) now that the precondition was met → stuck
+  (`FFCR` read back `0x2`) and `FFSR` returned to `0x4` on its own (the
+  formatter resumed, now genuinely in continuous mode).
+- `orbtrace stats` immediately after: `rx_bytes=22` — **nonzero for the
+  first time in this entire multi-week investigation.** A follow-up real
+  `orbtrace capture` over 8 seconds produced a 115 MB file,
+  `rx_bytes=195808453` and climbing. A 2,000,000-byte sample showed 117
+  distinct byte values (vs. section 16's flat two-value idle pattern) —
+  real structural content, not another idle signature.
+
+**Implemented as real, tested, committed firmware** (`firmware/a53/src/lib.rs`'s
+`coresight` module): added `TPIU_FFSR`/`TPIU_FFCR` offset constants and
+`FFCR_STOP_ON_FLUSH`/`FFCR_MANUAL_FLUSH`/`FFCR_ENFCONT` bit constants,
+plus a new `enable_tpiu_formatter()` function performing the exact
+three-write sequence confirmed above.
+
+**A second real-hardware finding, not obvious from the TRM text alone:
+ordering relative to the ETM's own start matters, and the two orderings
+are not equivalent.** First implementation attempt called
+`enable_tpiu_formatter()` from `select()` (before `enable_trace()` ever
+starts the ETM — i.e., against a TPIU with no real ATB traffic flowing
+yet). Rebuilt, reflashed, retested from a clean boot: `FFCR`/`FFSR` read
+back exactly as intended (`FFCR=0x2`, `FFSR=0x4`) but a real 8-second
+capture produced **zero bytes** — the identical "looks correctly
+configured, produces nothing" symptom this whole investigation kept
+hitting. Re-running `configure` a second time *while the ETM was already
+actively tracing* (no code change, just calling the same command again
+against already-running hardware) immediately produced
+`rx_bytes=101646995`. This isolates the real requirement precisely:
+**the stop-on-flush-then-`EnFCont` sequence must run against a TPIU that
+already has genuine ATB traffic flowing through it** — running it against
+an idle/silent ATB path leaves the formatter registers reading back
+exactly as configured but never produces real framed output, matching
+every earlier session's confusing "the write stuck but nothing changed"
+result. Moved `enable_tpiu_formatter()`'s call site from `select()` to
+the *end* of `enable_trace()`, immediately after `TRCPRGCTLR = PRGCTLR_EN`
+(the ETM's own start-tracing write) — rebuilt, reflashed, and confirmed
+end-to-end from a fully clean boot with a single, ordinary
+`configure` → `start` → `capture` sequence (no double-call workaround):
+**116 MB captured in 8 seconds, `rx_bytes=201826785`.** Two host unit
+tests updated/added (`coresight_routes_r5_and_a53_1_through_distinct_funnels`
+now asserts `select()` does *not* touch the TPIU at all;
+`enable_trace_starts_the_selected_etm_with_a_unique_trace_id` asserts the
+three FFCR writes appear immediately after `TRCPRGCTLR=PRGCTLR_EN`, not
+before). `bazel test --config=host
+//applications/orbtrace/firmware/a53:control_firmware_test` passes; real
+aarch64 cross-build (`--config=apu`) succeeds.
+
+**Content quality check: this is a structural CoreSight/TPIU fix, not a
+content-quality fix, and the byte-value distribution says so consistently.**
+The final, clean-boot capture's 2,000,000-byte sample: 84 distinct values,
+but still `0xFF`/`0xFB`/`0xDF` at 74.9%/12.4%/12.4% (99.7% combined) — the
+same dominant three-value signature as the very first post-fix capture.
+This is exactly consistent with sections 20-26's independently-established,
+still-open ThreadX tick-stall bug: the ETM is now genuinely, correctly
+framing and transmitting real trace content, but `orbtrace_workload`'s
+single R5 thread is still almost certainly stuck spinning in ThreadX's
+idle scheduler loop (tick never advances) for the overwhelming majority
+of any multi-second capture window, so a real trace of a real but
+tiny, tightly-repetitive loop is exactly what should be expected. **This
+session's fix and the tick-stall bug are two independent, now-decoupled
+problems** — the CoreSight/TPIU pipeline this document spent sections
+12-26 on is now confirmed structurally correct end-to-end; the remaining
+low content diversity is fully attributable to the separate, already
+partially-understood R5 bug in sections 20-26, not to anything
+CoreSight-side.
+
+**Committed vs. scratch:** `firmware/a53/src/lib.rs`'s new TPIU formatter
+code and updated tests are committed, real source changes. Nothing left
+uncommitted. Board: reflashed twice this session (first with the
+`select()`-based attempt to test the ordering hypothesis, discovered
+wrong; then with the corrected `enable_trace()`-based version), both
+times with the production bitstream (`bazel-out/orbtrace-vivado-m3-10mhz-r4`)
+paired with its own `psu_init.tcl` (section 14's standing rule). Final
+state: A53 running the corrected, committed fix; R5-0 running
+`orbtrace_workload` via the known-safe JTAG-only boot; `orbtrace info`
+confirmed responsive. This is now the new normal/expected state for a
+future session to build on, not something to revert.
+
 ## Next steps for a future session
 
 1. **Superseded, resolved 2026-08-20 (section 25) — kept for history.**
@@ -1970,36 +2123,70 @@ left behind.
    `LR_irq`/`SPSR_irq`/mode at the exact moment of one of these mystery
    exceptions, which no amount of further memory-mapped polling from
    inside `timer.c` can substitute for.
-5. **Once the tick is confirmed genuinely advancing (heartbeat or
-   equivalent moving under JTAG readback across several seconds), redo
-   the ETM capture from scratch** — both the plain `configure r5 tpiu4` →
-   `start` → `capture` sequence (section 14's baseline) and, if that
-   alone doesn't move `rx_bytes`, the combined ILA-while-pulsing-CTI-0
-   test (tooling already proven end-to-end in section 19: `hw_server` is
-   a real `flake.nix` devShell tool, Vivado Hardware Manager and `xsct`
-   share one instance concurrently, `ila_capture.tcl`/`cti_pulse.tcl`
-   shape reusable, recreate from section 19's description). Every
-   capture result from sections 12-19 should be treated as measuring an
-   idle CPU until this is redone against a workload confirmed genuinely
-   looping.
-6. Get the real **Arm CoreSight SoC-400 Technical Reference Manual**
-   (UG1085's own Ref 39 citation) — not in the private archive; check
-   there first before searching further afield. Still the authoritative
-   source for exact funnel/TPIU ATB-handshake behavior beyond the simple
-   port-select bitmask this investigation has already confirmed working
-   — worth having regardless of how item 1 resolves.
-7. Once `rx_bytes` moves, mirror `M3_TRACE_VERIFICATION_PLAN.md`'s Phase
-   E/F methodology exactly: confirm real content recovery against
-   `applications/orbtrace/firmware/rpu`'s known-reproducible `Workload`
-   sequence before trusting anything downstream (this project has been
-   burned before by declaring victory on `rx_bytes > 0` alone — see that
-   document's own Phase E cautionary history).
-8. Before investing further in Phase 6-8's ambition level, it's worth
-   doing the real UG1085/Cortex-A53 TRM check flagged in section 3, point
-   5 — if this silicon's ETM genuinely has address/data comparators or an
-   ETR path, that changes how ambitious those phases are worth being from
-   the start.
-9. Everything from Phase 6 onward is new engineering, not just wiring —
-   size it accordingly before starting, the same way
-   `M3_TRACE_VERIFICATION_PLAN.md` Phase H sized the ETM-on-M3 path
-   before recommending against starting it without a clear bandwidth case.
+5. **Resolved 2026-08-20 (section 27) — kept for history, but see the
+   important caveat below.** ~~Once the tick is confirmed genuinely
+   advancing, redo the ETM capture from scratch~~ — partially superseded:
+   `rx_bytes` now moves (a real, structural CoreSight/TPIU fix, not
+   dependent on the tick bug — see section 27), so a real capture already
+   works today even with the tick bug unfixed. **What's still true from
+   this item's original framing**: every capture's *content* should still
+   be treated as measuring a mostly-idle CPU until the tick-stall bug
+   (sections 20-26) is separately fixed — the 116 MB/8s capture in
+   section 27 is real, correctly-framed trace data, but ~99.7% of its
+   sampled bytes are still the same three-value idle signature sections
+   16/19 identified, consistent with the R5 thread stuck spinning for
+   almost the entire capture window.
+6. **Resolved 2026-08-20 — the user obtained the real Arm CoreSight
+   SoC-400 TRM and it directly found the section 27 fix.** No longer
+   needed.
+7. **Now the top priority, cheapest next step.** Mirror
+   `M3_TRACE_VERIFICATION_PLAN.md`'s Phase E/F methodology: confirm real
+   content recovery against `applications/orbtrace/firmware/rpu`'s
+   known-reproducible `Workload` sequence before trusting anything
+   downstream (this project has been burned before by declaring victory
+   on `rx_bytes > 0` alone — see that document's own Phase E cautionary
+   history, and note section 27's own capture is *real* framed CoreSight
+   data now, unlike every earlier `rx_bytes > 0` false start, so this
+   step is finally meaningful to attempt). Given the tick-stall bug (item
+   below), don't expect rich content yet — the goal is to confirm the
+   *decoder* can correctly parse real framed TPIU output (funnel ID
+   demux, ETMv4 packet sync) against the small amount of genuine
+   pre-tick-stall execution every capture should contain (R5-0's own
+   boot/init code, before the workload's first `tx_thread_sleep` stalls
+   it), not to recover a rich trace yet.
+8. **Fix the ThreadX tick-stall bug (sections 20-26)** — now the single
+   blocker between "real capture with a tiny sliver of genuine content"
+   and "real capture with a rich, multi-second trace." Net position from
+   section 24: TTC0 is causally necessary for the mystery IRQs, its SPI
+   is level-sensitive, yet `TTC_ISR`/`GICC_IAR`/`GICC_HPPIR`/distributor
+   pending-active bits all agree nothing is outstanding, even from an
+   in-ISR read at the earliest possible vantage point (section 25). Get
+   R5-0's own CoreSight examine working (item 9 below) would materially
+   help here — a real halt/register-dump at the exact moment of one of
+   these exceptions is worth more than further memory-mapped polling.
+9. **`JTAG-DP STICKY ERROR` on R5-0 CoreSight examine: four hypotheses
+   ruled out 2026-08-20 (section 26), still unresolved.** JTAG clock
+   speed, `DBG_LPD_CTRL` (LPD debug clock gating), `RST_LPD_DBG` (RPU
+   debug-logic reset — note: this register's address was recalled from
+   memory of Xilinx BSP headers, not independently confirmed against this
+   repo's UG1085 archive; re-derive from UG1087 Register Reference if
+   revisiting), and DAP AP index/type have all been checked and are not
+   the explanation. Not yet tried: OpenOCD's own `-d3` transaction-level
+   debug tracing during `arp_examine`, to see exactly which step of the
+   ROM-table walk first returns the sticky error. **Now that the real
+   SoC-400 TRM is available, also worth checking its own JTAG-DP/APB-AP
+   chapters (this session only read the Funnel/TPIU chapters) for
+   anything specific to APB-AP examine sequences** — not yet done.
+10. Before investing further in Phase 7-8's ambition level, it's worth
+    doing the real DDI0500J Cortex-A53 TRM check flagged in section 3,
+    point 5 — if this silicon's ETM genuinely has address/data
+    comparators or an ETR path, that changes how ambitious those phases
+    are worth being from the start.
+11. Everything from Phase 7 onward is new engineering, not just wiring —
+    size it accordingly before starting, the same way
+    `M3_TRACE_VERIFICATION_PLAN.md` Phase H sized the ETM-on-M3 path
+    before recommending against starting it without a clear bandwidth
+    case. Phase 6 itself, as of section 27, is close to done: the
+    structural pipeline is confirmed; only the tick-stall bug (item 8)
+    and a real content-recovery check (item 7) remain before it can be
+    marked DONE outright.

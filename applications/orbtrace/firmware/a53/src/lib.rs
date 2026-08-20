@@ -853,6 +853,7 @@ mod tests {
             r5.0[7],
             (coresight::FUNNEL_SYSTEM + coresight::FUNNEL_CONTROL, 1)
         );
+        assert_eq!(r5.0.len(), 8, "select() must not touch the TPIU formatter -- that only works once the ETM is already tracing, see enable_trace()");
 
         let mut a53 = CoreSightWrites(Vec::new());
         // SAFETY: this test records accesses without touching MMIO.
@@ -912,12 +913,26 @@ mod tests {
                 .map(|(_, v)| *v)
                 .collect();
         assert_eq!(prgctlr, [0, coresight::PRGCTLR_EN]);
+        // The TPIU formatter sequence must run last, after PRGCTLR_EN --
+        // running it before the ETM is tracing produces a formatter that
+        // reads back as configured but never emits real framed output
+        // (confirmed on real hardware, see enable_tpiu_formatter's doc
+        // comment).
+        let prgctlr_en_index = r5
+            .0
+            .iter()
+            .position(|write| *write == (coresight::R5_0_ETM + coresight::TRCPRGCTLR, coresight::PRGCTLR_EN))
+            .unwrap();
         assert_eq!(
-            r5.0.last(),
-            Some(&(
-                coresight::R5_0_ETM + coresight::TRCPRGCTLR,
-                coresight::PRGCTLR_EN
-            ))
+            &r5.0[prgctlr_en_index + 1..],
+            [
+                (coresight::TPIU + coresight::TPIU_FFCR, coresight::FFCR_STOP_ON_FLUSH),
+                (
+                    coresight::TPIU + coresight::TPIU_FFCR,
+                    coresight::FFCR_STOP_ON_FLUSH | coresight::FFCR_MANUAL_FLUSH
+                ),
+                (coresight::TPIU + coresight::TPIU_FFCR, coresight::FFCR_ENFCONT),
+            ]
         );
 
         let mut a53 = CoreSightWrites(Vec::new());
@@ -968,6 +983,37 @@ pub mod coresight {
     pub const LAR: usize = 0xfb0;
     pub const FUNNEL_CONTROL: usize = 0x000;
 
+    // TPIU formatter registers (Arm CoreSight SoC-400 TRM, 100536_0302_09_en,
+    // section 4.7: "TPIU register summary", 4.7.10/4.7.11). PS_CORESIGHT_TRACE_PLAN.md
+    // Phase 6 root cause: this project never programmed these at all --
+    // `select()` only unlocked the TPIU's software lock (LAR), leaving FFCR at
+    // its power-on-reset value (0x0, formatting disabled / bypass mode). With
+    // no formatting active, the TPIU never framed its output at all, so
+    // `orbtrace_tpiu_demux.sv` could never find a Full Sync Packet to lock onto
+    // -- not a sync-timing problem (TRCAUXCTLR.SYNCDELAY, tried in an earlier
+    // session) or a CTI-trigger problem (tried and ruled out), just formatting
+    // never having been turned on.
+    pub const TPIU_FFSR: usize = 0x300;
+    pub const TPIU_FFCR: usize = 0x304;
+    /// FFCR bit assignments (Table 4-124). `EnFCont` (bit 1, continuous
+    /// formatting) has a documented precondition: "This bit can only be
+    /// changed when FtStopped is HIGH" (FFSR bit 1) -- and FFSR resets to
+    /// 0x0 (FtStopped LOW), so it must be driven HIGH first. `StopFl` (bit
+    /// 12) plus a manual flush (`FOnMan`, bit 6) is the TRM's own documented
+    /// two-write "stop on flush completion" procedure (section 4.7.11's own
+    /// text) for doing exactly that. Confirmed live on real hardware before
+    /// being added here: FFSR read 0x4 (FtStopped=0) at reset; writing
+    /// `FFCR_STOP_ON_FLUSH` then `FFCR_STOP_ON_FLUSH | FFCR_MANUAL_FLUSH`
+    /// took FFSR to 0x6 (FtStopped=1); writing `FFCR_ENFCONT` from there
+    /// stuck (read back 0x2) and FFSR returned to 0x4 on its own (the
+    /// formatter resumed, now in continuous mode) -- and real capture bytes
+    /// reached the host for the first time in this investigation
+    /// immediately afterward (rx_bytes went from always-0 to real,
+    /// multi-megabyte captures).
+    pub const FFCR_STOP_ON_FLUSH: u32 = 1 << 12; // StopFl
+    pub const FFCR_MANUAL_FLUSH: u32 = 1 << 6; // FOnMan, self-clearing once serviced
+    pub const FFCR_ENFCONT: u32 = 1 << 1; // EnFCont
+
     pub trait Mmio {
         unsafe fn write32(&mut self, address: usize, value: u32);
     }
@@ -985,6 +1031,30 @@ pub mod coresight {
             mmio.write32(FUNNEL_RPU + FUNNEL_CONTROL, if a53_1 { 0 } else { 1 });
             mmio.write32(FUNNEL_APU + FUNNEL_CONTROL, if a53_1 { 2 } else { 0 });
             mmio.write32(FUNNEL_SYSTEM + FUNNEL_CONTROL, if a53_1 { 2 } else { 1 });
+        }
+    }
+
+    /// Drive FFSR.FtStopped HIGH (stop-on-flush-completion, then a manual
+    /// flush) so EnFCont's write precondition is satisfied, then enable
+    /// continuous formatting -- see `FFCR_ENFCONT`'s doc comment for the
+    /// real-hardware confirmation of the sequence itself. **Must be called
+    /// after `enable_trace()` has already started the ETM (`TRCPRGCTLR.EN`
+    /// set), not from `select()` before any ATB traffic exists.** Confirmed
+    /// on real hardware the two orderings are NOT equivalent: running this
+    /// sequence against an idle/silent ATB path (called from `select()`,
+    /// before `enable_trace()`) leaves the formatter in continuous mode
+    /// (FFCR reads back correctly) but no real capture bytes ever reach the
+    /// host; re-running the identical sequence once the ETM is already
+    /// actively tracing immediately produces real, multi-megabyte captures.
+    /// The manual flush apparently needs genuine in-flight ATB data to
+    /// leave the formatter in a state that actually emits framed output,
+    /// not just an FFCR register value that reads back as intended.
+    pub unsafe fn enable_tpiu_formatter<M: Mmio>(mmio: &mut M) {
+        // SAFETY: caller guarantees the fixed CoreSight range is mapped device-nGnRE.
+        unsafe {
+            mmio.write32(TPIU + TPIU_FFCR, FFCR_STOP_ON_FLUSH);
+            mmio.write32(TPIU + TPIU_FFCR, FFCR_STOP_ON_FLUSH | FFCR_MANUAL_FLUSH);
+            mmio.write32(TPIU + TPIU_FFCR, FFCR_ENFCONT);
         }
     }
 
@@ -1080,6 +1150,12 @@ pub mod coresight {
             mmio.write32(etm + TRCVISSCTLR, 0); // no start/stop address comparators
             mmio.write32(etm + TRCVICTLR, VICTLR_ALWAYS_TRACE);
             mmio.write32(etm + TRCPRGCTLR, PRGCTLR_EN); // start tracing
+        }
+        // Must run after the ETM is already tracing -- see
+        // `enable_tpiu_formatter`'s own doc comment for why ordering matters.
+        // SAFETY: same as above.
+        unsafe {
+            enable_tpiu_formatter(mmio);
         }
     }
 }
