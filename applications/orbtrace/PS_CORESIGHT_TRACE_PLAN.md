@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 — CTI hypothesis tested live on hardware and RULED OUT via `rx_bytes`/`fifo_high_water` (section 17). A more sensitive re-test (ILA byte pattern while pulsing CTI 0) was attempted but blocked on a tooling conflict (OpenOCD vs. Vivado Hardware Manager can't share the JTAG adapter) before touching hardware — not yet completed. Real root cause of the idle-pattern output (section 16) still open.** See sections 17-18 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 — section 18's tooling blocker is fixed for good (`hw_server` now a real flake.nix devShell tool; Vivado Hardware Manager and xsct proven to share one `hw_server` instance concurrently). The combined ILA-while-pulsing-CTI-0 re-test ran for real: still zero observable change, extending section 17's negative result to raw byte-pattern granularity. But this session also found R5-0's `g_heartbeat` stuck at 0 via JTAG readback both times R5 was booted — real doubt that R5 ever reached its workload's main loop this session, which weakens confidence in the negative CTI result and is now the most urgent open item. Real root cause of the idle-pattern output (section 16) still open.** See section 19 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -1051,21 +1051,222 @@ bitstream + `a53_app`, R5-0 running `orbtrace_workload`, last confirmed
 responsive via `orbtrace info` at the end of section 17). No code
 changes. This section is scratch/tooling notes only.
 
+## 19. Phase 6 continued — combined ILA + CTI test finally run, but R5's own boot health now in doubt (2026-08-20)
+
+Picked up section 18's blocker directly: get a persistent `hw_server`
+that both Vivado Hardware Manager and `xsct` can connect to at once, so
+the CTI-0-pulse-while-ILA-armed test section 17 recommended could
+actually run.
+
+**Fixed the tooling gap for good, not just worked around it this
+session.** Section 18 found `flake.nix`'s `mkXilinxTool` wraps
+`vivado`/`xsct`/`xelab`/`xsim`/`xvlog` for the FHS sandbox but not
+`hw_server`, and that raw `~/opt/vitis/.../hw_server` isn't directly
+executable outside that sandbox (same FHS-runtime-library reason
+`vivado`/`xsct` themselves aren't). Added `hw_server = mkTool "hw_server"`
+to both the `devShells.default` tool list and its `packages` list in
+`mkDevShell` (`flake.nix`, two one-line additions, same pattern as every
+other wrapped tool) — `nix develop -c hw_server -s tcp::3121` now just
+works. Confirmed the FHS sandbox (`buildFHSEnv`/bubblewrap) does **not**
+isolate the network namespace: a `hw_server` launched this way binds
+`127.0.0.1:3121` and is reachable from plain host-namespace processes
+(`bash -c '(exec 3<>/dev/tcp/127.0.0.1/3121)'` succeeded) — this is what
+makes the whole multi-client scheme work at all.
+
+**Proved Vivado Hardware Manager and `xsct` can genuinely share one
+`hw_server` instance concurrently, not just sequentially.** Ran a
+persistent `hw_server -s tcp::3121` in the background; pointed a separate
+`xsct` process at `-url tcp:127.0.0.1:3121` and confirmed real target
+enumeration (`PS TAP`/`PMU`/`PL`/`PSU`/`RPU` with `Cortex-R5 #0
+(Running)`/`Cortex-R5 #1 (Reset)`, `APU` with `Cortex-A53 #0
+(Running)`/`Cortex-A53 #1 (Power On Reset)` — a real, live JTAG scan, not
+cached state); separately ran a Vivado batch-mode Tcl script doing
+`connect_hw_server -url localhost:3121` against the same instance and
+successfully found/armed the diagnostic build's `system_ila`. Both
+clients worked against the same `hw_server` in the same test run (`xsct`
+pulsing CTI 0 while a *separate* Vivado process re-armed and captured the
+ILA moments later) with no contention errors from either side — the
+combined test section 18 couldn't even attempt is now real, reusable
+infrastructure.
+
+**Re-ran the section 16 diagnostic bitstream build fresh** (rebuilt
+current-HEAD `a53_app` — includes every fix through section 18, notably
+`TRCAUXCTLR.SYNCDELAY` from section 15 — and reflashed
+`bazel-out/orbtrace-vivado-ps-etm-ila-debug`'s cached bitstream + its own
+paired `psu_init.tcl`; `orbtrace info` confirmed responsive). Booted R5-0
+with `orbtrace_workload` via the known-safe JTAG-only flow (`load_r5.tcl`,
+omitting `psu_init_run.tcl`). Ran `configure r5 tpiu4 2000000` → `start`;
+reproduced the section 14/15/17 baseline exactly (`fifo_high_water=63`
+pegged, `rx_bytes=0`).
+
+**Ran the actual combined test — but re-scoped the synchronization
+problem section 18 was stuck on, since it turned out to not matter.**
+Section 18 was trying to figure out how to arm the ILA and pulse CTI
+*at the same instant* to catch the transition live, inside a single
+~41µs capture window (4096 samples at the 100 MHz `trace_clk`) — a hard
+synchronization problem against a JTAG-scripted pulse whose own round-trip
+latency is orders of magnitude longer than that window. Realized this
+isn't actually necessary: if CTI-gated trace start were real, pulsing it
+once should durably switch the system from "idle pattern forever" to
+"real trace forever" (or at least visibly perturb it), not require
+catching a single instant. So instead: captured a baseline ILA snapshot,
+pulsed CTI 0 (unlock LAR, `CTIOUTEN6=1`/`CTIOUTEN7=1`, `CTICONTROL=1`,
+same channel-0-to-`FLUSHIN`/`TRIGIN` mapping section 17 used, then a
+50-pulse burst on `CTIAPPPULSE` — all via `xsct mwr` through the shared
+`hw_server`, not OpenOCD), then captured a second ILA snapshot, and
+compared.
+
+Reusable scripts (session scratch, not committed — recreate from this
+description, per this document's established convention):
+- `ila_capture.tcl <outfile.csv> <label>`: `open_hw_manager`;
+  `connect_hw_server -url localhost:3121`; the same `PARAM.FREQUENCY
+  1000000` pre-`open_hw_target` fix section 16 documented; sets
+  `PROBES.FILE`/`FULL_PROBES.FILE` from the diagnostic build's
+  `debug_nets.ltx`; `refresh_hw_device`; arms on
+  `[lindex [get_hw_probes -of_objects $ila] 2]` (probe index, not name —
+  see gotcha below) `TRIGGER_COMPARE_VALUE eq1'b1`; `run_hw_ila` /
+  `wait_on_hw_ila -timeout 60`; `upload_hw_ila_data`; `write_hw_ila_data
+  -csv_file`.
+- `cti_pulse.tcl`: `connect -url tcp:127.0.0.1:3121`; `targets -set
+  -nocase -filter {name =~ "PSU"}`; unlocks CTI 0 at `CORESIGHT_BASE
+  (0xfe80_0000) + 0x0019_0000 = 0xfe99_0000` (`LAR` offset `0xFB0`,
+  `CTICONTROL` `0x000`, `CTIOUTEN6`/`CTIOUTEN7` `0x0B8`/`0x0BC`,
+  `CTIAPPPULSE` `0x01C` — the same offsets section 17 already proved
+  stick); 50× `mwr $CTIAPPPULSE 0x1` with `after 20` between pulses.
+
+**Real gotcha hit and worked around:** `get_hw_probes *dbg_trace_valid*`
+(matching section 16's own descriptive probe names) returned "No matching
+hw_probes were found" — the diagnostic build's `.ltx` doesn't carry the
+net names from `create_bd_debug.tcl`'s `connect_bd_net` calls, only
+generic `probe0_1`..`probe3_1`. Recovered the mapping by `WIDTH` instead
+(`list_property`/`get_property WIDTH`, since `NAME`/`MATCH` aren't valid
+properties on a `hw_probe` object — `list_property $p` is the reliable way
+to discover what's queryable): `probe0`=4-bit (`dbg_trace_data_raw`),
+`probe1`=8-bit (`dbg_trace_byte`), `probe2`/`probe3`=1-bit each
+(`dbg_trace_valid`/`dbg_cdc_write_ready`, order per section 16's own
+`connect_bd_net` ordering — both read identically throughout this
+session's captures so which is which didn't end up mattering for the
+result).
+
+**Result: no observable change, at a materially more sensitive
+granularity than section 17's `rx_bytes`/`fifo_high_water`.** Baseline
+capture (4096 samples, before any pulse): `probe1` (`dbg_trace_byte`)
+constant `0x11` for all 4096 samples — no variation at all, a single
+value, not even section 16's own two-value period-4 pattern. Post-pulse
+capture (immediately after the 50-pulse burst): **identical** — `probe1`
+still constant `0x11` across all 4096 samples, `probe0`/`probe2`/`probe3`
+also bit-for-bit identical to baseline. `orbtrace stats` after the pulse
+also unchanged (`rx_bytes=0`, `fifo_high_water=63`,
+`sync_loss=283907430` — the exact same `sync_loss` value as immediately
+before the pulse, corroborating section 17's own noted "`sync_loss` reads
+identical across calls" anomaly rather than section 12/14's "climbing"
+description). This extends section 17's negative CTI finding to raw
+byte-pattern granularity: whatever channel/pulse-mapping this
+investigation has tried, CTI 0 provably changes nothing observable
+anywhere in the pipeline, from PL-side raw bytes up through the TCP stats
+API.
+
+**But: a materially concerning new finding surfaced while sanity-checking
+the setup, undermining confidence in the above.** Read R5-0's
+`g_heartbeat` (ELF symbol, `nm`-resolved to `0xffff4370`, `.bss`,
+incremented by nearly every `Action` the workload dispatches — see
+`applications/rpu/orbtrace_workload/main.c`) via direct JTAG memory
+readback (`mrd -value`, through the `PSU` target — an ordinary AXI/APB
+memory read, **not** an ETM register read, so none of section 15's
+`TRCSTATR.PMSTABLE` unreliability-while-tracing caveat applies here).
+Three reads spaced 300-500ms apart, both immediately after this session's
+first R5 boot and again after a deliberate second reboot: **stuck at
+exactly `0` every time.** Cross-validated the read path itself is sound,
+not a wrong-address mistake: the same JTAG connection read
+`0xFFFF0000` (R5's OCM reset vector) as `0xe59ff018` — bit-for-bit the
+value `load_r5.tcl`'s own load step already verifies — and
+`0xFFFFFF00` (the boot-sequence reset marker) as `0x52535431`, matching
+`load_r5.tcl`'s own printed diagnostic exactly. If `g_heartbeat` were
+being read correctly and the workload were genuinely looping, it should
+have moved within any of these windows; it never did.
+
+The second reboot attempt made this worse, not better: a first JTAG
+attach attempt hit `Error: JTAG-DP STICKY ERROR`/`Invalid ACK (0) in DAP
+response` outright (a transient bus issue, recovered on retry — noted,
+not chased), and the retry that did boot printed `WARNING: UART0_SR=0x0
+TX_EMPTY not set` and read back **`UART0_CR=0 MR=0 BAUDGEN=0 BAUDDIV=0
+SR=0`** — every UART0 register zero, meaning `load_r5.tcl`'s own
+`setup_uart` step plausibly never took effect this time (contrast the
+first boot's `UART0_CR=0x00000114 MR=0x00000020 BAUDGEN=124 BAUDDIV=6
+SR=0x00000802`, which looks like a real, working configuration). A
+concurrent 15-20s UART capture across both boot attempts shows **only**
+A53's own diag-thread output — no `--- ThreadX ETM Workload`/`[TEST
+BEGIN]`/`[TEST PASS]` line ever appeared, where every prior session that
+booted this same firmware saw it immediately. Leading hypothesis,
+untested: UART0 register contention with A53's own diag thread (which
+this session's `a53_app` runs unusually UART-chatty compared to earlier
+sessions, judging by the diag log volume) — but this is speculation, not
+confirmed.
+
+**Net effect: this session's own CTI-negative result (and, by extension,
+maybe R5-0's actual liveness during *every* prior session's captures too,
+since nothing before this session ever checked `g_heartbeat` either) is
+weaker evidence than it looks.** A `0x11`-constant, non-toggling ILA
+capture with an unresponsive core behind it and a genuinely-toggling
+`0xFF`/`0xDF` capture (section 16, against a core this document's own
+text describes as "already running... from a prior session," i.e., known
+live) are not obviously testing the same thing. This doesn't retract
+section 16/17's own conclusions (still real, independently-obtained
+results against their own sessions' hardware state) but does mean this
+session's *addition* to them (the ILA-level CTI re-test) should be
+treated as inconclusive rather than confirmatory until R5's liveness is
+independently nailed down — see next steps.
+
+**Session end state:** `flake.nix`'s `hw_server` addition and this
+document's updates are the only code/doc changes, both committed. No
+firmware changes this session (the CTI pulse and heartbeat/UART reads
+were all live JTAG probes, same as section 17). Board reflashed back to
+the last known-good *production* bitstream
+(`bazel-out/orbtrace-vivado-m3-10mhz-r4`) + its own `psu_init.tcl` +
+current `a53_app`; `orbtrace info` confirmed responsive. R5-0 was left in
+whatever state the second (UART-registers-zeroed) boot attempt left it in
+— **not** reflashed/reset again after that, since the production
+bitstream reflash itself re-establishes a clean PL/A53 state independent
+of R5's JTAG-only boot path (R5 is PS hardened silicon, untouched by a PL
+bitstream reflash) — a future session should treat R5-0's state as
+unknown/unverified until it re-boots it and checks `g_heartbeat` itself,
+not assume it's still running `orbtrace_workload` correctly. No
+destructive hardware state left behind; `hw_server` process from this
+session stopped (not left running).
+
 ## Next steps for a future session
 
-1. **Cheapest, do first:** finish what section 18 started — get a
-   wrapped `hw_server` running (see section 18's concrete suggestion) so
-   Vivado Hardware Manager (ILA arm/capture) and `xsct` (CTI 0 `mwr`
-   pulse sequence, translated from section 17's OpenOCD writes) can both
-   connect to it at once, then actually run the combined
-   re-arm-ILA-while-pulsing-CTI-0 test. This is the same check section 17
-   already recommended — section 18 only got as far as identifying why
-   OpenOCD can't be the tool for the pulse half of it.
-2. **The CTI hypothesis (section 16's leading candidate) is already
-   tested and ruled out** via `rx_bytes`/`fifo_high_water` (section 17) —
-   item 1 above is specifically about getting a *more sensitive* readout
-   (raw ILA byte pattern) before fully abandoning CTI 0 as a factor, not
-   about re-trying the same coarse test.
+1. **Cheapest, do first: settle whether R5-0 genuinely reaches its
+   workload's main loop.** Section 19 found `g_heartbeat` (ELF symbol,
+   currently `0xffff4370` — re-check with `nm` if the ELF is rebuilt)
+   stuck at `0` via direct JTAG memory readback (`mrd -value`, through
+   the `PSU` target, **not** the ETM/CoreSight registers — this read path
+   has none of `TRCSTATR.PMSTABLE`'s reliability caveat from section 15)
+   across two separate boot attempts this session, and the second attempt
+   additionally showed UART0's own registers reading back all-zero
+   (`UART0_CR=0 MR=0 BAUDGEN=0 BAUDDIV=0 SR=0`) — `load_r5.tcl`'s
+   `setup_uart` step likely didn't stick, plausibly from contention with
+   A53's own concurrent, heavy UART0 diag-thread traffic on the same
+   shared line. Add a `g_heartbeat` readback (or equivalent) as a
+   standard post-boot check for R5 in general — nothing in this whole
+   investigation (including section 17's own now-doubtful negative CTI
+   result) has ever confirmed R5 reaches ThreadX/its main loop by
+   anything stronger than the boot script's own reset-marker check, which
+   only proves `reset_handler` ran, not that the workload thread started.
+   If R5 turns out not to be running, the fix is likely in `load_r5.tcl`
+   or `setup_uart`, not in anything CoreSight-specific.
+2. **Once R5 is confirmed genuinely running its workload (heartbeat
+   moving), redo the combined ILA-while-pulsing-CTI-0 test** — the
+   tooling now works end-to-end (see section 19: `hw_server` is a real
+   `flake.nix` devShell tool, Vivado Hardware Manager and `xsct` proven to
+   share one instance concurrently, `applications/orbtrace/firmware/rpu`'s
+   `ila_capture.tcl`/`cti_pulse.tcl` shape is reusable, recreate from
+   section 19's description same as every other diagnostic script in this
+   document) — but this session's own result (zero change, byte pattern
+   constant `0x11` both before and after the pulse) should be treated as
+   provisional until this is confirmed against a verified-running R5.
+   Section 17's coarser `rx_bytes`/`fifo_high_water`-based negative result
+   still stands on its own terms regardless.
 3. Get the real **Arm CoreSight SoC-400 Technical Reference Manual**
    (UG1085's own Ref 39 citation) — not in the private archive; check
    there first before searching further afield. Still the authoritative

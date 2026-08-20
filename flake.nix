@@ -103,6 +103,7 @@
           xelab = mkTool "xelab";
           xsim = mkTool "xsim";
           xsct = mkTool "xsct";
+          hw_server = mkTool "hw_server";
         in pkgs.mkShell {
           name = "zub_1cg-sdk";
           packages = [
@@ -133,6 +134,7 @@
             xelab
             xsim
             xsct
+            hw_server
           ] ++ extraPackages;
           shellHook = ''
             export ARM_GCC_BIN="${armGcc}/bin"
