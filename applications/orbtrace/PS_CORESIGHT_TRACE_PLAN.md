@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 — section 18's tooling blocker is fixed for good (`hw_server` now a real flake.nix devShell tool; Vivado Hardware Manager and xsct proven to share one `hw_server` instance concurrently). The combined ILA-while-pulsing-CTI-0 re-test ran for real: still zero observable change, extending section 17's negative result to raw byte-pattern granularity. But this session also found R5-0's `g_heartbeat` stuck at 0 via JTAG readback both times R5 was booted — real doubt that R5 ever reached its workload's main loop this session, which weakens confidence in the negative CTI result and is now the most urgent open item. Real root cause of the idle-pattern output (section 16) still open.** See section 19 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 (continued) — section 19's R5-liveness doubt is resolved, and resolving it surfaced what looks like the real root cause of every "idle pattern" capture since section 16: R5-0 genuinely boots and runs ThreadX (real, repeated UART evidence, both `hello_world` and `orbtrace_workload`), but a distinct, pre-existing bug in this RPU BSP's TTC0/GIC-driven ThreadX tick means `tx_thread_sleep()` never returns — every workload thread stalls forever in ThreadX's idle scheduler loop after its first sleep call, seconds (or less) into any run. An ETM tracing a CPU stuck in a tiny idle spin loop would produce exactly the low-entropy, tightly-periodic byte patterns sections 16/19 captured. This reframes Phase 6: the CoreSight/funnel/TPIU wiring may have been fine all along, and what needs fixing next is this ThreadX tick bug, not more funnel/TPIU register archaeology. Not yet fixed — root cause narrowed to either the GIC/TTC interrupt path or ThreadX's own Cortex-R5 port glue, not fully isolated.** See section 20 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -1234,44 +1234,211 @@ not assume it's still running `orbtrace_workload` correctly. No
 destructive hardware state left behind; `hw_server` process from this
 session stopped (not left running).
 
+## 20. Phase 6 continued — R5 liveness confirmed for real, but surfaces a distinct ThreadX-tick bug that likely explains every "idle" capture (2026-08-20, continued)
+
+Picked up section 19's own item 1 (cheapest next step: settle whether
+R5-0 genuinely reaches its workload's main loop) directly, using real
+UART evidence instead of JTAG memory readback this time — cheaper, and
+sidesteps any question about whether `mrd`/`read_memory` itself is
+trustworthy.
+
+**R5-0 boots and runs ThreadX for real — decisively confirmed, twice,
+via live UART capture, not inferred from a boot script's own diagnostics.**
+Captured `/dev/ttyUSB1` (`stty raw -echo` + `cat` to a file) across a
+fresh `openocd -f aes_zub.cfg -f load_r5.tcl` boot (JTAG-only, omitting
+`psu_init_run.tcl`, same known-safe flow as every session since section
+12) of `orbtrace_workload`: the real, live stream shows
+`--- ThreadX ETM Workload (AES-ZUB R5F) ---`, `[TEST BEGIN]
+orbtrace_workload`, `[TEST DIAG] R5-0 ETM trace workload running`,
+`[TEST PASS] orbtrace_workload` in order, cleanly interleaved with A53's
+own concurrent diagnostic chatter on the shared UART0 line (cosmetic
+interleaving only, per section 14's already-known caveat). This is the
+first time in the whole investigation this print sequence was captured
+live rather than inferred — resolves section 19's doubt outright, for
+this boot at least: R5-0 genuinely reaches `workload_entry`, the ThreadX
+thread genuinely runs.
+
+**But a repeat `g_heartbeat` JTAG readback (same technique as section 19,
+address re-confirmed via `arm-none-eabi-nm` against the exact ELF just
+booted — still `0xffff4370`, ELF unchanged) again read exactly `0`, six
+samples spaced ~700ms apart, immediately after this UART-confirmed-good
+boot.** Section 19's finding reproduces cleanly even with R5's liveness
+no longer in any doubt — so the explanation isn't "R5 might not be
+running," it's something more specific.
+
+**Root-caused (partially) via `hello_world`, not `orbtrace_workload` —
+cleaner signal, no CoreSight/ETM complexity involved at all.**
+`hello_world`'s loop is `uart_print("Hello, World!\r\n");
+tx_thread_sleep(100);` — a single self-contained liveness signal with no
+`g_heartbeat`/JTAG-readback-reliability question at all: every 1 second
+(100 ticks × 10 ms), *if the ThreadX tick is actually advancing*, another
+`"Hello, World!"` should appear on UART. Captured a full boot +
+9-second window: **`"Hello, World!"` appears in the capture exactly
+twice** — once from the unconditional print before `TEST_PASS`, once
+from the very first loop iteration (which prints *before* its own
+`tx_thread_sleep(100)` call) — and **never again**, despite the capture
+window being 9× the thread's own 1-second sleep interval. Reproduced
+identically both with the original `timer.c` and with a speculative fix
+(below) — not a one-off fluke.
+
+**This means the bug is not specific to `orbtrace_workload`, to
+CoreSight, or to anything this document's Phases 4-6 added — it's a
+latent bug in the shared RPU ThreadX BSP itself
+(`sdk/bsp/rpu/timer.c`/`startup.S`), present since Phase 3's
+`hello_world`, silently undetected until now because Phase 3's own
+"DONE" verification only ever checked for a single `[TEST PASS]` marker
+— which the very first loop iteration produces *before* the first
+blocking `tx_thread_sleep` call, regardless of whether the tick ever
+advances again afterward.** Every RPU app built on this BSP to date has
+only ever proven "the first loop iteration ran," never "the loop
+actually loops."
+
+**Investigated the TTC0/GIC path directly via JTAG, inconclusive but
+narrowing.** Read TTC0 ch0's real registers (`0xFF11_0000` range,
+externally AXI-visible, no `TRCSTATR.PMSTABLE`-style reliability caveat
+since these aren't ETM registers) repeatedly while a workload thread sat
+stalled in its first sleep:
+- `TTC_CLK_CNTRL=0x00000007`, `TTC_CNT_CNTRL=0x00000002` (`CNT_INTERVAL`
+  set, counter genuinely running — matches what `ttc0_init()`/
+  `timer_start()` write), `TTC_INTERVAL_VAL=0x0000f424` (62500, matches
+  the computed 100 Hz interval), `TTC_IER=0x00000001` (interval interrupt
+  enabled) — every register the R5 core is supposed to have configured
+  reads back exactly as programmed. **The TTC hardware itself is
+  correctly configured and counting** — `TTC_COUNT_VAL` sampled
+  repeatedly showed large, scattered values consistent with a real,
+  continuously reloading down-counter (not stuck).
+- `TTC_ISR` (`0xFF11_0054`, read-to-clear) read `0x00000000` across five
+  consecutive JTAG reads, spaced widely enough apart (given real JTAG
+  round-trip latency) that the counter almost certainly reloaded — and
+  therefore should have re-latched an interval-interrupt bit — more than
+  once between samples. Getting a clean `0` every time is genuinely
+  ambiguous: it's consistent with *either* "the interrupt condition never
+  latches at all" (a TTC/GIC configuration bug) *or* "something is
+  reading and clearing it faster than this session's JTAG round-trip can
+  catch" — which, if true, would mean the interrupt is actually firing
+  and being serviced, pointing the bug instead at ThreadX's own
+  tick-to-thread-wake logic (`_tx_timer_interrupt`, or the
+  `_tx_thread_context_save`/`__tx_irq_processing_return`/
+  `_tx_thread_context_restore` assembly glue this BSP's `startup.S`
+  documents) rather than at the interrupt controller path at all. This
+  session couldn't distinguish the two hypotheses.
+- **The RPU's own GIC (PL390, `0xF900_0000`) is architecturally
+  unreachable via the JTAG AXI-AP at all** — every read attempt
+  (`GICD_CTLR`, `GICC_CTLR`, `GICC_PMR`, `GICD_ISENABLER0`) hit a `JTAG-DP
+  STICKY ERROR`. Confirmed this is expected, not a bug: UG1085 Table 13-5
+  explicitly labels this address range "RPU - Private CPU Bus for RPU
+  MPCore" and its own text says "The RPU GIC's base address is aligned to
+  the Cortex-R5F MPCore's low-latency peripheral port (LLPP) base
+  address" — LLPP is core-private by architecture, not reachable from any
+  external system bus master, JTAG included. This means **GIC state can
+  never be diagnosed via JTAG readback for this core** — only inferred
+  behaviorally (UART output, TTC register state, or a real ETM/ILA
+  capture of the CPU's own instruction stream).
+- **Tried one candidate fix, live-tested, no observable effect — reverted
+  (not committed, tree is clean).** UG1085 Table 13-5 also documents a
+  per-SPI security register (`PL390.spi_security`, `0xF900_0084`, 5
+  registers wide) that `gic_init()`/`timer_start()` never program at all
+  — if TTC0's SPI resets into Group 1 (non-secure) while `GICD_CTLR`/
+  `GICC_CTLR` only enable Group 0 (bit 0, what the existing code writes),
+  the interrupt would never signal even though every other register looks
+  correctly configured. Tried writing `GICD_CTLR = 0x3` /
+  `GICC_CTLR = 0x3` (`EnableGrp0 | EnableGrp1`) instead of `0x1`/`0x1`,
+  rebuilt, reflashed `hello_world`: **`"Hello, World!"` still printed
+  exactly twice in a 12-second capture — no change.** Either the group
+  hypothesis is wrong, or enabling both groups at the distributor/CPU
+  interface isn't sufficient without also touching the per-SPI security
+  register directly (never tried — `0xF900_0084` is in the
+  JTAG-unreachable LLPP range, so it can only be validated by another
+  live-build-and-boot cycle, not a quick JTAG probe). Reverted the change
+  (`timer.c` back to `GICD_CTLR = 1`/`GICC_CTLR = 1`) rather than leave an
+  unconfirmed, ineffective speculative fix in tree — `git diff` clean.
+
+**Why this plausibly reframes the entire Phase 6 mystery, not just a
+side note.** ThreadX's own idle-scheduler behavior when no thread is
+ready to run (which is exactly the state a single-thread app like
+`hello_world`/`orbtrace_workload` enters the moment its one thread blocks
+on `tx_thread_sleep`) is, absent any explicit low-power/tickless
+configuration this BSP doesn't set up, a tight spin loop — not a genuine
+CPU halt. **An ETM tracing a CPU stuck spinning in a tiny, fixed loop for
+seconds at a time would produce exactly the kind of low-entropy,
+tightly-periodic byte pattern sections 16 and 19 both captured**
+(`0xFF`/`0xDF` period-4; later a flat constant `0x11`) — not because of
+any CoreSight funnel/TPIU/CTI wiring defect, but because **there was
+never any interesting instruction/branch content to trace in the first
+place** by the time any of Phase 6's capture attempts actually ran.
+Every capture attempt in this document from section 12 onward involved a
+boot-then-configure-then-capture sequence that plausibly took well over a
+second in wall-clock time — meaning R5 was almost certainly *already*
+stuck in this idle spin, past its very first `tx_thread_sleep`, before
+ETM tracing was ever enabled. This doesn't retroactively invalidate
+sections 12-15's real, independently-confirmed *register-level* fixes
+(funnel/TPIU addresses, ETMv4 offsets, trace clock) — those are still
+correct and still needed — but it does mean the CTI negative result
+(section 17, and section 19's own now-doubly-provisional re-test) may
+have been testing an idle CPU rather than disproving a real hypothesis,
+and the "no genuine ATB traffic" conclusion (section 16) may have an
+explanation that has nothing to do with CoreSight at all.
+
+**Session end state:** no net code changes — the one speculative
+`timer.c` edit (`GICD_CTLR`/`GICC_CTLR` group-enable bits) was tried live
+and reverted after confirming it didn't help; `git diff` is clean, only
+this document changed. Board: no PL bitstream/A53 firmware reflash this
+session (all work was R5-only JTAG boots via `load_r5.tcl`, confirmed
+throughout not to disturb A53); `orbtrace info 192.168.1.50` reconfirmed
+responsive at session end. R5-0 was left running whichever build booted
+last during this session's testing (a `hello_world` build, harmless) —
+per the same convention as section 19, treat R5-0's state as
+unknown/unverified at the start of a future session rather than assuming
+continuity.
+
 ## Next steps for a future session
 
-1. **Cheapest, do first: settle whether R5-0 genuinely reaches its
-   workload's main loop.** Section 19 found `g_heartbeat` (ELF symbol,
-   currently `0xffff4370` — re-check with `nm` if the ELF is rebuilt)
-   stuck at `0` via direct JTAG memory readback (`mrd -value`, through
-   the `PSU` target, **not** the ETM/CoreSight registers — this read path
-   has none of `TRCSTATR.PMSTABLE`'s reliability caveat from section 15)
-   across two separate boot attempts this session, and the second attempt
-   additionally showed UART0's own registers reading back all-zero
-   (`UART0_CR=0 MR=0 BAUDGEN=0 BAUDDIV=0 SR=0`) — `load_r5.tcl`'s
-   `setup_uart` step likely didn't stick, plausibly from contention with
-   A53's own concurrent, heavy UART0 diag-thread traffic on the same
-   shared line. Add a `g_heartbeat` readback (or equivalent) as a
-   standard post-boot check for R5 in general — nothing in this whole
-   investigation (including section 17's own now-doubtful negative CTI
-   result) has ever confirmed R5 reaches ThreadX/its main loop by
-   anything stronger than the boot script's own reset-marker check, which
-   only proves `reset_handler` ran, not that the workload thread started.
-   If R5 turns out not to be running, the fix is likely in `load_r5.tcl`
-   or `setup_uart`, not in anything CoreSight-specific.
-2. **Once R5 is confirmed genuinely running its workload (heartbeat
-   moving), redo the combined ILA-while-pulsing-CTI-0 test** — the
-   tooling now works end-to-end (see section 19: `hw_server` is a real
-   `flake.nix` devShell tool, Vivado Hardware Manager and `xsct` proven to
-   share one instance concurrently, `applications/orbtrace/firmware/rpu`'s
-   `ila_capture.tcl`/`cti_pulse.tcl` shape is reusable, recreate from
-   section 19's description same as every other diagnostic script in this
-   document) — but this session's own result (zero change, byte pattern
-   constant `0x11` both before and after the pulse) should be treated as
-   provisional until this is confirmed against a verified-running R5.
-   Section 17's coarser `rx_bytes`/`fifo_high_water`-based negative result
-   still stands on its own terms regardless.
+1. **Cheapest, do first: isolate the ThreadX tick bug found in section
+   20, independent of any CoreSight work.** This is now a standalone RPU
+   BSP bug (`sdk/bsp/rpu/timer.c`, `startup.S`, or the vendored ThreadX
+   Cortex-R5 port's context-save glue), unrelated to ETM/funnel/TPIU, and
+   worth fixing on its own terms before returning to capture attempts.
+   Concrete angles not yet tried, cheapest first:
+   - Add a raw, no-ThreadX smoke test: from `IRQHandler()` in `timer.c`,
+     increment a `volatile` global on *every* call, independent of the
+     `intid == TTC0_CH0_INTID` check and independent of
+     `_tx_timer_interrupt()` — if this counter moves under JTAG readback,
+     the GIC/TTC signal path is proven working and the bug is inside
+     ThreadX's own tick/wake logic; if it stays `0`, the bug is upstream
+     of `IRQHandler()` ever being entered (GIC/TTC/vector-table level).
+     This single change would have resolved section 20's core ambiguity
+     immediately, cheaper than the group-security-register rabbit hole.
+   - If that counter *does* move: the bug is ThreadX-internal
+     (`_tx_timer_interrupt`, or a context-save/restore bug in this port's
+     assembly glue that corrupts the resumed thread's state without
+     crashing outright) — compare this BSP's `startup.S`/context-save
+     assembly line-by-line against a known-good upstream ThreadX
+     Cortex-R5/GNU port if one is vendored or fetchable.
+   - If it doesn't move: revisit the per-SPI security register
+     (`PL390.spi_security`, `0xF900_0084`, UG1085 Table 13-5) properly —
+     write it explicitly (not just the group-enable bits tried and
+     reverted this session) — or check whether TTC0's SPI needs an
+     explicit routing/wake-enable step this BSP never performs (the RPU
+     wake-from-GIC path mentioned at UG1085 line ~4643, "R5_1 and R5_0
+     wake from RPU GIC," may imply a separate enable gate).
+2. **Once the tick is confirmed genuinely advancing (heartbeat or
+   equivalent moving under JTAG readback across several seconds), redo
+   the ETM capture from scratch** — both the plain `configure r5 tpiu4` →
+   `start` → `capture` sequence (section 14's baseline) and, if that
+   alone doesn't move `rx_bytes`, the combined ILA-while-pulsing-CTI-0
+   test (tooling already proven end-to-end in section 19: `hw_server` is
+   a real `flake.nix` devShell tool, Vivado Hardware Manager and `xsct`
+   share one instance concurrently, `ila_capture.tcl`/`cti_pulse.tcl`
+   shape reusable, recreate from section 19's description). Every
+   capture result from sections 12-19 should be treated as measuring an
+   idle CPU until this is redone against a workload confirmed genuinely
+   looping.
 3. Get the real **Arm CoreSight SoC-400 Technical Reference Manual**
    (UG1085's own Ref 39 citation) — not in the private archive; check
    there first before searching further afield. Still the authoritative
    source for exact funnel/TPIU ATB-handshake behavior beyond the simple
-   port-select bitmask this investigation has already confirmed working.
+   port-select bitmask this investigation has already confirmed working
+   — worth having regardless of how item 1 resolves.
 4. Once `rx_bytes` moves, mirror `M3_TRACE_VERIFICATION_PLAN.md`'s Phase
    E/F methodology exactly: confirm real content recovery against
    `applications/orbtrace/firmware/rpu`'s known-reproducible `Workload`
