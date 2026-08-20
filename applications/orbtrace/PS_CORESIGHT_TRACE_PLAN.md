@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 — CTI hypothesis tested live on hardware and RULED OUT (system CTI 0 is real but disabled by default; unlocking/enabling it and pulsing its TPIU FLUSHIN/TRIGIN outputs produced no change in `rx_bytes`/`fifo_high_water`). Real root cause of the idle-pattern output (section 16) still open.** See section 17 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 — CTI hypothesis tested live on hardware and RULED OUT via `rx_bytes`/`fifo_high_water` (section 17). A more sensitive re-test (ILA byte pattern while pulsing CTI 0) was attempted but blocked on a tooling conflict (OpenOCD vs. Vivado Hardware Manager can't share the JTAG adapter) before touching hardware — not yet completed. Real root cause of the idle-pattern output (section 16) still open.** See sections 17-18 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -1000,23 +1000,72 @@ bitstream + `a53_app`; R5-0 left running `orbtrace_workload` harmlessly
 effects); `orbtrace info` confirmed responsive. No destructive hardware
 state left behind.
 
+## 18. Phase 6 continued — ILA re-arm + CTI pulse attempted, blocked on tooling, not completed (2026-08-20)
+
+Attempted section 17's own recommended next step (item 2): re-arm the
+cached diagnostic ILA bitstream (`bazel-out/orbtrace-vivado-ps-etm-ila-debug`)
+while live-pulsing CTI 0, to see whether the raw `dbg_trace_byte` pattern
+changes at all. **Did not get as far as a capture — hit a real tooling
+conflict before touching the board, worth recording so the next attempt
+doesn't repeat it.**
+
+**The problem:** section 17's CTI pulse used OpenOCD (`tooling/openocd/aes_zub.cfg`),
+which opens the board's FTDI FT2232H JTAG adapter directly via its own
+`ftdi` driver (libusb, exclusive access) — this is *separate* from, and
+incompatible with, Vivado Hardware Manager's route to the same physical
+adapter (`open_hw_manager`/`connect_hw_server`/`open_hw_target`, the
+mechanism section 16's ILA capture used). Both want exclusive ownership
+of the one USB JTAG cable; they cannot run concurrently. Pulsing CTI 0
+*during* a live ILA capture — the whole point of this check — needs both
+at once.
+
+**The fix, not yet executed:** don't use OpenOCD for the CTI pulse in
+this combined test. `jtag_flash.sh` and `psu_init_run.tcl` already prove
+`xsct` can do raw PS memory reads/writes (`mwr`/`mrd`, via the same ARM
+DAP, targeting `APU*`/`PSU` in xsct's `targets -set` selection) through
+Xilinx's own `hw_server` — and `hw_server` is designed for exactly this,
+multiple simultaneous TCP clients (xsct *and* Vivado Hardware Manager)
+against one JTAG session. So the real sequence for next time: launch one
+persistent `hw_server`, connect Vivado Hardware Manager to it for the ILA
+arm/capture, and connect `xsct` to the *same* `hw_server` for the CTI 0
+`mwr` pulse sequence (translating section 17's register writes to `mwr`
+calls) — never OpenOCD in this specific combined test.
+
+**Where this attempt actually stopped:** tried to launch `hw_server`
+directly (`~/opt/vitis/Vivado/2023.2/bin/hw_server`) to have a persistent
+instance both clients could reach — it isn't directly executable outside
+the FHS-wrapped environment `nix develop` provides for `xsct`/`vivado`
+(same reason raw `vivado`/`xsct` binaries aren't directly executable
+either — see [[hardware-test-environment]]). `flake.nix`'s `mkXilinxTool`
+wraps `xsct`/`vivado`/`openocd`/`picocom` for the devShell but not
+`hw_server` as its own top-level tool. Didn't chase a workaround this
+session (e.g. `nix develop -c env XILINX_ROOT=... vivado -mode tcl -source
+<script that just does connect_hw_server>` to get a wrapped `hw_server`
+spawned and left running, then pointing `xsct`'s own `connect` at that
+same port instead of autostarting its own) — that's the concrete next
+thing to try.
+
+**Session end state: no hardware touched at all this session** — the
+board is in exactly the state section 17 left it (production Orbtrace
+bitstream + `a53_app`, R5-0 running `orbtrace_workload`, last confirmed
+responsive via `orbtrace info` at the end of section 17). No code
+changes. This section is scratch/tooling notes only.
+
 ## Next steps for a future session
 
-1. **The CTI hypothesis (section 16's leading candidate) is now tested
-   and ruled out** for the specific channel/output mapping tried (section
-   17) — don't re-attempt the same fix without new information. The
-   remaining open question from section 16 (why no genuine ATB traffic
-   ever leaves the ETM/funnel chain, despite every register reading
-   "should be tracing") is still unresolved.
-2. **Cheapest remaining check:** the diagnostic ILA bitstream is still
-   cached (`bazel-out/orbtrace-vivado-ps-etm-ila-debug`) — re-arm it (no
-   rebuild needed, `PROBES.FILE` + `refresh_hw_device` + `run_hw_ila`, see
-   section 16's tooling notes) while live-pulsing CTI 0 (section 17's
-   exact sequence) *during* an active ILA capture, to see directly whether
-   the raw `dbg_trace_byte` pattern changes at all (even partially, even
-   without achieving TPIU demux sync) — a strictly more informative test
-   than `rx_bytes`/`fifo_high_water` alone, since it doesn't depend on the
-   demux's sync detection succeeding to show *some* effect.
+1. **Cheapest, do first:** finish what section 18 started — get a
+   wrapped `hw_server` running (see section 18's concrete suggestion) so
+   Vivado Hardware Manager (ILA arm/capture) and `xsct` (CTI 0 `mwr`
+   pulse sequence, translated from section 17's OpenOCD writes) can both
+   connect to it at once, then actually run the combined
+   re-arm-ILA-while-pulsing-CTI-0 test. This is the same check section 17
+   already recommended — section 18 only got as far as identifying why
+   OpenOCD can't be the tool for the pulse half of it.
+2. **The CTI hypothesis (section 16's leading candidate) is already
+   tested and ruled out** via `rx_bytes`/`fifo_high_water` (section 17) —
+   item 1 above is specifically about getting a *more sensitive* readout
+   (raw ILA byte pattern) before fully abandoning CTI 0 as a factor, not
+   about re-trying the same coarse test.
 3. Get the real **Arm CoreSight SoC-400 Technical Reference Manual**
    (UG1085's own Ref 39 citation) — not in the private archive; check
    there first before searching further afield. Still the authoritative
