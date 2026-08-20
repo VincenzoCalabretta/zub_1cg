@@ -29,6 +29,9 @@
 #define GICC_PMR            REG32(GIC_CPU_BASE + 0x004)  /* priority mask */
 #define GICC_IAR            REG32(GIC_CPU_BASE + 0x00C)  /* interrupt acknowledge */
 #define GICC_EOIR           REG32(GIC_CPU_BASE + 0x010)  /* end of interrupt */
+#define GICC_RPR            REG32(GIC_CPU_BASE + 0x014)  /* running priority (diag) */
+#define GICD_ISPENDR(n)     REG32(GIC_DIST_BASE + 0x200 + (n)*4)  /* set-pending (diag) */
+#define GICD_ISACTIVER(n)   REG32(GIC_DIST_BASE + 0x300 + (n)*4)  /* active bit (diag) */
 
 /*
  * ─── TTC0 channel 0 register map ────────────────────────────────────────────
@@ -142,9 +145,37 @@ static void ttc0_init(void)
  * IRQHandler() that it branches to from within _tx_thread_irq_handler.
  * If your ThreadX version uses a different dispatch symbol, rename this.
  */
+
+/* Diagnostic-only (PS_CORESIGHT_TRACE_PLAN.md section 20/21): unconditional,
+ * ThreadX-independent evidence of whether IRQHandler() is ever entered at
+ * all, and with what INTID, so a JTAG readback can distinguish "GIC/TTC
+ * signal path broken" from "ThreadX's own tick/wake logic broken". */
+volatile uint32_t g_irq_entries;
+volatile uint32_t g_irq_last_intid;
+volatile uint32_t g_irq_last_rpr;
+volatile uint32_t g_irq_ttc_pending_bit;
+volatile uint32_t g_irq_ttc_active_bit;
+/* Word 0 covers PPI IDs 16-31, including UG1085's "Legacy IRQ signal (from
+ * PL)" at ID 31 -- a candidate source for IRQ entries that never show up as
+ * a real GICC_IAR value, since it's a separate, GIC-SPI-independent path
+ * ("the FIQ signal and IRQ signal from the PL are inverted and then sent to
+ * the interrupt controller"). */
+volatile uint32_t g_irq_ppi_pending_word0;
+volatile uint32_t g_irq_ppi_active_word0;
+
 void IRQHandler(void)
 {
     uint32_t intid = GICC_IAR & 0x3FFU;   /* bottom 10 bits = INTID */
+
+    g_irq_entries++;
+    g_irq_last_intid = intid;
+    g_irq_last_rpr = GICC_RPR;
+    g_irq_ttc_pending_bit =
+        (GICD_ISPENDR(GIC_ENABLE_WORD(TTC0_CH0_INTID)) & GIC_ENABLE_BIT(TTC0_CH0_INTID)) ? 1U : 0U;
+    g_irq_ttc_active_bit =
+        (GICD_ISACTIVER(GIC_ENABLE_WORD(TTC0_CH0_INTID)) & GIC_ENABLE_BIT(TTC0_CH0_INTID)) ? 1U : 0U;
+    g_irq_ppi_pending_word0 = GICD_ISPENDR(0);
+    g_irq_ppi_active_word0  = GICD_ISACTIVER(0);
 
     if (intid == TTC0_CH0_INTID) {
         (void)TTC_ISR;               /* clear TTC interrupt flag (read-to-clear) */
