@@ -174,16 +174,31 @@ volatile uint32_t g_irq_last_hppir;
  * distributor/CPU-interface never shows this interrupt as pending even
  * though it's proven causally necessary (section 23's disable test). */
 volatile uint32_t g_irq_ttc_icfgr_bits;
+/* PS_CORESIGHT_TRACE_PLAN.md section 24 next-steps items 1-2: every prior
+ * TTC_ISR read in this investigation was an external JTAG read, tens of
+ * milliseconds after the exception -- too slow to rule out a condition that
+ * self-clears faster than that. This is the first read of TTC_ISR from
+ * *inside* IRQHandler() itself, unconditional (not gated behind
+ * intid==TTC0_CH0_INTID, which never true so far), giving the earliest
+ * possible vantage point on whether the interval bit (or any other TTC_ISR
+ * bit -- match/overflow/event) is actually set at exception entry.
+ * TTC_COUNT_VAL alongside it settles the counter-direction question
+ * (increment vs decrement -- CNT_DECR is never set by ttc0_init()). */
+volatile uint32_t g_irq_ttc_isr_bits;
+volatile uint32_t g_irq_ttc_count_val;
 
 void IRQHandler(void)
 {
     uint32_t hppir = GICC_HPPIR & 0x3FFU; /* read before IAR: no side effects */
     uint32_t intid = GICC_IAR & 0x3FFU;   /* bottom 10 bits = INTID */
+    uint32_t ttc_isr = TTC_ISR;           /* read-to-clear: earliest possible vantage point */
 
     g_irq_entries++;
     g_irq_last_hppir = hppir;
     g_irq_last_intid = intid;
     g_irq_last_rpr = GICC_RPR;
+    g_irq_ttc_isr_bits = ttc_isr;
+    g_irq_ttc_count_val = TTC_COUNT_VAL;
     g_irq_ttc_pending_bit =
         (GICD_ISPENDR(GIC_ENABLE_WORD(TTC0_CH0_INTID)) & GIC_ENABLE_BIT(TTC0_CH0_INTID)) ? 1U : 0U;
     g_irq_ttc_active_bit =
@@ -197,8 +212,7 @@ void IRQHandler(void)
     }
 
     if (intid == TTC0_CH0_INTID) {
-        (void)TTC_ISR;               /* clear TTC interrupt flag (read-to-clear) */
-        _tx_timer_interrupt();      /* advance ThreadX time */
+        _tx_timer_interrupt();      /* advance ThreadX time (TTC_ISR already read+cleared above) */
     }
 
     GICC_EOIR = intid;              /* signal end-of-interrupt to GIC */

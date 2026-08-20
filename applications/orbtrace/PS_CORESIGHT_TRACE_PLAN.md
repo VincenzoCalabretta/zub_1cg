@@ -40,7 +40,7 @@ short:
 | 3 | Confirm RPU (R5 subsystem) is actually usable on this board/PS config | **DONE, 2026-08-19 — real hardware, R5-0 booted and ran real ThreadX firmware.** See section 10 |
 | 4 | Build real target firmware for R5 and/or a second A53 core to actually trace | **DONE, 2026-08-19 — real hardware, R5-0 booted the new deterministic workload.** See section 11 |
 | 5 | Boot/load path for that target firmware | **DONE, 2026-08-19 — reused Phase 3's existing R5 JTAG boot flow unchanged.** See section 11 |
-| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 (continued further still) — R5-0 genuinely boots and runs ThreadX (real, repeated UART evidence). A real power cycle ruled out "stale JTAG debug state" as the cause of both the persistent CoreSight-examine `JTAG-DP STICKY ERROR` and the "IRQHandler() fires but GICC_IAR always reads spurious" symptom. A clean disable A/B test proved TTC0 *is* causally necessary for the IRQ exceptions. `GICD_ICFGR` checked next — TTC0's SPI is genuinely level-sensitive (not edge), ruling out the edge-triggered-narrow-pulse theory too. Net position: TTC0 demonstrably drives the exceptions, its SPI is level-sensitive, yet its own `TTC_ISR` bit, `GICC_IAR`, `GICC_HPPIR`, and the distributor's pending/active bits all agree, every time, that nothing is outstanding — checked from essentially every angle software alone can reach, still an open contradiction. CoreSight/funnel/TPIU wiring itself is still believed fine — the idle-pattern captures are still best explained by some stalled/spinning CPU state once this tick bug stalls a thread.** See sections 20-24 |
+| 6 | First real hardware capture on the R5/A53 path, verify PS/ETM sync (mirrors M3 Phase E/F) | **STARTED, 2026-08-20 (continued yet further still) — R5-0 genuinely boots and runs ThreadX (real, repeated UART evidence). A real power cycle ruled out "stale JTAG debug state." A clean disable A/B test proved TTC0 *is* causally necessary for the IRQ exceptions; `GICD_ICFGR` confirmed its SPI is level-sensitive, ruling out edge-triggered-narrow-pulse. A follow-up A/B test (IER enabled, counter statically disabled) proved IER alone is insufficient — the counter must genuinely be running. `TTC_ISR`/`TTC_COUNT_VAL` now read from *inside* `IRQHandler()` itself (earliest possible vantage point, not slow external JTAG): `TTC_ISR` still reads `0` every time, `TTC_COUNT_VAL` reads an identical small constant (13) every time. A wall-clock-bracketed measurement confirms the entry rate is genuinely ~105 Hz, not a sampling artifact. Four specific, TRM-motivated hypotheses for the persistent CoreSight-examine `JTAG-DP STICKY ERROR` (JTAG clock speed, LPD debug clock gating, RPU debug-logic reset, AP index/type) have all been tried and ruled out; that failure remains unexplained. Net position: a real, counter-driven hardware event reproducibly and immediately fires a genuine ARM IRQ into `IRQHandler()`, yet every status register this investigation can reach — including an in-ISR `TTC_ISR` read — agrees, every time, that nothing is outstanding. CoreSight/funnel/TPIU wiring itself is still believed fine — the idle-pattern captures are still best explained by some stalled/spinning CPU state once this tick bug stalls a thread.** See sections 20-26 |
 | 7 | ETMv4 host-side decoder | NOT STARTED |
 | 8 | Perfetto integration (reuse `M3_PERFETTO_VISUALIZATION_PLAN.md`'s pipeline/JSON writer, extend for ETMv4 call-stack bars per that document's Phase-I-style discussion) | NOT STARTED |
 
@@ -1696,39 +1696,280 @@ A53); `orbtrace info` confirmed responsive. R5-0 left running the final
 instrumented `hello_world` build. No destructive hardware state left
 behind.
 
+## 25. Phase 6 continued — in-ISR TTC_ISR read still shows nothing latched, and IER-alone is confirmed insufficient (2026-08-20, continued yet further still)
+
+Picked up section 24's next-steps items 1 and 2 directly, same session. Board
+was confirmed present and the A53 Orbtrace service reachable over TCP port
+3401 (`ZUBoard-Orbtrace/1` banner) before touching R5 at all — ICMP `ping`
+to `192.168.1.50` fails and is a red herring: the A53's own hand-rolled
+TCP/IP stack (visible via its UART diagnostic chatter, `diag: ISR=...
+NWSR=0x86 ...`) evidently never implements ICMP echo; a raw TCP connect to
+port 3401 (`/dev/tcp/192.168.1.50/3401`) succeeds immediately, and
+`bazel run //applications/orbtrace/model:orbtrace -- info` confirms this
+properly. Worth remembering for a future session that doesn't want to
+mis-diagnose "ping fails" as "board is down."
+
+**New instrumentation, item 2's spirit: read `TTC_ISR` and `TTC_COUNT_VAL`
+from *inside* `IRQHandler()` itself, unconditionally, for the first time
+in this investigation.** Every prior `TTC_ISR` read (sections 19, 22) was
+an external JTAG read, tens of milliseconds after the exception —
+section 22 already flagged this as a real methodological gap ("too slow to
+rule out a self-clearing condition"). Added `g_irq_ttc_isr_bits` (raw
+`TTC_ISR`, read as the very first register access in `IRQHandler()`,
+before `GICC_HPPIR`/`GICC_IAR`... actually after those two, since they're
+GIC registers and reading them first was already established as the
+cleanest non-consuming order — but *before* anything else touches TTC) and
+`g_irq_ttc_count_val` (raw `TTC_COUNT_VAL` at the same moment, settling the
+counter-direction/behavior question). Host tests extended and passing,
+real aarch64 cross-build succeeds (`bazel test --config=host
+//tests:rpu_hello_world_elf_test //tests:rpu_hello_world_size_test
+//tests:rpu_orbtrace_workload_elf_test //tests:rpu_orbtrace_workload_size_test`
+all pass).
+
+**Real hardware result: `TTC_ISR` reads exactly `0x00000000` from inside
+the handler too, every single sample.** Booted the instrumented
+`hello_world` via the known-safe JTAG-only flow (`load_r5.tcl`, omitting
+`psu_init_run.tcl`), confirmed live via UART (`--- ThreadX Hello World
+---` / `[TEST BEGIN]` / `[TEST PASS]`, and confirmed the tick-stall bug
+still reproduces exactly as sections 20-24 describe: exactly 2 `"Hello,
+World!"` lines across a full 25-second capture, not the ~25 a genuinely
+advancing 1 Hz tick would print). Sampled `g_irq_entries` /
+`g_irq_ttc_isr_bits` / `g_irq_ttc_count_val` via 6 separate JTAG sessions
+(`uscale.axi` `mdw`, ~1.5s apart, each a fresh `openocd` connect/disconnect
+to avoid any single-session artifact): `g_irq_entries` climbed steadily
+(`0x2ce6` → `0x30d9`, ~336 counts over ~9 wall-clock seconds — roughly
+37/s, not the expected ~100/s, but the per-sample JTAG connect/teardown
+overhead dominates that window's real elapsed time, so this isn't a clean
+rate measurement, just confirms "climbing steadily"). **`g_irq_ttc_isr_bits`
+read `0x00000000` on all 6 samples. `g_irq_ttc_count_val` read exactly
+`0x0000000d` (13) on all 6 samples, bit-for-bit identical every time.**
+`g_irq_ttc_icfgr_bits` stayed `0x1` (level-sensitive, matches section 24).
+
+**This closes off the "JTAG readback is too slow" explanation for good.**
+`TTC_ISR` reading a stored, latched-until-read value of exactly zero from
+literally the first instructions of the exception handler — not a
+polling loop tens of milliseconds later — means the interval condition
+genuinely is not observably set at the point software can first look,
+for a register UG1085 describes as "stores [the interrupt] until the
+register is read," not a register that could plausibly self-clear on its
+own between the hardware event and a same-microsecond read.
+
+**The identical `TTC_COUNT_VAL=13` across six independent samples is a new,
+genuinely strange data point, not explained by anything checked so far.**
+If this really is a free-running interval counter (as `ttc0_init()`
+programs it — `CNT_INTERVAL` set, counter never explicitly held at a fixed
+value), a value this small (13 out of a 62500 interval), and this
+*identical* across six physically separate JTAG connect/read round-trips
+(each with its own, uncorrelated few-hundred-millisecond USB/JTAG latency),
+is consistent with "software always happens to read `COUNT_VAL` a fixed,
+tiny number of ticks after every interval-reset event" — i.e., the counter
+genuinely does reach its interval and reset (explaining why `IRQHandler()`
+entries correlate with TTC0 being enabled at all, per section 23), and
+whatever generates these IRQ exceptions does so essentially immediately
+after that reset, every time, with sub-JTAG-sample-jitter precision. That
+level of determinism is hard to square with "an unrelated, coincidental
+interrupt source" and easy to square with "this genuinely is the TTC
+interval event, but something about how its signal reaches the CPU/GIC
+leaves no trace in any status register this investigation can reach."
+
+**Ran section 24 next-steps item 1 for real: `TTC_IER` enabled, counter
+left statically disabled (`CNT_DIS`, no `CNT_INTERVAL` toggle) —
+temporarily wrapped just the `TTC_CNT_CNTRL = CNT_INTERVAL;` line in
+`timer_start()` in `#if 0` (everything else, including `TTC_IER =
+TTC_INT_INTERVAL;` and the GIC enable sequence, untouched). Rebuilt,
+reflashed, booted, sampled 6 times over ~9s.**
+
+**Result: `g_irq_entries` stayed exactly `0` across every sample — no
+entries at all with the counter statically disabled, even though `TTC_IER`
+was genuinely enabled.** This directly answers item 1's open question:
+**merely enabling `TTC_IER` is not sufficient by itself; the counter must
+actually be counting (in interval mode) for any IRQ to occur.** Combined
+with section 23's original disable test, this narrows the causal
+requirement from "TTC0's enable state generally" down specifically to "the
+counter genuinely running in interval mode" — strengthening, not
+weakening, the case that a real interval-match hardware event is the
+trigger, not some artifact of the `IER` write itself. Reverted the `#if 0`
+immediately after (`git diff sdk/bsp/rpu/timer.c` now shows only the two
+new permanent diagnostic globals/reads, confirmed via `git diff --stat`);
+rebuilt, host-tested, and reflashed the reverted build onto R5-0 before
+ending the session.
+
+**Net position: item 1 resolved cleanly (counter must genuinely run), item
+2 resolved cleanly but deepens rather than dissolves the mystery (TTC_ISR
+is unset even at the earliest possible software vantage point). The core
+contradiction from section 24 stands, now on firmer footing: a real,
+counter-driven hardware event reproducibly and immediately produces a real
+ARM IRQ exception into `IRQHandler()`, yet every status register this
+investigation can reach — `TTC_ISR` (now including an in-ISR read),
+`GICC_IAR`, `GICC_HPPIR`, distributor pending/active bits — agrees, every
+single time, that nothing is outstanding.** The remaining live
+possibilities are unchanged from section 24's own framing (something
+faster than even an in-ISR read, or a signal path this investigation
+hasn't identified at all) — this session's contribution is ruling out the
+"read too slow" objection specifically, not resolving the mystery itself.
+
+**Session end state:** two new permanent diagnostic globals
+(`g_irq_ttc_isr_bits`, `g_irq_ttc_count_val`) committed, same
+pure-addition/no-behavior-change category as every diagnostic since
+section 20. The `#if 0` counter-disable experiment was tried live and
+fully reverted (`git diff` clean on that line). No PL bitstream/A53
+firmware reflash this session (all work was R5-only JTAG boots via
+`load_r5.tcl`, confirmed via `orbtrace info` not to have disturbed A53 at
+any point, checked both before and after this session's R5 work). R5-0
+left running the final, reverted `hello_world` build (harmless). No
+destructive hardware state left behind.
+
+## 26. Phase 6 continued — real ~105 Hz rate confirmed; three more CoreSight-examine hypotheses tried and ruled out (2026-08-20, same day, continued still further)
+
+Picked up next-steps items 3 and 4 directly, same session as section 25.
+Board reconfirmed reachable first (`orbtrace info` → `ZUBoard-Orbtrace/1`) —
+no reflash needed, R5-0 still running section 25's final `hello_world`
+build.
+
+**Item 3, resolved cleanly: the ~100 Hz correlation is real, not a JTAG-sampling
+artifact.** Bracketed a genuine wall-clock `time.sleep(10)` (Python, not
+in-script `after` delays) between two independent, short-lived `openocd`
+JTAG sessions, each doing nothing but `mdw` on `g_irq_entries`. Result:
+entries climbed from `30229` to `31282` (delta `1053`) across a
+precisely-timed `10.0002 s` window — **105.30 Hz**, close enough to the
+BSP's intended 100 Hz (`TTC_INTERVAL_VAL`/`TTC_COUNTER_CLK_HZ` computed
+assuming a 100 MHz `TTC_REF_CLK_HZ`) that the small delta is more likely a
+~5% error in that assumed reference clock than evidence of a different
+mechanism. This closes off any remaining doubt that `g_irq_entries`'
+climb rate was some polling/session artifact rather than a real,
+counter-clock-derived hardware rate — it's exactly the kind of tight,
+deterministic timing a genuine interval timer produces.
+
+**Item 4, three new hypotheses tried, all ruled out — `JTAG-DP STICKY
+ERROR` on R5-0 CoreSight examine remains unexplained.** Tested against
+the *already-running* R5-0 (no reboot needed for these three checks):
+
+1. **JTAG clock speed.** Tried `uscale.r5_0 arp_examine` at 3000 kHz
+   (default), 500 kHz, and 100 kHz in the same session (`adapter speed`
+   between attempts, `clear_stickyerr` before each). Identical
+   `JTAG-DP STICKY ERROR` at all three speeds. Rules out a
+   Vivado-Hardware-Manager-style "TCK vs. debug hub clock ratio" issue
+   (section 16's own `PARAM.FREQUENCY 1000000` fix doesn't apply here —
+   different failure shape).
+2. **LPD debug clock gating (`DBG_LPD_CTRL`), the same class of bug
+   section 14 found for the FPD trace clock.** Found the real register in
+   UG1085 (Table 37-7, Table 39-10: `CRL_APB.DBG_LPD_CTRL`, offset
+   `0x068` → `0xFF5E0068`, "used by RPU debug logic and funnel"; unlike
+   `DBG_TRACE_CTRL`'s documented reset default of "Clock stop," this one's
+   documented reset default is `CLKACT=Enabled`). Read live:
+   `0x01010500` — `CLKACT=1` (bit 24, genuinely enabled),
+   `DIVISOR0=5` (not the raw-reset `0x20`, so *something* — plausibly
+   this build's own `psu_init.tcl`, not checked further this session —
+   already reprograms it for a faster debug clock, matching the same
+   `DIVISOR0=5` pattern section 14 found for `DBG_TRACE_CTRL`). **Ruled
+   out**: the LPD debug clock is genuinely running, not gated.
+3. **RPU debug-logic held in reset (`CRL_APB.RST_LPD_DBG`).** UG1085
+   Table 39-11 documents this exact register's bits
+   (`rpu_dbg{0,1}_reset`, `dbg_lpd_reset`) as controlling debug-logic
+   reset for the LPD/RPU — a real, specific, TRM-named candidate for
+   "CoreSight examine fails because the debug logic itself is held in
+   reset," distinct from the clock-gating question. Read live at the
+   well-known ZynqMP offset `0x218` (`0xFF5E0218`, not independently
+   confirmed against this archive's address tables — no explicit hex
+   offset was found near the register's TRM description text, only
+   recalled from familiarity with Xilinx's BSP headers; worth
+   double-checking against UG1087 Register Reference if available
+   before trusting this address further): `0x00000000` — if the
+   convention matches every other `RST_*` register this project has
+   already confirmed (`RST_LPD_TOP`: bit=1 means "in reset," matching
+   `load_r5.tcl`'s own comments), an all-zero reading means **nothing is
+   held in debug-reset**. **Ruled out**, with the caveat that the
+   register address itself is less rigorously confirmed than the other
+   findings in this document — worth re-deriving from UG1087 rather than
+   memory if this needs revisiting.
+4. **AP index/type mismatch.** Enumerated all APs on `uscale.dap` via
+   `apid` (0-3): AP0 `0x34770004` (class 8 = MEM-AP, type 4 = AMBA
+   AXI3/4 — matches `uscale.axi`'s own `-ap-num 0`), **AP1 `0x44770002`
+   (class 8 = MEM-AP, type 2 = AMBA APB2/3 — matches `uscale.r5_0`'s
+   configured `-ap-num 1`, and matches the "APB-AP" naming this
+   investigation has used since section 1)**, AP2 `0x24760010` (class 0 =
+   JTAG-AP, the fourth CoreSight access path UG1085 Table 39-10 lists
+   alongside JTAG-DP/AXI-AP/APB-AP), AP3 `0x00000000` (no further AP).
+   **Ruled out**: `-ap-num 1 -dbgbase 0xFE810000` is genuinely the right
+   AP, of the right type, at the right index — not a stale/wrong
+   configuration.
+
+**A fourth idea (XPPU firewalling the APB-AP's access to the CoreSight
+region) was considered but not tested — reasoned through instead, and
+judged unlikely enough not to be worth a live probe this session.**
+UG1085 Table 10-4 lists `CRL_APB` (`0xFF5E_0000`) and `RPU`
+(`0xFF9A_0000`) as XPPU-protected — both already-known-relevant
+(`load_r5.tcl` already has an XPPU-blocked-write fallback for
+`RPU_GLBL_CNTL`) — but the CoreSight debug region (`0xFE80_0000`
+upward) never appears in that table or the System Addresses chapter's
+reserved-range list. Section 9's own text ("The JTAG DAP controller can
+use the AXI interconnect to access the APB slave interfaces") describes
+a *different*, generic APB-bridge access path (for peripherals like
+SYSMON) distinct from a dedicated CoreSight debug APB-AP, which by
+standard ARM DAP architecture is normally its own physically separate
+bus, not routed through the system's protected AXI interconnect at all —
+consistent with AP1's own IDR identifying it as a genuine, standard
+CoreSight-class APB-AP. Worth revisiting only if every other avenue is
+exhausted.
+
+**Net position on item 4: four real, specific, TRM-or-architecture-motivated
+hypotheses tried across this session and section 16, all negative.**
+Power-up handshake (section 16), JTAG clock speed, LPD debug clock
+gating, RPU debug-logic reset, and AP configuration are now all confirmed
+*not* the explanation. What remains unexplored: the actual ROM-table walk
+`arp_examine` performs once it starts talking to AP1 (this investigation
+has only checked *preconditions* for that walk succeeding, never traced
+the walk itself — e.g. via OpenOCD's own `-d3` debug-level tracing to see
+exactly which transaction inside the examine sequence first returns the
+sticky error), and the address-confidence caveat on `RST_LPD_DBG` above.
+
+**Session end state:** no firmware/code changes this session beyond
+section 25's (already committed). All of this session's new work was
+read-only JTAG register probes (adapter-speed changes, `DBG_LPD_CTRL`/
+`RST_LPD_DBG` reads, AP enumeration) against R5-0's *already-running*
+`hello_world` — no reboot needed for items 3/4, so no new UART/boot
+evidence to report beyond section 25's. Board: no PL bitstream/A53
+reflash; `orbtrace info 192.168.1.50` reconfirmed responsive both before
+and after this session's R5 JTAG probing. R5-0 left running the same
+`hello_world` build section 25 ended with. No destructive hardware state
+left behind.
+
 ## Next steps for a future session
 
-1. **Cheapest, do first: extend the disable-test methodology to isolate
-   TTC_IER from the running counter.** Section 23's disable test turned
-   off both `TTC_IER` and `TTC_CNT_CNTRL`'s interval-enable together;
-   leave `TTC_IER` enabled but leave the counter in `CNT_DIS` (static, not
-   running) to see whether entries still occur — this would show whether
-   merely having the interrupt-enable bit set (regardless of whether the
-   counter ever actually reaches its interval) is enough to trigger
-   something, versus needing a genuine counter-reaches-zero event.
-2. Check `TTC_ISR`'s other bits (match 1/2, overflow, event — not just
-   the interval bit this BSP intends to use) in case a *different* TTC0
-   condition is the actual real trigger — e.g. confirm which direction
-   the counter genuinely runs in (`ttc0_init()`'s `TTC_CNT_CNTRL =
-   CNT_DIS` only ever sets the `DIS` bit; `DEC` is never explicitly set,
-   so the counter may be running in increment mode despite this BSP's own
-   comments assuming decrement) and whether an overflow-type condition
-   (not interval) is what's really firing.
-3. Independently verify the actual entry rate against a real clock (e.g.
-   read `entries` at the start and end of a `sleep 10` wrapped around two
-   separate short JTAG sessions, rather than trusting in-script `after`
-   delays whose real wall-clock cost was never measured) — confirming
-   it's genuinely ~100 Hz would itself be informative, now that TTC0 is
-   confirmed causally involved (section 23) but every register-level
-   explanation checked so far (sections 20-24) has come back clean.
-4. **Get R5-0's own CoreSight examine to actually succeed** — still
-   unresolved, and no longer explicable by "stale state from repeated
-   soft-resets" (this session's power cycle ruled that out directly).
-   Worth understanding on its own terms regardless of the IRQ mystery: a
-   working halt/register-dump capability would let a future session read
-   the real `LR_irq`/`SPSR_irq`/mode at the exact moment of one of these
-   mystery exceptions, which no amount of further memory-mapped polling
-   from inside `timer.c` can substitute for.
+1. **Superseded, resolved 2026-08-20 (section 25) — kept for history.**
+   ~~Extend the disable-test methodology to isolate TTC_IER from the
+   running counter~~ — done: IER-enabled-with-static-counter produces
+   zero entries, so the counter must genuinely be running/reaching its
+   interval, not just IER being set.
+2. **Partially resolved 2026-08-20 (section 25).** The `TTC_ISR`
+   "other bits" question is now moot for the interval bit specifically —
+   an in-ISR read at the earliest possible vantage point still shows
+   `0x0`, ruling out "JTAG read too slow to catch it." Still open: whether
+   a genuinely *different* TTC_ISR bit (match/overflow/event) explains
+   anything, and confirming counter direction — `TTC_COUNT_VAL` read a
+   suspicious identical constant (13) across six independent samples,
+   worth understanding on its own terms (see section 25's discussion).
+3. **Resolved 2026-08-20 (section 26) — kept for history.**
+   ~~Independently verify the actual `g_irq_entries` rate against a real
+   clock~~ — done: a wall-clock-bracketed 10s window measured **105.30
+   Hz**, confirming the entry rate is genuinely clock-derived and close to
+   the BSP's intended ~100 Hz, not a sampling artifact.
+4. **`JTAG-DP STICKY ERROR` on R5-0 CoreSight examine: four hypotheses
+   ruled out 2026-08-20 (section 26), still unresolved.** JTAG clock
+   speed, `DBG_LPD_CTRL` (LPD debug clock gating), `RST_LPD_DBG` (RPU
+   debug-logic reset — note: this register's address was recalled from
+   memory of Xilinx BSP headers, not independently confirmed against this
+   repo's UG1085 archive; re-derive from UG1087 Register Reference if
+   revisiting), and DAP AP index/type have all been checked and are not
+   the explanation. Not yet tried: OpenOCD's own `-d3` transaction-level
+   debug tracing during `arp_examine`, to see exactly which step of the
+   ROM-table walk first returns the sticky error, rather than only
+   checking preconditions for it to succeed. Worth understanding on its
+   own terms regardless of the IRQ mystery: a working halt/register-dump
+   capability would let a future session read the real
+   `LR_irq`/`SPSR_irq`/mode at the exact moment of one of these mystery
+   exceptions, which no amount of further memory-mapped polling from
+   inside `timer.c` can substitute for.
 5. **Once the tick is confirmed genuinely advancing (heartbeat or
    equivalent moving under JTAG readback across several seconds), redo
    the ETM capture from scratch** — both the plain `configure r5 tpiu4` →
